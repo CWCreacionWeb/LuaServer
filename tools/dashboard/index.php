@@ -360,10 +360,12 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
     <h2>Proyectos</h2>
     <?php if (!$sites): ?>
       <div class="card muted">Aún no hay proyectos. Crea el primero arriba.</div>
-    <?php else: foreach ($sites as $name => $info): $ver = is_array($info)?($info['php']??'?'):$info; ?>
+    <?php else: foreach ($sites as $name => $info):
+          $ver = is_array($info)?($info['php']??'?'):$info;
+          $dom = (is_array($info) && !empty($info['domain'])) ? $info['domain'] : $name.'.'.$tld; ?>
       <div class="card row">
         <div class="name"><?= e($name) ?></div>
-        <a class="url" href="http://<?= e($name) ?>.<?= e($tld) ?>" target="_blank"><?= e($name) ?>.<?= e($tld) ?> &#8599;</a>
+        <a class="url" href="http://<?= e($dom) ?>" target="_blank"><?= e($dom) ?> &#8599;</a>
         <div class="spacer"></div>
         <form method="post" class="inline" style="gap:6px">
           <input type="hidden" name="action" value="switch">

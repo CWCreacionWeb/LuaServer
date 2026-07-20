@@ -13,6 +13,9 @@
 /config/https.on
 /config/mailpit.on
 
+# ===== registro de proyectos: estado de cada maquina (plantilla: sites.example.json) =====
+/config/sites.json
+
 # ===== proyectos: NO versionar (cada proyecto es tuyo / tiene su propio repo) =====
 /www/*
 !/www/.gitkeep

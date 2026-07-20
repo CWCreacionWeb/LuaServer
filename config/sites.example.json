@@ -1,0 +1,8 @@
+{
+  "defaultPhp": "8.4",
+  "tld": "lua.test",
+  "sites": {
+    "miproyecto": { "php": "8.4" },
+    "cliente-com": { "php": "8.3", "domain": "cliente.lua.test" }
+  }
+}

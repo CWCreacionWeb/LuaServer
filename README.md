@@ -82,6 +82,23 @@ cd lua-server
 .\lua.ps1 start
 ```
 
+## Proyectos existentes y dominios personalizados
+
+Para servir una carpeta que ya tienes en `www\` (p.ej. un WordPress con nombre de
+dominio), añádela a `config\sites.json`. Admite un `domain` opcional cuando el
+nombre de la carpeta no sirve como dominio:
+
+```json
+{
+  "sites": {
+    "cliente.com": { "php": "8.3", "domain": "cliente.lua.test" }
+  }
+}
+```
+
+Luego `.\lua.ps1 reload`. `config\sites.json` es propio de cada máquina (no se
+versiona); tienes una plantilla en `config\sites.example.json`.
+
 ## Servidor de equipo (opcional)
 
 Para que Apache arranque solo al encender el PC y sea accesible por la red de la oficina:

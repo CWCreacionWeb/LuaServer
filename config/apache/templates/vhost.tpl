@@ -1,8 +1,8 @@
 # === Auto-generado por lua.ps1 — NO editar (se sobrescribe en cada reload) ===
 # Proyecto: {NAME}   PHP: {PHPVER}
 <VirtualHost *:80>
-    ServerName {NAME}.lua.test
-    ServerAlias www.{NAME}.lua.test *.{NAME}.lua.test
+    ServerName {DOMAIN}
+    ServerAlias www.{DOMAIN}
     DocumentRoot "{DOCROOT}"
     FcgidInitialEnv PHPRC "{PHPDIR}"
 

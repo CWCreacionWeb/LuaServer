@@ -85,7 +85,10 @@ function Require-Admin {
     }
 }
 
-function Get-Config { Get-Content $SitesJson -Raw | ConvertFrom-Json }
+function Get-Config {
+    if (-not (Test-Path $SitesJson)) { return ([pscustomobject]@{ defaultPhp='8.4'; tld=$Tld; sites=([pscustomobject]@{}) }) }
+    Get-Content $SitesJson -Raw | ConvertFrom-Json
+}
 function Save-Config($cfg) {
     $json = $cfg | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText($SitesJson, $json, (New-Object System.Text.UTF8Encoding($false)))
@@ -138,6 +141,9 @@ function Set-HttpdConf {
     $c = $c -replace '(?m)^\s*Define\s+LUAROOT\s+".*"', "Define LUAROOT `"$lua`""
     $c = $c.Replace('# LoadModule rewrite_module modules/mod_rewrite.so', 'LoadModule rewrite_module modules/mod_rewrite.so')
     $c = $c.Replace('# LoadModule vhost_alias_module modules/mod_vhost_alias.so', 'LoadModule vhost_alias_module modules/mod_vhost_alias.so')
+    # modulos que usan los .htaccess de WordPress/proyectos (cache y compresion)
+    $c = $c -replace '(?m)^#\s*LoadModule expires_module', 'LoadModule expires_module'
+    $c = $c -replace '(?m)^#\s*LoadModule deflate_module', 'LoadModule deflate_module'
     $c = $c.Replace('#ServerName www.example.com:80', 'ServerName localhost:80')
     if ($c -notmatch 'httpd-lua\.conf') {
         $c = $c + "`r`n`r`n# ================= lua-server =================`r`nDefine LUAROOT `"$lua`"`r`nInclude `"`${LUAROOT}/config/apache/httpd-lua.conf`"`r`n"
@@ -223,20 +229,21 @@ SSLSessionCacheTimeout 300
         Set-Content -Path $SslConf -Value "# HTTPS desactivado" -Encoding ascii
     }
 }
-function New-VhostFile($name, $php) {
+function New-VhostFile($name, $php, $domain) {
+    if (-not $domain) { $domain = "$name.$Tld" }
     $docroot = Fwd (Get-DocRoot $name)
     $phpdir  = Fwd (Join-Path $PhpBase $php)
     $phpcgi  = Fwd (Join-Path $PhpBase "$php\php-cgi.exe")
     $logdir  = Fwd $ApacheLog
     $tpl = Get-Content $Template -Raw
-    $out = $tpl.Replace('{NAME}',$name).Replace('{PHPVER}',$php).Replace('{DOCROOT}',$docroot).Replace('{PHPDIR}',$phpdir).Replace('{PHPCGI}',$phpcgi).Replace('{LOGDIR}',$logdir)
+    $out = $tpl.Replace('{NAME}',$name).Replace('{DOMAIN}',$domain).Replace('{PHPVER}',$php).Replace('{DOCROOT}',$docroot).Replace('{PHPDIR}',$phpdir).Replace('{PHPCGI}',$phpcgi).Replace('{LOGDIR}',$logdir)
     if ((Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)) {
         $cert = Fwd $SslCert; $key = Fwd $SslKey
         $out = $out + @"
 
 <VirtualHost *:443>
-    ServerName $name.$Tld
-    ServerAlias www.$name.$Tld
+    ServerName $domain
+    ServerAlias www.$domain
     DocumentRoot "$docroot"
     FcgidInitialEnv PHPRC "$phpdir"
     SSLEngine on
@@ -259,12 +266,22 @@ function Regenerate-Vhosts {
     if (-not (Test-Path $VhostDir)) { New-Item -ItemType Directory -Force -Path $VhostDir | Out-Null }
     Get-ChildItem $VhostDir -Filter *.conf -ErrorAction SilentlyContinue | Remove-Item -Force
     $cfg = Get-Config
-    foreach ($p in $cfg.sites.PSObject.Properties.Name) { New-VhostFile $p $cfg.sites.$p.php }
+    foreach ($p in $cfg.sites.PSObject.Properties.Name) {
+        $s = $cfg.sites.$p; $dom = $null
+        if (($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { $dom = $s.domain }
+        New-VhostFile $p $s.php $dom
+    }
+}
+function Get-SiteDomain($cfg, $name) {
+    $s = $cfg.sites.$name
+    if ($s -and ($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { return $s.domain }
+    return "$name.$Tld"
 }
 
 function Cmd-Init {
     Info "Ajustando el stack a: $Root"
     foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$SslDir,(Join-Path $Root 'logs\php'))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    if (-not (Test-Path $SitesJson)) { Save-Config (Get-Config) }
     Set-HttpdConf
     Set-PhpInis
     Set-Ssl
@@ -451,7 +468,7 @@ function Update-Hosts {
     if (-not (Test-Admin)) { return }
     $cfg = Get-Config
     $entries = @("127.0.0.1 localhost.$Tld")
-    foreach ($p in $cfg.sites.PSObject.Properties.Name) { $entries += "127.0.0.1 $p.$Tld www.$p.$Tld" }
+    foreach ($p in $cfg.sites.PSObject.Properties.Name) { $dom = Get-SiteDomain $cfg $p; $entries += "127.0.0.1 $dom www.$dom" }
     $content = Get-Content $HostsFile -ErrorAction SilentlyContinue
     $kept = @(); $inside = $false
     foreach ($l in $content) {
@@ -502,7 +519,7 @@ function Cmd-SwitchPhp($name, $php) {
 function Cmd-ListSites {
     $cfg = Get-Config; $names = $cfg.sites.PSObject.Properties.Name
     if ($names.Count -eq 0) { Info "Sin sitios. Crea uno:  .\lua.ps1 add-site micliente"; return }
-    foreach ($p in $names) { Write-Host ("  {0,-18} PHP {1,-5} http://{2}.{3}" -f $p,$cfg.sites.$p.php,$p,$Tld) }
+    foreach ($p in $names) { Write-Host ("  {0,-22} PHP {1,-5} http://{2}" -f $p,$cfg.sites.$p.php,(Get-SiteDomain $cfg $p)) }
 }
 function Cmd-ListPhp {
     $v = Get-PhpVersions
@@ -522,7 +539,7 @@ function Cmd-Hosts {
     $lan = Get-LanIp; $cfg = Get-Config
     Write-Host "`nTus companeros deben anadir esto a C:\Windows\System32\drivers\etc\hosts (como admin):`n"
     Write-Host $HostsBegin -ForegroundColor DarkGray
-    foreach ($p in $cfg.sites.PSObject.Properties.Name) { Write-Host ("{0} {1}.{2} www.{1}.{2}" -f $lan,$p,$Tld) }
+    foreach ($p in $cfg.sites.PSObject.Properties.Name) { $dom = Get-SiteDomain $cfg $p; Write-Host ("{0} {1} www.{1}" -f $lan,$dom) }
     Write-Host $HostsEnd -ForegroundColor DarkGray; Write-Host ""
 }
 function Cmd-Logs { Get-Content (Join-Path $ApacheLog "error.log") -Tail 40 -ErrorAction SilentlyContinue }
