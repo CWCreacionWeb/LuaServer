@@ -16,3 +16,7 @@
 *.log
 Thumbs.db
 Desktop.ini
+
+# basura de shell de Windows
+tools/dashboard/%SystemDrive%/
+**/cversions*.db
