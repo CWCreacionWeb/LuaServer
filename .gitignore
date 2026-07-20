@@ -3,6 +3,7 @@
 /downloads/
 
 # ===== runtime =====
+/data/
 /logs/
 /tmp/
 
