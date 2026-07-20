@@ -62,7 +62,11 @@ Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Say "descargando Composer..."
 New-Item -ItemType Directory -Force -Path (Join-Path $root "bin\composer") | Out-Null
-Invoke-WebRequest "https://getcomposer.org/composer-stable.phar" -OutFile (Join-Path $root "bin\composer\composer.phar") -UseBasicParsing -TimeoutSec 300
+& curl.exe -s -L -o (Join-Path $root "bin\composer\composer.phar") "https://getcomposer.org/composer-stable.phar"
+
+Say "descargando mkcert (HTTPS local)..."
+New-Item -ItemType Directory -Force -Path (Join-Path $root "bin\mkcert") | Out-Null
+& curl.exe -s -L -o (Join-Path $root "bin\mkcert\mkcert.exe") "https://github.com/FiloSottile/mkcert/releases/download/v1.4.4/mkcert-v1.4.4-windows-amd64.exe"
 
 Say "aplicando configuracion (lua.ps1 init)..."
 & (Join-Path $root "lua.ps1") init

@@ -29,6 +29,9 @@ máquina). Desde ahí puedes, sin tocar la terminal:
   configurado para depurar paso a paso en el puerto **9003**, VS Code/PhpStorm).
 - **Logs**: ver en vivo los logs de Apache y de cada proyecto desde el navegador,
   con auto-refresco y opción de vaciar.
+- **HTTPS local**: botón para activar certificados de confianza (mkcert) y servir
+  `https://<proyecto>.lua.test` con candado verde. Al activarlo, Windows pide
+  permiso (UAC) para instalar la CA local una sola vez.
 
 Los cambios se aplican solos: un proceso *watcher* (que arranca con `lua.ps1 start`)
 recarga Apache en un par de segundos. Los ajustes de `php.ini` se guardan como

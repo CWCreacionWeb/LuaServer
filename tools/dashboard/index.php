@@ -177,6 +177,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else { $msg='error:Versión no válida.'; }
     }
     elseif ($action === 'hosts') { lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
+    elseif ($action === 'https') {
+        $enable = ($_POST['enable'] ?? '') === '1';
+        if ($enable) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); $msg='info:Activando HTTPS: acepta el aviso de Windows (UAC) para instalar la CA. Recarga en unos segundos.'; }
+        else { @unlink($ROOT.'/config/https.on'); lua_apply(); $msg='applied:HTTPS desactivado.'; }
+    }
 
     header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').'&msg='.urlencode($msg));
     exit;
@@ -372,6 +377,20 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
       <form method="post">
         <input type="hidden" name="action" value="hosts">
         <button class="btn ghost" type="submit">Sincronizar dominios</button>
+      </form>
+    </div>
+
+    <?php $httpsOn = is_file($ROOT.'/config/https.on') && is_file($ROOT.'/data/ssl/lua.pem'); ?>
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">HTTPS local <span class="jstate <?= $httpsOn?'ok':'err' ?>" style="margin-left:6px"><?= $httpsOn?'ACTIVO':'INACTIVO' ?></span></div>
+        <div class="muted">Certificados de confianza para <code>https://&lt;proyecto&gt;.<?= e($tld) ?></code> (candado verde). Al activar, Windows pedirá permiso para instalar la CA (una vez).</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post">
+        <input type="hidden" name="action" value="https">
+        <input type="hidden" name="enable" value="<?= $httpsOn?'0':'1' ?>">
+        <button class="btn <?= $httpsOn?'danger':'ghost' ?>" type="submit"><?= $httpsOn?'Desactivar':'Activar' ?> HTTPS</button>
       </form>
     </div>
 

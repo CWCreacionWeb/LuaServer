@@ -45,6 +45,13 @@ $SitesJson  = Join-Path $Root "config\sites.json"
 $ApacheLog  = Join-Path $Root "logs\apache"
 $TmpDir     = Join-Path $Root "tmp"
 $HostsFile  = Join-Path $env:WINDIR "System32\drivers\etc\hosts"
+# --- HTTPS (mkcert + mod_ssl) ---
+$SslDir     = Join-Path $Root "data\ssl"
+$Mkcert     = Join-Path $Bin  "mkcert\mkcert.exe"
+$HttpsFlag  = Join-Path $Root "config\https.on"
+$SslConf    = Join-Path $Root "config\apache\ssl.conf"
+$SslCert    = Join-Path $SslDir "lua.pem"
+$SslKey     = Join-Path $SslDir "lua-key.pem"
 
 $SvcApache  = "luaApache"
 $Tld        = "lua.test"
@@ -188,6 +195,24 @@ function Set-PhpInis {
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
 }
 
+# Escribe config\apache\ssl.conf: carga mod_ssl + Listen 443 solo si HTTPS esta activo.
+function Set-Ssl {
+    $on = (Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)
+    if ($on) {
+        Set-Content -Path $SslConf -Encoding ascii -Value @'
+# Generado por lua.ps1 -- HTTPS activo
+LoadModule ssl_module modules/mod_ssl.so
+LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
+Listen 443
+SSLCipherSuite HIGH:!aNULL:!MD5
+SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+SSLSessionCache "shmcb:${LUAROOT}/tmp/ssl_scache(512000)"
+SSLSessionCacheTimeout 300
+'@
+    } else {
+        Set-Content -Path $SslConf -Value "# HTTPS desactivado" -Encoding ascii
+    }
+}
 function New-VhostFile($name, $php) {
     $docroot = Fwd (Get-DocRoot $name)
     $phpdir  = Fwd (Join-Path $PhpBase $php)
@@ -195,6 +220,29 @@ function New-VhostFile($name, $php) {
     $logdir  = Fwd $ApacheLog
     $tpl = Get-Content $Template -Raw
     $out = $tpl.Replace('{NAME}',$name).Replace('{PHPVER}',$php).Replace('{DOCROOT}',$docroot).Replace('{PHPDIR}',$phpdir).Replace('{PHPCGI}',$phpcgi).Replace('{LOGDIR}',$logdir)
+    if ((Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)) {
+        $cert = Fwd $SslCert; $key = Fwd $SslKey
+        $out = $out + @"
+
+<VirtualHost *:443>
+    ServerName $name.$Tld
+    ServerAlias www.$name.$Tld
+    DocumentRoot "$docroot"
+    FcgidInitialEnv PHPRC "$phpdir"
+    SSLEngine on
+    SSLCertificateFile "$cert"
+    SSLCertificateKeyFile "$key"
+    <Directory "$docroot">
+        Options +ExecCGI +FollowSymLinks
+        AllowOverride All
+        Require all granted
+        DirectoryIndex index.php index.html
+        FcgidWrapper "$phpcgi" .php
+    </Directory>
+    ErrorLog  "$logdir/$name-ssl-error.log"
+</VirtualHost>
+"@
+    }
     Set-Content -Path (Join-Path $VhostDir "$name.conf") -Value $out -Encoding ascii
 }
 function Regenerate-Vhosts {
@@ -206,9 +254,10 @@ function Regenerate-Vhosts {
 
 function Cmd-Init {
     Info "Ajustando el stack a: $Root"
-    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,(Join-Path $Root 'logs\php'))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$SslDir,(Join-Path $Root 'logs\php'))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     Set-HttpdConf
     Set-PhpInis
+    Set-Ssl
     Regenerate-Vhosts
     if (Test-Path $Httpd) { Info "Validando Apache..."; if (Test-HttpdConfig) { Ok "Config de Apache: OK" } else { Err "Revisa la config de Apache (.\lua.ps1 logs)" } }
     Ok "Init completo. Arranca con:  .\lua.ps1 start"
@@ -248,10 +297,12 @@ function Cmd-Watch {
     $pf = Join-Path $TmpDir "watch.pid"; Set-Content -Path $pf -Value $PID -Encoding ascii
     $fApply = Join-Path $TmpDir "apply.flag"
     $fHosts = Join-Path $TmpDir "hosts.flag"
+    $fHttps = Join-Path $TmpDir "https.flag"
     while ($true) {
         try {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
             if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
+            if (Test-Path $fHttps) { Remove-Item $fHttps -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'https-setup') }
             Process-Jobs
         } catch {}
         Start-Sleep -Seconds 1
@@ -276,6 +327,7 @@ function Cmd-Apply {
     $log = Join-Path $ApacheLog "apply.log"
     "$(Get-Date -Format o)  apply: start" | Add-Content $log
     Set-PhpInis | Out-Null
+    Set-Ssl
     Regenerate-Vhosts
     if (-not (Test-HttpdConfig)) { "$(Get-Date -Format o)  apply: CONFIG INVALIDA, abortado" | Add-Content $log; return }
     Start-Sleep -Milliseconds 800   # deja que el navegador reciba la respuesta antes de reiniciar
@@ -444,6 +496,28 @@ function Cmd-Hosts {
     Write-Host $HostsEnd -ForegroundColor DarkGray; Write-Host ""
 }
 function Cmd-Logs { Get-Content (Join-Path $ApacheLog "error.log") -Tail 40 -ErrorAction SilentlyContinue }
+function Cmd-HttpsSetup {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    New-Item -ItemType Directory -Force -Path $SslDir | Out-Null
+    if (-not (Test-Path $Mkcert)) { Err "Falta mkcert (bin\mkcert\mkcert.exe). Ejecuta bootstrap.ps1."; $ErrorActionPreference=$prev; return }
+    Info "Instalando CA local de confianza (mkcert -install)..."
+    & $Mkcert -install
+    Info "Generando certificado para *.$Tld ..."
+    & $Mkcert -cert-file "$SslCert" -key-file "$SslKey" "*.$Tld" "$Tld" "localhost" "127.0.0.1" "::1"
+    $ErrorActionPreference = $prev
+    if ((Test-Path $SslCert) -and (Test-Path $SslKey)) {
+        Set-Content -Path $HttpsFlag -Value "1" -Encoding ascii
+        Set-Ssl; Regenerate-Vhosts
+        if (Test-HttpdConfig) { Restart-Apache; Ok "HTTPS activado: los sitios responden en https://<proyecto>.$Tld con candado verde." }
+        else { Err "La config SSL no es valida; revisa .\lua.ps1 logs" }
+    } else { Err "No se genero el certificado." }
+}
+function Cmd-HttpsOff {
+    Remove-Item $HttpsFlag -Force -ErrorAction SilentlyContinue
+    Set-Ssl; Regenerate-Vhosts
+    if (Test-HttpdConfig) { Restart-Apache }
+    Ok "HTTPS desactivado."
+}
 function Cmd-Help { Get-Content $PSCommandPath -TotalCount 40 | ForEach-Object { $_ } }
 
 switch ($Command.ToLower()) {
@@ -461,6 +535,8 @@ switch ($Command.ToLower()) {
     "hosts"       { Cmd-Hosts }
     "apply"       { Cmd-Apply }
     "watch"       { Cmd-Watch }
+    "https-setup" { Require-Admin; Cmd-HttpsSetup }
+    "https-off"   { Cmd-HttpsOff }
     "hosts-sync"  { Require-Admin; Update-Hosts; Ok "Dominios sincronizados en el archivo hosts." }
     "setup"       { Require-Admin; & (Join-Path $Root "config\_setup.ps1") }
     "logs"        { Cmd-Logs }
