@@ -23,6 +23,16 @@ $CURATED = [
   'error_reporting'     => ['label' => 'Nivel de errores',        'type' => 'text',  'ph' => 'E_ALL'],
 ];
 
+// URLs de las DLL de Xdebug por version de PHP (Windows NTS x64). Se rellenan tras verificar.
+$XDEBUG_URLS = [
+  '7.4' => 'https://xdebug.org/files/php_xdebug-3.1.6-7.4-vc15-x86_64.dll',
+  '8.1' => 'https://xdebug.org/files/php_xdebug-3.5.3-8.1-nts-vs16-x86_64.dll',
+  '8.2' => 'https://xdebug.org/files/php_xdebug-3.5.3-8.2-nts-vs16-x86_64.dll',
+  '8.3' => 'https://xdebug.org/files/php_xdebug-3.5.3-8.3-nts-vs16-x86_64.dll',
+  '8.4' => 'https://xdebug.org/files/php_xdebug-3.5.3-8.4-nts-vs17-x86_64.dll',
+  '8.5' => 'https://xdebug.org/files/php_xdebug-3.5.3-8.5-nts-vs17-x86_64.dll',
+];
+
 function read_json($f){ $r=@file_get_contents($f); if($r===false)return null; $r=preg_replace('/^\xEF\xBB\xBF/','',$r); return json_decode($r,true); }
 function write_json($f,$d){ file_put_contents($f, json_encode($d, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE)); }
 function valid_name($n){ return (bool)preg_match('/^[a-z0-9][a-z0-9_-]{0,40}$/', $n); }
@@ -37,6 +47,8 @@ function lua_flag($name){ @file_put_contents(dirname(__DIR__,2).'/tmp/'.$name.'.
 function lua_apply(){ lua_flag('apply'); }
 function lua_hosts(){ lua_flag('hosts'); }
 
+function tail_file($f,$n=250){ if(!is_file($f)) return ''; $lines=@file($f,FILE_IGNORE_NEW_LINES); if($lines===false) return ''; return implode("\n",array_slice($lines,-$n)); }
+function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n : ''; }
 function read_jobs($dir){
     $out=[];
     if(is_dir($dir)){
@@ -104,6 +116,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         foreach (glob($ROOT.'/tmp/jobs/*.status') as $f) @unlink($f);
         $msg='info:Historial de tareas limpiado.';
     }
+    elseif ($action === 'xdebug') {
+        $ver = $_POST['ver'] ?? '';
+        $enable = ($_POST['enable'] ?? '') === '1';
+        if ($vers && in_array($ver,$vers,true)) {
+            $marker = $OVR_DIR.'/'.$ver.'.xdebug.on';
+            $dll = $PHP_BASE.'/'.$ver.'/ext/php_xdebug.dll';
+            if ($enable) {
+                @mkdir($OVR_DIR,0777,true); @file_put_contents($marker,'1');
+                if (is_file($dll)) { lua_apply(); $msg='applied:Xdebug activado en PHP '.$ver.'.'; }
+                elseif (!empty($XDEBUG_URLS[$ver])) {
+                    $id='xdebug-'.$ver.'-'.time();
+                    $job=['id'=>$id,'name'=>'xdebug-'.$ver,'php'=>$ver,'type'=>'xdebug','url'=>$XDEBUG_URLS[$ver]];
+                    @mkdir($ROOT.'/tmp/jobs',0777,true);
+                    file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                    $msg='job:Descargando Xdebug para PHP '.$ver.'…';
+                } else { @unlink($marker); $msg='error:No hay URL de Xdebug configurada para PHP '.$ver.'.'; }
+            } else { @unlink($marker); lua_apply(); $msg='applied:Xdebug desactivado en PHP '.$ver.'.'; }
+        } else { $msg='error:Versión no válida.'; }
+        header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
+    }
+    elseif ($action === 'clearlog') {
+        $lf = safe_logname($_POST['log'] ?? '');
+        if ($lf && is_file($ROOT.'/logs/apache/'.$lf)) { @file_put_contents($ROOT.'/logs/apache/'.$lf, ''); $msg='info:Log '.$lf.' vaciado.'; }
+        $tab='logs';
+        header('Location: ?tab=logs&log='.urlencode($lf)); exit;
+    }
     elseif ($action === 'switch') {
         $name=$_POST['name']??''; $php=$_POST['php']??'';
         if (isset($cfg['sites'][$name]) && (!$vers || in_array($php,$vers,true))) {
@@ -165,6 +203,7 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
 <title>lua-server</title>
 <?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
 <?php if ($tab==='proyectos' && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
+<?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
 <style>
   :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; --ok:#3fb950; --warn:#d29922; --err:#f85149; --in:#11141c; }
   @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; --in:#fff; } }
@@ -227,6 +266,7 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
   <div class="tabs">
     <a href="?tab=proyectos" class="<?= $tab==='proyectos'?'on':'' ?>">Proyectos</a>
     <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
+    <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">Logs</a>
   </div>
 
   <?php if ($mtext): ?>
@@ -335,7 +375,7 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
       </form>
     </div>
 
-  <?php else: /* ---------- PESTAÑA PHP ---------- */ ?>
+  <?php elseif ($tab==='php'): /* ---------- PESTAÑA PHP ---------- */ ?>
 
     <h2>Editar php.ini por versión</h2>
     <div class="muted" style="margin-bottom:14px">Los cambios se guardan como <em>overrides</em> (sobreviven a actualizaciones) y se aplican recargando Apache automáticamente.</div>
@@ -347,6 +387,20 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
       <details <?= $v===$openVer?'open':'' ?>>
         <summary>PHP <?= e($v) ?> <span class="op">&mdash; config/php/<?= e($v) ?>.overrides.ini</span></summary>
         <div class="pane">
+          <?php $xon = is_file($OVR_DIR.'/'.$v.'.xdebug.on'); $xdll = is_file($PHP_BASE.'/'.$v.'/ext/php_xdebug.dll'); $xactive=($xon&&$xdll); $xnourl=(empty($XDEBUG_URLS[$v]) && !$xdll); ?>
+          <div class="row" style="margin-bottom:4px">
+            <span style="font-weight:600">Xdebug</span>
+            <span class="jstate <?= $xactive?'ok':'err' ?>"><?= $xactive?'ACTIVADO':'DESACTIVADO' ?></span>
+            <?php if ($xon && !$xdll): ?><span class="muted">descargando DLL…</span><?php endif; ?>
+            <div class="spacer"></div>
+            <form method="post">
+              <input type="hidden" name="action" value="xdebug">
+              <input type="hidden" name="ver" value="<?= e($v) ?>">
+              <input type="hidden" name="enable" value="<?= $xactive?'0':'1' ?>">
+              <button class="btn <?= $xactive?'danger':'' ?>" <?= $xnourl?'disabled':'' ?>><?= $xactive?'Desactivar':'Activar' ?> Xdebug</button>
+            </form>
+          </div>
+          <div class="muted" style="margin-bottom:16px;font-size:12px">Depuración paso a paso en el puerto <b>9003</b> (VS Code / PhpStorm)<?= $xnourl?' · <em>sin DLL disponible para esta versión</em>':'' ?>.</div>
           <form method="post">
             <input type="hidden" name="action" value="phpini">
             <input type="hidden" name="ver" value="<?= e($v) ?>">
@@ -374,6 +428,30 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
         </div>
       </details>
     <?php endforeach; endif; ?>
+
+  <?php elseif ($tab==='logs'): /* ---------- PESTAÑA LOGS ---------- */
+      $logDir = $ROOT.'/logs/apache';
+      $logFiles = [];
+      foreach (glob($logDir.'/*.log') as $f) $logFiles[] = basename($f);
+      sort($logFiles);
+      if (!$logFiles) $logFiles = ['error.log'];
+      $sel = safe_logname($_GET['log'] ?? '');
+      if (!$sel || !in_array($sel,$logFiles,true)) $sel = in_array('error.log',$logFiles,true)?'error.log':$logFiles[0];
+      $refresh = (($_GET['refresh']??'')==='1');
+      $content = tail_file($logDir.'/'.$sel, 300);
+  ?>
+    <div class="row" style="margin-bottom:14px;gap:8px;flex-wrap:wrap">
+      <?php foreach ($logFiles as $lf): ?>
+        <a href="?tab=logs&log=<?= urlencode($lf) ?><?= $refresh?'&refresh=1':'' ?>" class="btn <?= $lf===$sel?'':'ghost' ?>" style="padding:6px 12px;font-size:13px"><?= e($lf) ?></a>
+      <?php endforeach; ?>
+      <div class="spacer"></div>
+      <a href="?tab=logs&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost" style="padding:6px 12px;font-size:13px"><?= $refresh?'⏸ Auto-refresco ON':'▶ Auto-refresco' ?></a>
+      <form method="post" onsubmit="return confirm('¿Vaciar <?= e($sel) ?>?')" style="display:inline">
+        <input type="hidden" name="action" value="clearlog"><input type="hidden" name="log" value="<?= e($sel) ?>">
+        <button class="btn ghost" style="padding:6px 12px;font-size:13px">Vaciar</button>
+      </form>
+    </div>
+    <pre class="joblog" style="max-height:62vh"><?= $content!=='' ? e($content) : '(vacío)' ?></pre>
 
   <?php endif; ?>
 

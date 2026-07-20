@@ -24,7 +24,11 @@ máquina). Desde ahí puedes, sin tocar la terminal:
   o **clonando un repo de Git**), eliminar y cambiar la versión de PHP de cada uno.
   Las creaciones pesadas se hacen en segundo plano con progreso visible.
 - **Versiones PHP**: editar los valores del `php.ini` de cada versión
-  (memoria, tamaños de subida, timezone, errores…) más directivas libres.
+  (memoria, tamaños de subida, timezone, errores…) más directivas libres, y
+  **activar/desactivar Xdebug** por versión (descarga la DLL correcta y lo deja
+  configurado para depurar paso a paso en el puerto **9003**, VS Code/PhpStorm).
+- **Logs**: ver en vivo los logs de Apache y de cada proyecto desde el navegador,
+  con auto-refresco y opción de vaciar.
 
 Los cambios se aplican solos: un proceso *watcher* (que arranca con `lua.ps1 start`)
 recarga Apache en un par de segundos. Los ajustes de `php.ini` se guardan como

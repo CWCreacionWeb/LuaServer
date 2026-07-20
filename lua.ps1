@@ -172,6 +172,17 @@ function Set-PhpInis {
         }
         $b.Add(""); $b.Add("; ===== overrides: config/php/$ver.overrides.ini =====")
         $b.AddRange([string[]](Get-Content $ovr))
+        # Xdebug: activo si existe el marcador Y la DLL
+        $xon = Join-Path $ovrDir "$ver.xdebug.on"
+        if ((Test-Path $xon) -and (Test-Path (Join-Path $ext "php_xdebug.dll"))) {
+            $b.Add(""); $b.Add("; ===== Xdebug (panel) =====")
+            $b.Add("zend_extension=xdebug")
+            $b.Add("xdebug.mode=debug")
+            $b.Add("xdebug.start_with_request=yes")
+            $b.Add("xdebug.client_host=127.0.0.1")
+            $b.Add("xdebug.client_port=9003")
+            $b.Add("xdebug.idekey=VSCODE")
+        }
         Set-Content -Path $ini -Value (@($lines) + $b.ToArray()) -Encoding ascii
     }
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
@@ -319,17 +330,24 @@ function Run-Job($id, $job) {
             "slim"      { & $phpExe $composer create-project slim/slim-skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
             "wordpress" { Download-WordPress $dir $log }
             "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
+            "xdebug"    { $dest = Join-Path $PhpBase "$php\ext\php_xdebug.dll"; "Descargando Xdebug: $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 20000)) { $ok=$false; $err="No se descargo la DLL de Xdebug"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Xdebug descargado ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
-        Add-SiteToConfig $name $php
-        Set-PhpInis | Out-Null
-        Regenerate-Vhosts
-        if (Test-HttpdConfig) { Restart-Apache }
-        Set-JobStatus $id $name $type "done" "Listo -> http://$name.$Tld"
+        if ($type -eq 'xdebug') {
+            Set-PhpInis | Out-Null
+            if (Test-HttpdConfig) { Restart-Apache }
+            Set-JobStatus $id $name $type "done" "Xdebug activado en PHP $php"
+        } else {
+            Add-SiteToConfig $name $php
+            Set-PhpInis | Out-Null
+            Regenerate-Vhosts
+            if (Test-HttpdConfig) { Restart-Apache }
+            Set-JobStatus $id $name $type "done" "Listo -> http://$name.$Tld"
+        }
         "== DONE ==" | Add-Content $log
     } else {
         Set-JobStatus $id $name $type "error" $err
