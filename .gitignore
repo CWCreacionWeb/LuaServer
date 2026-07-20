@@ -1,0 +1,20 @@
+# ===== binarios pesados (se descargan con bootstrap.ps1) =====
+/bin/
+/downloads/
+
+# ===== datos y runtime =====
+/data/
+/logs/
+/tmp/
+
+# ===== generado automaticamente =====
+/config/apache/vhosts/*.conf
+/tools/adminer.php
+
+# ===== proyectos (opcional: descomenta si NO quieres versionar tus sitios) =====
+# /www/
+
+# varios
+*.log
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,12 @@
+{
+    "defaultPhp":  "8.4",
+    "tld":  "lua.test",
+    "sites":  {
+                  "app85":  {
+                                "php":  "8.5"
+                            },
+                  "app84":  {
+                                "php":  "8.4"
+                            }
+              }
+}
