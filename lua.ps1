@@ -52,6 +52,9 @@ $HttpsFlag  = Join-Path $Root "config\https.on"
 $SslConf    = Join-Path $Root "config\apache\ssl.conf"
 $SslCert    = Join-Path $SslDir "lua.pem"
 $SslKey     = Join-Path $SslDir "lua-key.pem"
+# --- Mailpit (captura de correo) ---
+$Mailpit     = Join-Path $Bin  "mailpit\mailpit.exe"
+$MailpitFlag = Join-Path $Root "config\mailpit.on"
 
 $SvcApache  = "luaApache"
 $Tld        = "lua.test"
@@ -190,6 +193,13 @@ function Set-PhpInis {
             $b.Add("xdebug.client_port=9003")
             $b.Add("xdebug.idekey=VSCODE")
         }
+        # Mailpit: rutear mail() de PHP al buzon local (SMTP 1025)
+        if (Test-Path $MailpitFlag) {
+            $b.Add(""); $b.Add("; ===== Mailpit (captura de correo) =====")
+            $b.Add("SMTP = 127.0.0.1")
+            $b.Add("smtp_port = 1025")
+            $b.Add("sendmail_from = dev@$Tld")
+        }
         Set-Content -Path $ini -Value (@($lines) + $b.ToArray()) -Encoding ascii
     }
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
@@ -275,12 +285,21 @@ function Start-Watcher {
     if (Watcher-Alive) { return }
     Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
 }
+function Mailpit-Up { [bool](Get-Process mailpit -ErrorAction SilentlyContinue) }
+function Start-Mailpit {
+    if (-not (Test-Path $Mailpit)) { return }
+    if (Mailpit-Up) { return }
+    $db = Join-Path $Root "data\mailpit.db"
+    Start-Process -FilePath $Mailpit -WindowStyle Hidden -ArgumentList @('--smtp','127.0.0.1:1025','--listen','127.0.0.1:8025','--db-file',"`"$db`"")
+}
+function Stop-Mailpit { Get-Process mailpit -ErrorAction SilentlyContinue | Stop-Process -Force }
 
 function Cmd-Start {
     if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
     elseif (Apache-Up) { Info "Apache ya estaba arriba" }
     else { Start-Process -FilePath $Httpd -WindowStyle Hidden; Ok "Apache arrancado" }
     Start-Watcher
+    if (Test-Path $MailpitFlag) { Start-Mailpit }
     Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
@@ -288,6 +307,7 @@ function Cmd-Stop {
     if (Service-Exists $SvcApache) { Stop-Service $SvcApache -Force -ErrorAction SilentlyContinue } else { Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force }
     $pf = Join-Path $TmpDir "watch.pid"
     if (Test-Path $pf) { $wp = Get-Content $pf -ErrorAction SilentlyContinue; if ($wp) { Stop-Process -Id ([int]$wp) -Force -ErrorAction SilentlyContinue }; Remove-Item $pf -Force -ErrorAction SilentlyContinue }
+    Stop-Mailpit
     Ok "Apache detenido."
 }
 
@@ -303,6 +323,10 @@ function Cmd-Watch {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
             if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
             if (Test-Path $fHttps) { Remove-Item $fHttps -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'https-setup') }
+            # Reconciliar Mailpit con su flag
+            $mpOn = Test-Path $MailpitFlag
+            if ($mpOn -and (Test-Path $Mailpit) -and -not (Mailpit-Up)) { Start-Mailpit }
+            if (-not $mpOn -and (Mailpit-Up)) { Stop-Mailpit }
             Process-Jobs
         } catch {}
         Start-Sleep -Seconds 1
@@ -383,9 +407,10 @@ function Run-Job($id, $job) {
             "wordpress" { Download-WordPress $dir $log }
             "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
             "xdebug"    { $dest = Join-Path $PhpBase "$php\ext\php_xdebug.dll"; "Descargando Xdebug: $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 20000)) { $ok=$false; $err="No se descargo la DLL de Xdebug"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Xdebug descargado ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
+            "mailpit"   { $mpDir = Join-Path $Bin "mailpit"; New-Item -ItemType Directory -Force -Path $mpDir | Out-Null; $zip = Join-Path $mpDir "mailpit.zip"; "Descargando Mailpit..." | Add-Content $log; & curl.exe -s -L -o "$zip" "https://github.com/axllent/mailpit/releases/latest/download/mailpit-windows-amd64.zip" 2>&1 | Add-Content $log; if (Test-Path $zip) { Expand-Archive $zip $mpDir -Force; Remove-Item $zip -Force -ErrorAction SilentlyContinue }; if (-not (Test-Path $Mailpit)) { $ok=$false; $err="No se descargo Mailpit" } else { "Mailpit descargado." | Add-Content $log } }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -393,6 +418,11 @@ function Run-Job($id, $job) {
             Set-PhpInis | Out-Null
             if (Test-HttpdConfig) { Restart-Apache }
             Set-JobStatus $id $name $type "done" "Xdebug activado en PHP $php"
+        } elseif ($type -eq 'mailpit') {
+            Set-PhpInis | Out-Null
+            Start-Mailpit
+            if (Test-HttpdConfig) { Restart-Apache }
+            Set-JobStatus $id $name $type "done" "Mailpit activo: buzon en http://localhost:8025"
         } else {
             Add-SiteToConfig $name $php
             Set-PhpInis | Out-Null

@@ -182,6 +182,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($enable) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); $msg='info:Activando HTTPS: acepta el aviso de Windows (UAC) para instalar la CA. Recarga en unos segundos.'; }
         else { @unlink($ROOT.'/config/https.on'); lua_apply(); $msg='applied:HTTPS desactivado.'; }
     }
+    elseif ($action === 'mailpit') {
+        $enable = ($_POST['enable'] ?? '') === '1';
+        if ($enable) {
+            @file_put_contents($ROOT.'/config/mailpit.on','1');
+            if (is_file($ROOT.'/bin/mailpit/mailpit.exe')) { lua_apply(); $msg='applied:Mailpit activado. Buzón en http://localhost:8025'; }
+            else {
+                $id='mailpit-'.time();
+                $job=['id'=>$id,'name'=>'mailpit','php'=>($cfg['defaultPhp']??'8.4'),'type'=>'mailpit','url'=>''];
+                @mkdir($ROOT.'/tmp/jobs',0777,true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $msg='job:Descargando y activando Mailpit…';
+            }
+        } else { @unlink($ROOT.'/config/mailpit.on'); lua_apply(); $msg='applied:Mailpit desactivado.'; }
+    }
 
     header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').'&msg='.urlencode($msg));
     exit;
@@ -391,6 +405,21 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
         <input type="hidden" name="action" value="https">
         <input type="hidden" name="enable" value="<?= $httpsOn?'0':'1' ?>">
         <button class="btn <?= $httpsOn?'danger':'ghost' ?>" type="submit"><?= $httpsOn?'Desactivar':'Activar' ?> HTTPS</button>
+      </form>
+    </div>
+
+    <?php $mailOn = is_file($ROOT.'/config/mailpit.on'); ?>
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Mailpit <span class="jstate <?= $mailOn?'ok':'err' ?>" style="margin-left:6px"><?= $mailOn?'ACTIVO':'INACTIVO' ?></span></div>
+        <div class="muted">Atrapa los emails que envían tus proyectos PHP (SMTP <code>127.0.0.1:1025</code>) y los muestra en un buzón web. No salen a internet.</div>
+      </div>
+      <div class="spacer"></div>
+      <?php if ($mailOn): ?><a class="btn ghost" href="http://localhost:8025" target="_blank">Abrir buzón &#8599;</a><?php endif; ?>
+      <form method="post">
+        <input type="hidden" name="action" value="mailpit">
+        <input type="hidden" name="enable" value="<?= $mailOn?'0':'1' ?>">
+        <button class="btn <?= $mailOn?'danger':'ghost' ?>" type="submit"><?= $mailOn?'Desactivar':'Activar' ?> Mailpit</button>
       </form>
     </div>
 

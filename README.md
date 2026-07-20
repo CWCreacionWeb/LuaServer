@@ -32,6 +32,8 @@ máquina). Desde ahí puedes, sin tocar la terminal:
 - **HTTPS local**: botón para activar certificados de confianza (mkcert) y servir
   `https://<proyecto>.lua.test` con candado verde. Al activarlo, Windows pide
   permiso (UAC) para instalar la CA local una sola vez.
+- **Mailpit**: botón para activar una bandeja de correo local que captura los emails
+  que envían tus proyectos PHP (SMTP `127.0.0.1:1025`); buzón web en `http://localhost:8025`.
 
 Los cambios se aplican solos: un proceso *watcher* (que arranca con `lua.ps1 start`)
 recarga Apache en un par de segundos. Los ajustes de `php.ini` se guardan como

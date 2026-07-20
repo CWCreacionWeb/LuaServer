@@ -68,6 +68,12 @@ Say "descargando mkcert (HTTPS local)..."
 New-Item -ItemType Directory -Force -Path (Join-Path $root "bin\mkcert") | Out-Null
 & curl.exe -s -L -o (Join-Path $root "bin\mkcert\mkcert.exe") "https://github.com/FiloSottile/mkcert/releases/download/v1.4.4/mkcert-v1.4.4-windows-amd64.exe"
 
+Say "descargando Mailpit (captura de correo)..."
+New-Item -ItemType Directory -Force -Path (Join-Path $root "bin\mailpit") | Out-Null
+& curl.exe -s -L -o (Join-Path $root "bin\mailpit\mailpit.zip") "https://github.com/axllent/mailpit/releases/latest/download/mailpit-windows-amd64.zip"
+Expand-Archive (Join-Path $root "bin\mailpit\mailpit.zip") (Join-Path $root "bin\mailpit") -Force
+Remove-Item (Join-Path $root "bin\mailpit\mailpit.zip") -Force -ErrorAction SilentlyContinue
+
 Say "aplicando configuracion (lua.ps1 init)..."
 & (Join-Path $root "lua.ps1") init
 
