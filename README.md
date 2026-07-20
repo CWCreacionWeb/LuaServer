@@ -12,7 +12,22 @@ disco (mucho más rápido que las carpetas compartidas de Docker en Windows).
 
 - **Apache 2.4** + **mod_fcgid** (enruta cada proyecto a su versión de PHP)
 - **PHP 7.4, 8.1, 8.2, 8.3, 8.4, 8.5** (NTS x64) conviviendo
-- Panel web en `http://localhost` y un único script de control: `lua.ps1`
+- **Panel web** en `http://localhost` para gestionar todo con el ratón
+- Script de control `lua.ps1` para quien prefiera la terminal
+
+## Panel web (http://localhost)
+
+Con el servidor arrancado, abre **http://localhost** (solo accesible desde esta
+máquina). Desde ahí puedes, sin tocar la terminal:
+
+- **Proyectos**: crear, eliminar y cambiar la versión de PHP de cada proyecto.
+- **Versiones PHP**: editar los valores del `php.ini` de cada versión
+  (memoria, tamaños de subida, timezone, errores…) más directivas libres.
+
+Los cambios se aplican solos: un proceso *watcher* (que arranca con `lua.ps1 start`)
+recarga Apache en un par de segundos. Los ajustes de `php.ini` se guardan como
+*overrides* en `config\php\<version>.overrides.ini` y **sobreviven** a las
+actualizaciones del stack.
 
 ## Requisitos
 

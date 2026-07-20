@@ -53,7 +53,8 @@ $HostsEnd   = "# === lua-server END ==="
 
 # extensiones PHP a habilitar (solo si existe su DLL). mysqli/pdo_mysql incluidas
 # por si tus proyectos conectan a un MySQL (p.ej. en Docker) via 127.0.0.1.
-$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2')
+# com_dotnet lo usa el panel para lanzar la recarga de Apache en segundo plano.
+$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet')
 
 function Info($m){ Write-Host "[lua] $m" -ForegroundColor Cyan }
 function Ok($m){ Write-Host "[ok]  $m" -ForegroundColor Green }
@@ -97,6 +98,23 @@ function Get-LanIp {
 function Service-Exists($name) { [bool](Get-Service -Name $name -ErrorAction SilentlyContinue) }
 function Fwd($p) { return ($p -replace '\\','/') }
 function Apache-Up { [bool](Get-Process httpd -ErrorAction SilentlyContinue) }
+function Port80-Free { -not (Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue) }
+# Reinicio robusto: usa el servicio si existe; en consola espera a que el puerto 80 quede libre.
+function Restart-Apache {
+    if (Service-Exists $SvcApache) { Restart-Service $SvcApache; return }
+    Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force
+    for ($i=0; $i -lt 24; $i++) { Start-Sleep -Milliseconds 250; if (Port80-Free) { break } }
+    Start-Process -FilePath $Httpd -WindowStyle Hidden
+}
+# Valida la config de Apache SIN lanzar excepcion (httpd -t escribe en stderr:
+# con ErrorActionPreference=Stop eso rompe el script, por eso aislamos aqui).
+function Test-HttpdConfig {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $null = & $Httpd -t 2>&1
+    $ok = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = $prev
+    return $ok
+}
 
 # ============================================================
 #  INIT: re-aplica rutas a la carpeta actual (portable)
@@ -135,10 +153,25 @@ function Set-PhpInis {
         $b.Add(""); $b.Add("; ===== lua-server ====="); $b.Add("extension_dir = `"$(Fwd $ext)`"")
         $b.AddRange([string[]]$enable)
         if ($hasOp) { $b.Add("zend_extension=opcache"); $b.Add("opcache.enable = 1"); $b.Add("opcache.enable_cli = 0"); $b.Add("opcache.validate_timestamps = 1"); $b.Add("opcache.revalidate_freq = 0") }
-        $b.Add("date.timezone = Europe/Madrid"); $b.Add("memory_limit = 512M")
-        $b.Add("upload_max_filesize = 128M"); $b.Add("post_max_size = 128M"); $b.Add("max_execution_time = 120")
-        $b.Add("cgi.fix_pathinfo = 1"); $b.Add("display_errors = On"); $b.Add("error_reporting = E_ALL")
+        $b.Add("cgi.fix_pathinfo = 1")
         $b.Add("upload_tmp_dir = `"$tmpF`""); $b.Add("sys_temp_dir = `"$tmpF`""); $b.Add("session.save_path = `"$tmpF`"")
+        # --- overrides editables desde el panel (sobreviven a las regeneraciones) ---
+        $ovrDir = Join-Path $Root "config\php"; New-Item -ItemType Directory -Force -Path $ovrDir | Out-Null
+        $ovr = Join-Path $ovrDir "$ver.overrides.ini"
+        if (-not (Test-Path $ovr)) {
+            Set-Content -Path $ovr -Encoding ascii -Value @(
+              "; Ajustes editables desde el panel (http://localhost). Se aplican al final: ganan.",
+              "date.timezone = Europe/Madrid",
+              "memory_limit = 512M",
+              "upload_max_filesize = 128M",
+              "post_max_size = 128M",
+              "max_execution_time = 120",
+              "max_input_vars = 5000",
+              "display_errors = On",
+              "error_reporting = E_ALL")
+        }
+        $b.Add(""); $b.Add("; ===== overrides: config/php/$ver.overrides.ini =====")
+        $b.AddRange([string[]](Get-Content $ovr))
         Set-Content -Path $ini -Value (@($lines) + $b.ToArray()) -Encoding ascii
     }
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
@@ -166,37 +199,77 @@ function Cmd-Init {
     Set-HttpdConf
     Set-PhpInis
     Regenerate-Vhosts
-    if (Test-Path $Httpd) { Info "Validando Apache..."; & $Httpd -t }
+    if (Test-Path $Httpd) { Info "Validando Apache..."; if (Test-HttpdConfig) { Ok "Config de Apache: OK" } else { Err "Revisa la config de Apache (.\lua.ps1 logs)" } }
     Ok "Init completo. Arranca con:  .\lua.ps1 start"
 }
 
 # ============================================================
 #  Arranque (servicio si existe; si no, modo consola sin admin)
 # ============================================================
+function Watcher-Alive {
+    $pf = Join-Path $TmpDir "watch.pid"
+    if (Test-Path $pf) { $wp = Get-Content $pf -ErrorAction SilentlyContinue; if ($wp -and (Get-Process -Id ([int]$wp) -ErrorAction SilentlyContinue)) { return $true } }
+    return $false
+}
+function Start-Watcher {
+    if (Watcher-Alive) { return }
+    Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
+}
+
 function Cmd-Start {
     if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
     elseif (Apache-Up) { Info "Apache ya estaba arriba" }
     else { Start-Process -FilePath $Httpd -WindowStyle Hidden; Ok "Apache arrancado" }
+    Start-Watcher
     Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
 function Cmd-Stop {
     if (Service-Exists $SvcApache) { Stop-Service $SvcApache -Force -ErrorAction SilentlyContinue } else { Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force }
+    $pf = Join-Path $TmpDir "watch.pid"
+    if (Test-Path $pf) { $wp = Get-Content $pf -ErrorAction SilentlyContinue; if ($wp) { Stop-Process -Id ([int]$wp) -Force -ErrorAction SilentlyContinue }; Remove-Item $pf -Force -ErrorAction SilentlyContinue }
     Ok "Apache detenido."
 }
+
+# Watcher: proceso independiente que aplica los cambios pedidos desde el panel web.
+# El panel solo crea archivos-senal en tmp\; este proceso los ejecuta (no es hijo de Apache).
+function Cmd-Watch {
+    $pf = Join-Path $TmpDir "watch.pid"; Set-Content -Path $pf -Value $PID -Encoding ascii
+    $fApply = Join-Path $TmpDir "apply.flag"
+    $fHosts = Join-Path $TmpDir "hosts.flag"
+    while ($true) {
+        try {
+            if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
+            if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+}
 function Cmd-Restart {
-    & $Httpd -t | Out-Host
-    if ($LASTEXITCODE -ne 0) { Err "Config invalida, no se reinicia."; return }
-    Cmd-Stop; Start-Sleep -Milliseconds 700; Cmd-Start
+    if (-not (Test-HttpdConfig)) { Err "Config invalida, no se reinicia."; return }
+    Restart-Apache
+    Ok "Apache reiniciado."
 }
 function Cmd-Reload {
     Info "Regenerando vhosts..."
     Regenerate-Vhosts
     if (Test-Admin) { Update-Hosts } else { Warn "Sin admin: no se actualizo hosts. Anade los dominios manualmente o corre 'setup'." }
-    & $Httpd -t | Out-Host
-    if ($LASTEXITCODE -ne 0) { Err "Config invalida: reload abortado."; return }
-    if (Service-Exists $SvcApache) { Restart-Service $SvcApache } elseif (Apache-Up) { Get-Process httpd | Stop-Process -Force; Start-Sleep -Milliseconds 500; Start-Process -FilePath $Httpd -WindowStyle Hidden }
+    if (-not (Test-HttpdConfig)) { Err "Config invalida: reload abortado."; return }
+    Restart-Apache
     Ok "Recargado."
+}
+
+# Recarga usada por el PANEL (se invoca en segundo plano). Aplica php.ini + vhosts y reinicia.
+function Cmd-Apply {
+    $log = Join-Path $ApacheLog "apply.log"
+    "$(Get-Date -Format o)  apply: start" | Add-Content $log
+    Set-PhpInis | Out-Null
+    Regenerate-Vhosts
+    if (-not (Test-HttpdConfig)) { "$(Get-Date -Format o)  apply: CONFIG INVALIDA, abortado" | Add-Content $log; return }
+    Start-Sleep -Milliseconds 800   # deja que el navegador reciba la respuesta antes de reiniciar
+    Restart-Apache
+    "$(Get-Date -Format o)  apply: done" | Add-Content $log
+    Ok "Cambios aplicados."
 }
 
 function Update-Hosts {
@@ -293,6 +366,9 @@ switch ($Command.ToLower()) {
     "list-sites"  { Cmd-ListSites }
     "list-php"    { Cmd-ListPhp }
     "hosts"       { Cmd-Hosts }
+    "apply"       { Cmd-Apply }
+    "watch"       { Cmd-Watch }
+    "hosts-sync"  { Require-Admin; Update-Hosts; Ok "Dominios sincronizados en el archivo hosts." }
     "setup"       { Require-Admin; & (Join-Path $Root "config\_setup.ps1") }
     "logs"        { Cmd-Logs }
     default       { Cmd-Help }

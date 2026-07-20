@@ -1,24 +1,126 @@
 <?php
 // ============================================================
-//  lua-server :: panel (solo PHP)
+//  lua-server :: panel de gestion (solo localhost)
+//  - Proyectos: crear / eliminar / cambiar version de PHP
+//  - PHP: editar overrides del php.ini de cada version
 // ============================================================
-$root   = dirname(__DIR__, 2);
-$cfgRaw = @file_get_contents($root . '/config/sites.json');
-if ($cfgRaw !== false) { $cfgRaw = preg_replace('/^\xEF\xBB\xBF/', '', $cfgRaw); } // quitar BOM
-$cfg    = $cfgRaw ? json_decode($cfgRaw, true) : null;
-if (!is_array($cfg)) { $cfg = ['sites' => [], 'tld' => 'lua.test', 'defaultPhp' => '8.4']; }
-$tld    = $cfg['tld'] ?? 'lua.test';
-$sites  = $cfg['sites'] ?? [];
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE);
 
-$phpBase = $root . '/bin/php';
-$phpVers = [];
-if (is_dir($phpBase)) {
-    foreach (scandir($phpBase) as $d) {
-        if ($d[0] === '.') continue;
-        if (is_file("$phpBase/$d/php-cgi.exe")) $phpVers[] = $d;
-    }
-    natsort($phpVers);
+$ROOT     = dirname(__DIR__, 2);
+$CFG_FILE = $ROOT . '/config/sites.json';
+$PHP_BASE = $ROOT . '/bin/php';
+$OVR_DIR  = $ROOT . '/config/php';
+$WWW      = $ROOT . '/www';
+
+$CURATED = [
+  'date.timezone'       => ['label' => 'Zona horaria',            'type' => 'text',  'ph' => 'Europe/Madrid'],
+  'memory_limit'        => ['label' => 'Límite de memoria',       'type' => 'text',  'ph' => '512M'],
+  'upload_max_filesize' => ['label' => 'Tamaño máx. de subida',   'type' => 'text',  'ph' => '128M'],
+  'post_max_size'       => ['label' => 'Tamaño máx. de POST',     'type' => 'text',  'ph' => '128M'],
+  'max_execution_time'  => ['label' => 'Tiempo máx. ejecución (s)','type' => 'text', 'ph' => '120'],
+  'max_input_vars'      => ['label' => 'Máx. variables de entrada','type' => 'text', 'ph' => '5000'],
+  'display_errors'      => ['label' => 'Mostrar errores',         'type' => 'onoff', 'ph' => ''],
+  'error_reporting'     => ['label' => 'Nivel de errores',        'type' => 'text',  'ph' => 'E_ALL'],
+];
+
+function read_json($f){ $r=@file_get_contents($f); if($r===false)return null; $r=preg_replace('/^\xEF\xBB\xBF/','',$r); return json_decode($r,true); }
+function write_json($f,$d){ file_put_contents($f, json_encode($d, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE)); }
+function valid_name($n){ return (bool)preg_match('/^[a-z0-9][a-z0-9_-]{0,40}$/', $n); }
+function e($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+
+function php_versions($base){
+    $v=[]; if(is_dir($base)){ foreach(scandir($base) as $d){ if($d[0]==='.')continue; if(is_file("$base/$d/php-cgi.exe")) $v[]=$d; } } natsort($v); return array_values($v);
 }
+// El panel NO lanza procesos: solo deja un archivo-senal en tmp\ que el watcher
+// (proceso independiente arrancado por 'lua.ps1 start') ejecuta en ~1 segundo.
+function lua_flag($name){ @file_put_contents(dirname(__DIR__,2).'/tmp/'.$name.'.flag', (string)time()); }
+function lua_apply(){ lua_flag('apply'); }
+function lua_hosts(){ lua_flag('hosts'); }
+
+function parse_overrides($file, $curatedKeys){
+    $vals=[]; $extra=[];
+    if(is_file($file)){
+        foreach(file($file, FILE_IGNORE_NEW_LINES) as $ln){
+            $t=trim($ln);
+            if($t===''||$t[0]===';'||$t[0]==='#'){ continue; }
+            if(preg_match('/^([a-zA-Z0-9_.]+)\s*=\s*(.*)$/',$t,$m) && in_array($m[1],$curatedKeys,true)){ $vals[$m[1]]=trim($m[2]); continue; }
+            $extra[]=$ln;
+        }
+    }
+    return [$vals,$extra];
+}
+
+// ---------------- POST (patron PRG) ----------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'lua.test','sites'=>[]];
+    if(!isset($cfg['sites'])||!is_array($cfg['sites'])) $cfg['sites']=[];
+    $vers = php_versions($PHP_BASE);
+    $tab='proyectos'; $msg='';
+
+    if ($action === 'create') {
+        $name = strtolower(trim($_POST['name'] ?? ''));
+        $php  = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
+        if (!valid_name($name)) { $msg='error:Nombre no válido (usa minúsculas, números, - o _).'; }
+        elseif (isset($cfg['sites'][$name])) { $msg='error:Ya existe un proyecto llamado "'.$name.'".'; }
+        elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
+        else {
+            @mkdir("$WWW/$name", 0777, true);
+            if (!file_exists("$WWW/$name/index.php")) file_put_contents("$WWW/$name/index.php", "<?php\nphpinfo();\n");
+            $cfg['sites'][$name] = ['php'=>$php];
+            write_json($CFG_FILE, $cfg); lua_apply();
+            $msg='applied:Proyecto "'.$name.'" creado con PHP '.$php.'.';
+        }
+    }
+    elseif ($action === 'switch') {
+        $name=$_POST['name']??''; $php=$_POST['php']??'';
+        if (isset($cfg['sites'][$name]) && (!$vers || in_array($php,$vers,true))) {
+            $cfg['sites'][$name]['php']=$php; write_json($CFG_FILE,$cfg); lua_apply();
+            $msg='applied:"'.$name.'" ahora usa PHP '.$php.'.';
+        } else { $msg='error:No se pudo cambiar la versión.'; }
+    }
+    elseif ($action === 'delete') {
+        $name=$_POST['name']??'';
+        if (isset($cfg['sites'][$name])) {
+            unset($cfg['sites'][$name]); write_json($CFG_FILE,$cfg); lua_apply();
+            $msg='applied:Proyecto "'.$name.'" eliminado (la carpeta www\\'.$name.' se conserva).';
+        } else { $msg='error:No existe ese proyecto.'; }
+    }
+    elseif ($action === 'phpini') {
+        $tab='php';
+        $ver=$_POST['ver']??'';
+        if ($vers && in_array($ver,$vers,true)) {
+            $ini = $_POST['ini'] ?? [];
+            $lines = ['; Ajustes editables desde el panel (http://localhost). Se aplican al final: ganan.'];
+            foreach ($CURATED as $k=>$meta) {
+                if (isset($ini[$k]) && trim($ini[$k])!=='') $lines[] = $k.' = '.trim($ini[$k]);
+            }
+            $extra = $_POST['extra'] ?? '';
+            if (trim($extra)!=='') {
+                $lines[]=''; $lines[]='; --- directivas adicionales ---';
+                foreach (preg_split('/\r?\n/',$extra) as $el){ if(trim($el)!=='') $lines[]=rtrim($el); }
+            }
+            @mkdir($OVR_DIR,0777,true);
+            file_put_contents("$OVR_DIR/$ver.overrides.ini", implode("\r\n",$lines)."\r\n");
+            lua_apply();
+            $msg='applied:php.ini de PHP '.$ver.' guardado.';
+        } else { $msg='error:Versión no válida.'; }
+    }
+    elseif ($action === 'hosts') { lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
+
+    header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').'&msg='.urlencode($msg));
+    exit;
+}
+
+// ---------------- GET (render) ----------------
+$cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'lua.test','sites'=>[]];
+$tld = $cfg['tld'] ?? 'lua.test';
+$sites = $cfg['sites'] ?? [];
+$defaultPhp = $cfg['defaultPhp'] ?? '8.4';
+$vers = php_versions($PHP_BASE);
+$tab = $_GET['tab'] ?? 'proyectos';
+$msg = $_GET['msg'] ?? '';
+[$mtype,$mtext] = array_pad(explode(':',$msg,2),2,'');
 $curPhp = PHP_VERSION;
 ?>
 <!doctype html>
@@ -27,28 +129,48 @@ $curPhp = PHP_VERSION;
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lua-server</title>
+<?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
 <style>
-  :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; --ok:#3fb950; }
-  @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; } }
+  :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; --ok:#3fb950; --warn:#d29922; --err:#f85149; --in:#11141c; }
+  @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; --in:#fff; } }
   *{box-sizing:border-box} body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
-  .wrap{max-width:960px;margin:0 auto;padding:40px 20px}
-  header{display:flex;align-items:center;gap:16px;margin-bottom:8px}
-  .logo{width:52px;height:52px;border-radius:12px;background:linear-gradient(135deg,var(--ac),#9b6efe);
-        display:flex;align-items:center;justify-content:center;font-weight:800;font-size:20px;color:#fff;letter-spacing:1px}
-  h1{margin:0;font-size:22px} .sub{color:var(--mut);font-size:14px;margin-top:2px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;margin-top:24px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;transition:.15s}
-  .card:hover{border-color:var(--ac);transform:translateY(-2px)}
-  .card a{color:var(--tx);text-decoration:none;font-weight:600;font-size:16px}
-  .tag{display:inline-block;font-size:12px;color:var(--ac);background:rgba(110,168,254,.12);padding:2px 8px;border-radius:999px;margin-top:8px}
-  .bar{display:flex;flex-wrap:wrap;gap:10px;margin-top:20px}
-  .pill{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:13px;color:var(--mut)}
-  .pill b{color:var(--tx)}
-  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle;background:var(--ok)}
-  .empty{background:var(--card);border:1px dashed var(--line);border-radius:14px;padding:30px;text-align:center;color:var(--mut);margin-top:24px}
-  code{background:rgba(128,128,128,.15);padding:2px 6px;border-radius:6px;font-size:13px}
-  h2{font-size:14px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;margin:34px 0 0}
-  footer{margin-top:40px;color:var(--mut);font-size:12px;text-align:center}
+  .wrap{max-width:900px;margin:0 auto;padding:34px 20px 60px}
+  header{display:flex;align-items:center;gap:16px;margin-bottom:6px}
+  .logo{width:50px;height:50px;border-radius:12px;background:linear-gradient(135deg,var(--ac),#9b6efe);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:19px;color:#fff;letter-spacing:1px}
+  h1{margin:0;font-size:21px} .sub{color:var(--mut);font-size:13px;margin-top:2px}
+  .tabs{display:flex;gap:6px;margin:22px 0 18px;border-bottom:1px solid var(--line)}
+  .tabs a{padding:9px 16px;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px}
+  .tabs a.on{color:var(--ac);border-color:var(--ac)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+  .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .row .name{font-weight:700;font-size:16px;min-width:150px}
+  .row .url{color:var(--mut);font-size:13px;text-decoration:none} .row .url:hover{color:var(--ac)}
+  .spacer{flex:1}
+  label{display:block;font-size:12px;color:var(--mut);margin:0 0 4px}
+  input,select,textarea{background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:14px;font-family:inherit}
+  input:focus,select,textarea:focus{outline:none;border-color:var(--ac)}
+  textarea{width:100%;min-height:90px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+  .btn{background:var(--ac);color:#fff;border:none;border-radius:9px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)}
+  .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--tx)}
+  .btn.danger{background:transparent;border:1px solid var(--line);color:var(--err)}
+  .btn.danger:hover{background:var(--err);color:#fff;border-color:var(--err)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
+  .tag{display:inline-block;font-size:12px;color:var(--ac);background:rgba(110,168,254,.12);padding:2px 9px;border-radius:999px}
+  .banner{padding:11px 15px;border-radius:10px;margin-bottom:16px;font-size:14px;border:1px solid}
+  .banner.applied{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
+  .banner.info{background:rgba(110,168,254,.12);border-color:var(--ac);color:var(--ac)}
+  .banner.error{background:rgba(248,81,73,.12);border-color:var(--err);color:var(--err)}
+  details{border:1px solid var(--line);border-radius:12px;margin-bottom:12px;background:var(--card)}
+  summary{padding:14px 18px;cursor:pointer;font-weight:700;font-size:16px;list-style:none;display:flex;align-items:center;gap:10px}
+  summary::-webkit-details-marker{display:none}
+  summary .op{font-size:12px;color:var(--mut);font-weight:500}
+  .pane{padding:4px 18px 18px}
+  h2{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;margin:26px 0 12px}
+  code{background:rgba(128,128,128,.16);padding:2px 6px;border-radius:6px;font-size:13px}
+  .muted{color:var(--mut);font-size:13px}
+  .inline{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+  footer{margin-top:34px;color:var(--mut);font-size:12px;text-align:center}
 </style>
 </head>
 <body>
@@ -57,37 +179,124 @@ $curPhp = PHP_VERSION;
     <div class="logo">LUA</div>
     <div>
       <h1>lua-server</h1>
-      <div class="sub">Servidor PHP local &middot; multi-versi&oacute;n &middot; <?= count($sites) ?> proyecto(s)</div>
+      <div class="sub">Servidor PHP local &middot; <?= count($sites) ?> proyecto(s) &middot; PHP: <?= e(implode(', ',$vers)) ?></div>
     </div>
   </header>
 
-  <div class="bar">
-    <span class="pill"><span class="dot"></span>Apache <b>en linea</b></span>
-    <span class="pill">Panel sobre <b>PHP <?= htmlspecialchars($curPhp) ?></b></span>
-    <span class="pill">PHP disponibles: <b><?= htmlspecialchars(implode(', ', $phpVers) ?: '—') ?></b></span>
+  <div class="tabs">
+    <a href="?tab=proyectos" class="<?= $tab==='proyectos'?'on':'' ?>">Proyectos</a>
+    <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
   </div>
 
-  <h2>Proyectos</h2>
-  <?php if (!$sites): ?>
-    <div class="empty">
-      A&uacute;n no hay proyectos.<br><br>
-      Crea uno desde PowerShell:<br>
-      <code>.\lua.ps1 add-site micliente 8.4</code>
-    </div>
-  <?php else: ?>
-    <div class="grid">
-      <?php foreach ($sites as $name => $info):
-            $ver = is_array($info) ? ($info['php'] ?? '?') : $info; ?>
-        <div class="card">
-          <a href="http://<?= htmlspecialchars($name) ?>.<?= htmlspecialchars($tld) ?>" target="_blank"><?= htmlspecialchars($name) ?> &rarr;</a>
-          <div class="sub" style="font-size:12px;margin-top:4px"><?= htmlspecialchars($name) ?>.<?= htmlspecialchars($tld) ?></div>
-          <span class="tag">PHP <?= htmlspecialchars($ver) ?></span>
-        </div>
-      <?php endforeach; ?>
+  <?php if ($mtext): ?>
+    <div class="banner <?= e($mtype) ?>">
+      <?= e($mtext) ?>
+      <?php if ($mtype==='applied'): ?> <span class="muted">— Apache se está recargando, la página se actualizará sola.</span><?php endif; ?>
     </div>
   <?php endif; ?>
 
-  <footer>lua-server &middot; Apache + mod_fcgid &middot; gestiona con <code>.\lua.ps1</code></footer>
+  <?php if ($tab==='proyectos'): ?>
+
+    <div class="card">
+      <form method="post" class="inline">
+        <input type="hidden" name="action" value="create">
+        <div>
+          <label>Nombre del proyecto</label>
+          <input name="name" placeholder="micliente" pattern="[a-z0-9][a-z0-9_-]*" required>
+        </div>
+        <div>
+          <label>Versión de PHP</label>
+          <select name="php">
+            <?php foreach ($vers as $v): ?>
+              <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <button class="btn" type="submit">+ Crear proyecto</button>
+      </form>
+      <div class="muted" style="margin-top:10px">Se crea la carpeta <code>www\&lt;nombre&gt;</code> y se sirve en <code>&lt;nombre&gt;.<?= e($tld) ?></code>. Si añades una carpeta <code>public\</code> se usa como raíz.</div>
+    </div>
+
+    <h2>Proyectos</h2>
+    <?php if (!$sites): ?>
+      <div class="card muted">Aún no hay proyectos. Crea el primero arriba.</div>
+    <?php else: foreach ($sites as $name => $info): $ver = is_array($info)?($info['php']??'?'):$info; ?>
+      <div class="card row">
+        <div class="name"><?= e($name) ?></div>
+        <a class="url" href="http://<?= e($name) ?>.<?= e($tld) ?>" target="_blank"><?= e($name) ?>.<?= e($tld) ?> &#8599;</a>
+        <div class="spacer"></div>
+        <form method="post" class="inline" style="gap:6px">
+          <input type="hidden" name="action" value="switch">
+          <input type="hidden" name="name" value="<?= e($name) ?>">
+          <select name="php" onchange="this.form.submit()">
+            <?php foreach ($vers as $v): ?>
+              <option value="<?= e($v) ?>" <?= $v===$ver?'selected':'' ?>>PHP <?= e($v) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </form>
+        <form method="post" onsubmit="return confirm('¿Eliminar el proyecto <?= e($name) ?>? (la carpeta se conserva)')">
+          <input type="hidden" name="action" value="delete">
+          <input type="hidden" name="name" value="<?= e($name) ?>">
+          <button class="btn danger" type="submit">Eliminar</button>
+        </form>
+      </div>
+    <?php endforeach; endif; ?>
+
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Dominios <code>.<?= e($tld) ?></code> en el navegador</div>
+        <div class="muted">Para que <code>&lt;nombre&gt;.<?= e($tld) ?></code> abra en el navegador hay que registrarlos en Windows (una vez).</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post">
+        <input type="hidden" name="action" value="hosts">
+        <button class="btn ghost" type="submit">Sincronizar dominios</button>
+      </form>
+    </div>
+
+  <?php else: /* ---------- PESTAÑA PHP ---------- */ ?>
+
+    <h2>Editar php.ini por versión</h2>
+    <div class="muted" style="margin-bottom:14px">Los cambios se guardan como <em>overrides</em> (sobreviven a actualizaciones) y se aplican recargando Apache automáticamente.</div>
+
+    <?php if (!$vers): ?>
+      <div class="card muted">No hay versiones de PHP instaladas.</div>
+    <?php else: $openVer = $_GET['ver'] ?? ''; foreach ($vers as $v):
+        [$vals,$extra] = parse_overrides("$OVR_DIR/$v.overrides.ini", array_keys($CURATED)); ?>
+      <details <?= $v===$openVer?'open':'' ?>>
+        <summary>PHP <?= e($v) ?> <span class="op">&mdash; config/php/<?= e($v) ?>.overrides.ini</span></summary>
+        <div class="pane">
+          <form method="post">
+            <input type="hidden" name="action" value="phpini">
+            <input type="hidden" name="ver" value="<?= e($v) ?>">
+            <div class="grid">
+              <?php foreach ($CURATED as $k=>$meta): $cur = $vals[$k] ?? ''; ?>
+                <div>
+                  <label><?= e($meta['label']) ?> <span class="muted">(<?= e($k) ?>)</span></label>
+                  <?php if ($meta['type']==='onoff'): ?>
+                    <select name="ini[<?= e($k) ?>]" style="width:100%">
+                      <option value="On"  <?= strcasecmp($cur,'On')===0?'selected':''  ?>>On</option>
+                      <option value="Off" <?= strcasecmp($cur,'Off')===0?'selected':'' ?>>Off</option>
+                    </select>
+                  <?php else: ?>
+                    <input name="ini[<?= e($k) ?>]" value="<?= e($cur) ?>" placeholder="<?= e($meta['ph']) ?>" style="width:100%">
+                  <?php endif; ?>
+                </div>
+              <?php endforeach; ?>
+            </div>
+            <div style="margin-top:14px">
+              <label>Directivas adicionales (una por línea, formato <code>clave = valor</code>)</label>
+              <textarea name="extra" placeholder="; ejemplo&#10;opcache.jit = 1255&#10;realpath_cache_size = 4096k"><?= e(implode("\n",$extra)) ?></textarea>
+            </div>
+            <div style="margin-top:14px"><button class="btn" type="submit">Guardar y aplicar</button></div>
+          </form>
+        </div>
+      </details>
+    <?php endforeach; endif; ?>
+
+  <?php endif; ?>
+
+  <footer>lua-server &middot; Apache + mod_fcgid &middot; panel solo accesible desde esta máquina</footer>
 </div>
 </body>
 </html>
