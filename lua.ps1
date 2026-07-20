@@ -1,27 +1,26 @@
 <#
 ============================================================
- lua-server :: panel de control (portable)
+ lua-server :: servidor PHP local (portable) — solo Apache + PHP
  Uso:   .\lua.ps1 <comando> [argumentos]
 
  PRIMEROS PASOS EN UN PC NUEVO:
    .\lua.ps1 init          Ajusta todas las rutas a esta carpeta (portable)
-   .\lua.ps1 start         Arranca (modo consola, sin admin)
+   .\lua.ps1 start         Arranca (sin admin)
    http://localhost        Abre el panel
 
  COMANDOS:
-   init                      Re-aplica rutas a la carpeta actual (hazlo tras mover/clonar)
-   start | stop | restart    Arranca / para / reinicia (usa servicios si existen, si no modo consola)
+   init                      Re-aplica rutas a la carpeta actual (tras mover/clonar)
+   start | stop | restart    Arranca / para / reinicia Apache
    reload                    Regenera vhosts desde sites.json y recarga
-   status                    Estado de procesos, puertos, versiones PHP y sitios
-   add-site <nombre> [ver]   Crea un proyecto (carpeta + vhost). ver = version PHP (def. defaultPhp)
+   status                    Estado, versiones PHP y sitios
+   add-site <nombre> [ver]   Crea un proyecto (carpeta + vhost). ver = version PHP
    remove-site <nombre>      Elimina el vhost (NO borra la carpeta)
    list-sites                Lista proyectos y su version de PHP
    switch-php <nombre> <ver> Cambia la version de PHP de un proyecto
    list-php                  Lista las versiones de PHP instaladas
    hosts                     Lineas hosts para tus companeros (con la IP del server)
-   setup                     [ADMIN] Instala servicios + firewall + MariaDB (para servidor de equipo)
-   db [shell]                Abre Adminer (web) o el cliente mysql
-   logs [apache|mariadb]     Ultimas lineas del log
+   setup                     [ADMIN] Instala Apache como servicio + firewall + hosts
+   logs                      Ultimas lineas del log de Apache
 ============================================================
 #>
 
@@ -39,28 +38,21 @@ $Apache     = Join-Path $Bin  "apache"
 $Httpd      = Join-Path $Apache "bin\httpd.exe"
 $HttpdConf  = Join-Path $Apache "conf\httpd.conf"
 $PhpBase    = Join-Path $Bin  "php"
-$MariaBin   = Join-Path $Bin  "mariadb\bin"
-$MariaD     = Join-Path $MariaBin "mariadbd.exe"
-$MysqlExe   = Join-Path $MariaBin "mariadb.exe"
-$PluginDir  = (Join-Path $Bin "mariadb\lib\plugin") -replace '\\','/'
 $Www        = Join-Path $Root "www"
 $VhostDir   = Join-Path $Root "config\apache\vhosts"
 $Template   = Join-Path $Root "config\apache\templates\vhost.tpl"
 $SitesJson  = Join-Path $Root "config\sites.json"
-$MyIni      = Join-Path $Root "config\mariadb\my.ini"
-$DataDir    = Join-Path $Root "data\mariadb"
 $ApacheLog  = Join-Path $Root "logs\apache"
-$MariaLog   = Join-Path $Root "logs\mariadb\error.log"
 $TmpDir     = Join-Path $Root "tmp"
 $HostsFile  = Join-Path $env:WINDIR "System32\drivers\etc\hosts"
 
 $SvcApache  = "luaApache"
-$SvcMaria   = "luaMariaDB"
 $Tld        = "lua.test"
 $HostsBegin = "# === lua-server BEGIN (no editar a mano) ==="
 $HostsEnd   = "# === lua-server END ==="
 
-# extensiones PHP a habilitar (solo si existe su DLL)
+# extensiones PHP a habilitar (solo si existe su DLL). mysqli/pdo_mysql incluidas
+# por si tus proyectos conectan a un MySQL (p.ej. en Docker) via 127.0.0.1.
 $WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2')
 
 function Info($m){ Write-Host "[lua] $m" -ForegroundColor Cyan }
@@ -104,9 +96,10 @@ function Get-LanIp {
 }
 function Service-Exists($name) { [bool](Get-Service -Name $name -ErrorAction SilentlyContinue) }
 function Fwd($p) { return ($p -replace '\\','/') }
+function Apache-Up { [bool](Get-Process httpd -ErrorAction SilentlyContinue) }
 
 # ============================================================
-#  INIT: re-aplica todas las rutas a la carpeta actual (portable)
+#  INIT: re-aplica rutas a la carpeta actual (portable)
 # ============================================================
 function Set-HttpdConf {
     if (-not (Test-Path $HttpdConf)) { Warn "No existe httpd.conf (falta bin\apache). Ejecuta bootstrap.ps1"; return }
@@ -151,16 +144,6 @@ function Set-PhpInis {
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
 }
 
-function Set-MariaIni {
-    if (-not (Test-Path $MyIni)) { return }
-    $c = Get-Content $MyIni -Raw
-    $c = $c -replace '(?m)^\s*datadir\s*=.*',  ("datadir                 = " + (Fwd $DataDir))
-    $c = $c -replace '(?m)^\s*socket\s*=.*',   ("socket                  = " + (Fwd (Join-Path $TmpDir 'mysql.sock')))
-    $c = $c -replace '(?m)^\s*log-error\s*=.*',("log-error               = " + (Fwd $MariaLog))
-    Set-Content -Path $MyIni -Value $c -Encoding ascii
-    Ok "my.ini apuntando a: $(Fwd $DataDir)"
-}
-
 function New-VhostFile($name, $php) {
     $docroot = Fwd (Get-DocRoot $name)
     $phpdir  = Fwd (Join-Path $PhpBase $php)
@@ -179,48 +162,32 @@ function Regenerate-Vhosts {
 
 function Cmd-Init {
     Info "Ajustando el stack a: $Root"
-    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$DataDir,(Join-Path $Root 'logs\mariadb'),(Join-Path $Root 'logs\php'))) {
-        New-Item -ItemType Directory -Force -Path $d | Out-Null
-    }
+    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,(Join-Path $Root 'logs\php'))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     Set-HttpdConf
     Set-PhpInis
-    Set-MariaIni
     Regenerate-Vhosts
     if (Test-Path $Httpd) { Info "Validando Apache..."; & $Httpd -t }
     Ok "Init completo. Arranca con:  .\lua.ps1 start"
 }
 
 # ============================================================
-#  Arranque (servicios si existen; si no, modo consola sin admin)
+#  Arranque (servicio si existe; si no, modo consola sin admin)
 # ============================================================
-function Apache-Up { [bool](Get-Process httpd -ErrorAction SilentlyContinue) }
-function Maria-Up  { [bool](Get-Process mariadbd -ErrorAction SilentlyContinue) }
-
 function Cmd-Start {
     if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
-    else {
-        if (Apache-Up) { Info "Apache ya estaba arriba" }
-        else { Start-Process -FilePath $Httpd -WindowStyle Hidden; Ok "Apache (consola) arrancado" }
-    }
-    if (Test-Path $MariaD) {
-        if (Service-Exists $SvcMaria) { Start-Service $SvcMaria; Ok "MariaDB (servicio) arriba" }
-        elseif (-not (Maria-Up)) {
-            if (Test-Path (Join-Path $DataDir 'mysql')) { Start-Process -FilePath $MariaD -ArgumentList "--defaults-file=`"$MyIni`"" -WindowStyle Hidden; Ok "MariaDB (consola) arrancada" }
-            else { Warn "MariaDB sin inicializar (opcional). Ejecuta 'setup' si quieres base de datos." }
-        }
-    }
-    Write-Host ""
-    Ok "Panel:  http://localhost"
+    elseif (Apache-Up) { Info "Apache ya estaba arriba" }
+    else { Start-Process -FilePath $Httpd -WindowStyle Hidden; Ok "Apache arrancado" }
+    Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
 function Cmd-Stop {
     if (Service-Exists $SvcApache) { Stop-Service $SvcApache -Force -ErrorAction SilentlyContinue } else { Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force }
-    if (Service-Exists $SvcMaria)  { Stop-Service $SvcMaria  -Force -ErrorAction SilentlyContinue } else { Get-Process mariadbd -ErrorAction SilentlyContinue | Stop-Process -Force }
-    Ok "Detenido."
+    Ok "Apache detenido."
 }
 function Cmd-Restart {
-    if (-not (& $Httpd -t)) { Err "Config invalida, no se reinicia."; return }
-    Cmd-Stop; Start-Sleep -Milliseconds 800; Cmd-Start
+    & $Httpd -t | Out-Host
+    if ($LASTEXITCODE -ne 0) { Err "Config invalida, no se reinicia."; return }
+    Cmd-Stop; Start-Sleep -Milliseconds 700; Cmd-Start
 }
 function Cmd-Reload {
     Info "Regenerando vhosts..."
@@ -295,14 +262,12 @@ function Cmd-ListPhp {
     foreach ($x in $v) { Write-Host "  PHP $x" }
 }
 function Cmd-Status {
-    Write-Host ""; Write-Host "  lua-server  |  $Root" -ForegroundColor White
+    Write-Host ""; Write-Host "  lua-server (solo PHP)  |  $Root" -ForegroundColor White
     Write-Host "  ------------------------------------------------"
-    Write-Host ("  IP LAN                : {0}" -f (Get-LanIp))
+    Write-Host ("  IP LAN          : {0}" -f (Get-LanIp))
     $apTxt = "parado"; $apC = "Yellow"; if (Apache-Up -or ((Service-Exists $SvcApache) -and (Get-Service $SvcApache).Status -eq 'Running')) { $apTxt="corriendo"; $apC="Green" }
-    Write-Host "  Apache               : " -NoNewline; Write-Host $apTxt -ForegroundColor $apC
-    $dbTxt = "parada"; $dbC = "Yellow"; if (Maria-Up -or ((Service-Exists $SvcMaria) -and (Get-Service $SvcMaria).Status -eq 'Running')) { $dbTxt="corriendo"; $dbC="Green" }
-    Write-Host "  MariaDB              : " -NoNewline; Write-Host $dbTxt -ForegroundColor $dbC
-    Write-Host ("  PHP instalados       : {0}" -f ((Get-PhpVersions) -join ', '))
+    Write-Host "  Apache          : " -NoNewline; Write-Host $apTxt -ForegroundColor $apC
+    Write-Host ("  PHP instalados  : {0}" -f ((Get-PhpVersions) -join ', '))
     Write-Host "  Sitios:"; Cmd-ListSites; Write-Host ""
 }
 function Cmd-Hosts {
@@ -312,15 +277,8 @@ function Cmd-Hosts {
     foreach ($p in $cfg.sites.PSObject.Properties.Name) { Write-Host ("{0} {1}.{2} www.{1}.{2}" -f $lan,$p,$Tld) }
     Write-Host $HostsEnd -ForegroundColor DarkGray; Write-Host ""
 }
-function Cmd-Db($mode) {
-    if ($mode -eq "shell") { & $MysqlExe --plugin-dir="$PluginDir" -h 127.0.0.1 -P 3306 -u root -p }
-    else { Start-Process "http://localhost/adminer"; Ok "Adminer en http://localhost/adminer (servidor: 127.0.0.1)" }
-}
-function Cmd-Logs($which) {
-    if ($which -eq "mariadb") { Get-Content $MariaLog -Tail 40 -ErrorAction SilentlyContinue }
-    else { Get-Content (Join-Path $ApacheLog "error.log") -Tail 40 -ErrorAction SilentlyContinue }
-}
-function Cmd-Help { Get-Content $PSCommandPath -TotalCount 42 | ForEach-Object { $_ } }
+function Cmd-Logs { Get-Content (Join-Path $ApacheLog "error.log") -Tail 40 -ErrorAction SilentlyContinue }
+function Cmd-Help { Get-Content $PSCommandPath -TotalCount 40 | ForEach-Object { $_ } }
 
 switch ($Command.ToLower()) {
     "init"        { Cmd-Init }
@@ -336,7 +294,6 @@ switch ($Command.ToLower()) {
     "list-php"    { Cmd-ListPhp }
     "hosts"       { Cmd-Hosts }
     "setup"       { Require-Admin; & (Join-Path $Root "config\_setup.ps1") }
-    "db"          { Cmd-Db $Arg1 }
-    "logs"        { Cmd-Logs $Arg1 }
+    "logs"        { Cmd-Logs }
     default       { Cmd-Help }
 }

@@ -1,13 +1,13 @@
 <#
 ============================================================
- lua-server :: bootstrap
- Descarga y prepara TODOS los binarios (Apache, PHP x6, MariaDB,
- Adminer) en esta carpeta. Ejecutalo en un PC nuevo tras clonar
- el repositorio, o para reinstalar los binarios.
+ lua-server :: bootstrap  (solo Apache + PHP)
+ Descarga y prepara los binarios (Apache + PHP x6) en esta
+ carpeta. Ejecutalo en un PC nuevo tras clonar el repo, o
+ para reinstalar los binarios.
 
    powershell -ExecutionPolicy Bypass -File .\bootstrap.ps1
 
- Al terminar deja el stack listo:  .\lua.ps1 start
+ Al terminar:  .\lua.ps1 start   y abre http://localhost
 ============================================================
 #>
 $ErrorActionPreference = 'Stop'
@@ -18,9 +18,7 @@ $ua   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36"
 
 function Say($m){ Write-Host "[bootstrap] $m" -ForegroundColor Cyan }
 
-# --- estructura de carpetas ---
-$dirs = @("bin\apache","bin\php","bin\mariadb","www","config\apache\vhosts","config\apache\templates",
-          "config\mariadb","data\mariadb","logs\apache","logs\mariadb","logs\php","tools\dashboard","downloads","tmp")
+$dirs = @("bin\apache","bin\php","www","config\apache\vhosts","config\apache\templates","logs\apache","logs\php","tools\dashboard","downloads","tmp")
 foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null }
 
 # --- descargas (fuentes oficiales, versiones verificadas 2026-07) ---
@@ -33,13 +31,11 @@ $items = @(
   @{ n="php-8.3.32-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/php-8.3.32-nts-Win32-vs16-x64.zip"; php="8.3" },
   @{ n="php-8.2.32-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/php-8.2.32-nts-Win32-vs16-x64.zip"; php="8.2" },
   @{ n="php-8.1.34-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-8.1.34-nts-Win32-vs16-x64.zip"; php="8.1" },
-  @{ n="php-7.4.33-nts-Win32-vc15-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.4.33-nts-Win32-vc15-x64.zip"; php="7.4" },
-  @{ n="mariadb-11.8.8-winx64.zip";          u="https://archive.mariadb.org/mariadb-11.8.8/winx64-packages/mariadb-11.8.8-winx64.zip" },
-  @{ n="adminer-5.5.0.php";                  u="https://github.com/vrana/adminer/releases/download/v5.5.0/adminer-5.5.0.php" }
+  @{ n="php-7.4.33-nts-Win32-vc15-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.4.33-nts-Win32-vc15-x64.zip"; php="7.4" }
 )
 foreach ($it in $items) {
     $out = Join-Path $dl $it.n
-    if (Test-Path $out) { Say "ya existe $($it.n), se omite descarga" ; continue }
+    if (Test-Path $out) { Say "ya existe $($it.n), se omite" ; continue }
     Say "descargando $($it.n)..."
     Invoke-WebRequest -Uri $it.u -OutFile $out -UserAgent $ua -Headers @{ "Referer"="https://www.apachelounge.com/" } -TimeoutSec 600
 }
@@ -62,13 +58,6 @@ foreach ($it in ($items | Where-Object { $_.php })) {
     if (Test-Path $dest) { Get-ChildItem $dest -Force | Remove-Item -Recurse -Force }
     Expand-Archive (Join-Path $dl $it.n) $dest -Force
 }
-
-Say "extrayendo MariaDB..."
-$mw = Join-Path $tmp "mr"; Expand-Archive (Join-Path $dl "mariadb-11.8.8-winx64.zip") $mw -Force
-$mtop = Get-ChildItem $mw -Directory | Select-Object -First 1
-Get-ChildItem $mtop.FullName -Force | Move-Item -Destination (Join-Path $root "bin\mariadb") -Force
-
-Copy-Item (Join-Path $dl "adminer-5.5.0.php") (Join-Path $root "tools\adminer.php") -Force
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Say "aplicando configuracion (lua.ps1 init)..."
@@ -76,4 +65,4 @@ Say "aplicando configuracion (lua.ps1 init)..."
 
 Write-Host ""
 Write-Host "[bootstrap] LISTO. Ejecuta:  .\lua.ps1 start   y abre http://localhost" -ForegroundColor Green
-Write-Host "[bootstrap] Nota: si Apache/PHP no arrancan por DLL faltante, instala downloads\vc_redist.x64.exe" -ForegroundColor Yellow
+Write-Host "[bootstrap] Si Apache/PHP no arrancan por DLL faltante, instala downloads\vc_redist.x64.exe" -ForegroundColor Yellow

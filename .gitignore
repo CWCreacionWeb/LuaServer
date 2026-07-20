@@ -2,14 +2,12 @@
 /bin/
 /downloads/
 
-# ===== datos y runtime =====
-/data/
+# ===== runtime =====
 /logs/
 /tmp/
 
 # ===== generado automaticamente =====
 /config/apache/vhosts/*.conf
-/tools/adminer.php
 
 # ===== proyectos (opcional: descomenta si NO quieres versionar tus sitios) =====
 # /www/
