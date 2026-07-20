@@ -60,6 +60,10 @@ foreach ($it in ($items | Where-Object { $_.php })) {
 }
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
+Say "descargando Composer..."
+New-Item -ItemType Directory -Force -Path (Join-Path $root "bin\composer") | Out-Null
+Invoke-WebRequest "https://getcomposer.org/composer-stable.phar" -OutFile (Join-Path $root "bin\composer\composer.phar") -UseBasicParsing -TimeoutSec 300
+
 Say "aplicando configuracion (lua.ps1 init)..."
 & (Join-Path $root "lua.ps1") init
 

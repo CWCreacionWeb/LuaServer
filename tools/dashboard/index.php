@@ -37,6 +37,28 @@ function lua_flag($name){ @file_put_contents(dirname(__DIR__,2).'/tmp/'.$name.'.
 function lua_apply(){ lua_flag('apply'); }
 function lua_hosts(){ lua_flag('hosts'); }
 
+function read_jobs($dir){
+    $out=[];
+    if(is_dir($dir)){
+        foreach(glob($dir.'/*.status') as $f){
+            $j=json_decode(@file_get_contents($f),true);
+            if($j){ $j['_mtime']=@filemtime($f); $out[]=$j; }
+        }
+        foreach(glob($dir.'/*.job') as $f){ // en cola (aun sin status)
+            $b=basename($f,'.job'); $has=false;
+            foreach($out as $o){ if(($o['id']??'')===$b){$has=true;break;} }
+            if(!$has){ $out[]=['id'=>$b,'name'=>$b,'type'=>'?','state'=>'queued','msg'=>'En cola...','_mtime'=>@filemtime($f)]; }
+        }
+        usort($out, function($a,$b){ return ($b['_mtime']??0)-($a['_mtime']??0); });
+    }
+    return $out;
+}
+function job_log_tail($root,$id,$n=16){
+    $f=$root.'/logs/jobs/'.$id.'.log';
+    if(!is_file($f)) return '';
+    $lines=@file($f,FILE_IGNORE_NEW_LINES); if(!$lines) return '';
+    return implode("\n", array_slice($lines,-$n));
+}
 function parse_overrides($file, $curatedKeys){
     $vals=[]; $extra=[];
     if(is_file($file)){
@@ -61,16 +83,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'create') {
         $name = strtolower(trim($_POST['name'] ?? ''));
         $php  = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
+        $type = $_POST['type'] ?? 'blank';
+        $url  = trim($_POST['url'] ?? '');
+        $validTypes = ['blank','laravel','wordpress','symfony','slim','git'];
         if (!valid_name($name)) { $msg='error:Nombre no válido (usa minúsculas, números, - o _).'; }
-        elseif (isset($cfg['sites'][$name])) { $msg='error:Ya existe un proyecto llamado "'.$name.'".'; }
+        elseif (isset($cfg['sites'][$name]) || is_dir("$WWW/$name")) { $msg='error:Ya existe un proyecto o carpeta "'.$name.'".'; }
+        elseif (!in_array($type,$validTypes,true)) { $msg='error:Tipo de proyecto no válido.'; }
+        elseif ($type==='git' && !preg_match('#^(https?://|git@)#',$url)) { $msg='error:Introduce una URL de Git válida.'; }
         elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
         else {
-            @mkdir("$WWW/$name", 0777, true);
-            if (!file_exists("$WWW/$name/index.php")) file_put_contents("$WWW/$name/index.php", "<?php\nphpinfo();\n");
-            $cfg['sites'][$name] = ['php'=>$php];
-            write_json($CFG_FILE, $cfg); lua_apply();
-            $msg='applied:Proyecto "'.$name.'" creado con PHP '.$php.'.';
+            $id = $name.'-'.time();
+            $job = ['id'=>$id,'name'=>$name,'php'=>$php,'type'=>$type,'url'=>$url];
+            @mkdir($ROOT.'/tmp/jobs', 0777, true);
+            file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+            $labels=['blank'=>'PHP en blanco','laravel'=>'Laravel','wordpress'=>'WordPress','symfony'=>'Symfony','slim'=>'Slim','git'=>'clon de Git'];
+            $msg='job:Creando "'.$name.'" ('.$labels[$type].')… mira el progreso abajo.';
         }
+    }
+    elseif ($action === 'clearjobs') {
+        foreach (glob($ROOT.'/tmp/jobs/*.status') as $f) @unlink($f);
+        $msg='info:Historial de tareas limpiado.';
     }
     elseif ($action === 'switch') {
         $name=$_POST['name']??''; $php=$_POST['php']??'';
@@ -122,6 +154,8 @@ $tab = $_GET['tab'] ?? 'proyectos';
 $msg = $_GET['msg'] ?? '';
 [$mtype,$mtext] = array_pad(explode(':',$msg,2),2,'');
 $curPhp = PHP_VERSION;
+$jobs = read_jobs($ROOT.'/tmp/jobs');
+$anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['running','queued'],true)){$anyJobRun=true;break;} }
 ?>
 <!doctype html>
 <html lang="es">
@@ -130,6 +164,7 @@ $curPhp = PHP_VERSION;
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>lua-server</title>
 <?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
+<?php if ($tab==='proyectos' && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <style>
   :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; --ok:#3fb950; --warn:#d29922; --err:#f85149; --in:#11141c; }
   @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; --in:#fff; } }
@@ -161,6 +196,12 @@ $curPhp = PHP_VERSION;
   .banner.applied{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
   .banner.info{background:rgba(110,168,254,.12);border-color:var(--ac);color:var(--ac)}
   .banner.error{background:rgba(248,81,73,.12);border-color:var(--err);color:var(--err)}
+  .banner.job{background:rgba(210,153,34,.12);border-color:var(--warn);color:var(--warn)}
+  .jstate{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;letter-spacing:.3px}
+  .jstate.ok{background:rgba(63,185,80,.15);color:var(--ok)}
+  .jstate.err{background:rgba(248,81,73,.15);color:var(--err)}
+  .jstate.run{background:rgba(110,168,254,.15);color:var(--ac)}
+  .joblog{background:var(--in);border:1px solid var(--line);border-radius:8px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;max-height:180px;overflow:auto;color:var(--mut)}
   details{border:1px solid var(--line);border-radius:12px;margin-bottom:12px;background:var(--card)}
   summary{padding:14px 18px;cursor:pointer;font-weight:700;font-size:16px;list-style:none;display:flex;align-items:center;gap:10px}
   summary::-webkit-details-marker{display:none}
@@ -198,24 +239,64 @@ $curPhp = PHP_VERSION;
   <?php if ($tab==='proyectos'): ?>
 
     <div class="card">
-      <form method="post" class="inline">
+      <form method="post">
         <input type="hidden" name="action" value="create">
-        <div>
-          <label>Nombre del proyecto</label>
-          <input name="name" placeholder="micliente" pattern="[a-z0-9][a-z0-9_-]*" required>
+        <div class="inline">
+          <div>
+            <label>Nombre del proyecto</label>
+            <input name="name" placeholder="micliente" pattern="[a-z0-9][a-z0-9_-]*" required>
+          </div>
+          <div>
+            <label>Tipo</label>
+            <select name="type" onchange="document.getElementById('gitrow').style.display=(this.value==='git')?'block':'none'">
+              <option value="blank">PHP en blanco</option>
+              <option value="laravel">Laravel</option>
+              <option value="wordpress">WordPress</option>
+              <option value="symfony">Symfony</option>
+              <option value="slim">Slim</option>
+              <option value="git">Desde Git…</option>
+            </select>
+          </div>
+          <div>
+            <label>Versión de PHP</label>
+            <select name="php">
+              <?php foreach ($vers as $v): ?>
+                <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <button class="btn" type="submit">+ Crear</button>
         </div>
-        <div>
-          <label>Versión de PHP</label>
-          <select name="php">
-            <?php foreach ($vers as $v): ?>
-              <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
-            <?php endforeach; ?>
-          </select>
+        <div id="gitrow" style="display:none;margin-top:12px">
+          <label>URL del repositorio Git</label>
+          <input name="url" placeholder="https://github.com/usuario/repo.git" style="width:100%">
         </div>
-        <button class="btn" type="submit">+ Crear proyecto</button>
       </form>
-      <div class="muted" style="margin-top:10px">Se crea la carpeta <code>www\&lt;nombre&gt;</code> y se sirve en <code>&lt;nombre&gt;.<?= e($tld) ?></code>. Si añades una carpeta <code>public\</code> se usa como raíz.</div>
+      <div class="muted" style="margin-top:10px">Laravel/Symfony/Slim usan Composer; WordPress se descarga; Git clona el repo (y ejecuta <code>composer install</code> si hay <code>composer.json</code>). Se hace en segundo plano.</div>
     </div>
+
+    <?php if ($jobs): ?>
+      <div class="row" style="margin:22px 0 10px">
+        <h2 style="margin:0">Tareas</h2>
+        <div class="spacer"></div>
+        <form method="post"><input type="hidden" name="action" value="clearjobs"><button class="btn ghost" style="padding:5px 12px">Limpiar historial</button></form>
+      </div>
+      <?php foreach (array_slice($jobs,0,8) as $j):
+            $st=$j['state']??'?'; $cls=['done'=>'ok','error'=>'err','running'=>'run','queued'=>'run'];
+            $c=$cls[$st]??'run';
+            $tail = in_array($st,['running','error','queued'],true) ? job_log_tail($ROOT, $j['id']??'') : ''; ?>
+        <div class="card" style="padding:12px 16px">
+          <div class="row">
+            <span class="jstate <?= $c ?>"><?= e(strtoupper($st)) ?></span>
+            <span style="font-weight:700"><?= e($j['name']??'') ?></span>
+            <span class="muted"><?= e($j['type']??'') ?><?= isset($j['time'])?' · '.e($j['time']):'' ?></span>
+            <div class="spacer"></div>
+            <span class="muted"><?= e($j['msg']??'') ?></span>
+          </div>
+          <?php if ($tail): ?><pre class="joblog"><?= e($tail) ?></pre><?php endif; ?>
+        </div>
+      <?php endforeach; ?>
+    <?php endif; ?>
 
     <h2>Proyectos</h2>
     <?php if (!$sites): ?>

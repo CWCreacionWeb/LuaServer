@@ -20,7 +20,9 @@ disco (mucho más rápido que las carpetas compartidas de Docker en Windows).
 Con el servidor arrancado, abre **http://localhost** (solo accesible desde esta
 máquina). Desde ahí puedes, sin tocar la terminal:
 
-- **Proyectos**: crear, eliminar y cambiar la versión de PHP de cada proyecto.
+- **Proyectos**: crear (en blanco, **Laravel**, **WordPress**, **Symfony**, **Slim**
+  o **clonando un repo de Git**), eliminar y cambiar la versión de PHP de cada uno.
+  Las creaciones pesadas se hacen en segundo plano con progreso visible.
 - **Versiones PHP**: editar los valores del `php.ini` de cada versión
   (memoria, tamaños de subida, timezone, errores…) más directivas libres.
 

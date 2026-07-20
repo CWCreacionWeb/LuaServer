@@ -9,8 +9,9 @@
 # ===== generado automaticamente =====
 /config/apache/vhosts/*.conf
 
-# ===== proyectos (opcional: descomenta si NO quieres versionar tus sitios) =====
-# /www/
+# ===== proyectos: NO versionar (cada proyecto es tuyo / tiene su propio repo) =====
+/www/*
+!/www/.gitkeep
 
 # varios
 *.log

@@ -241,6 +241,7 @@ function Cmd-Watch {
         try {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
             if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
+            Process-Jobs
         } catch {}
         Start-Sleep -Seconds 1
     }
@@ -270,6 +271,80 @@ function Cmd-Apply {
     Restart-Apache
     "$(Get-Date -Format o)  apply: done" | Add-Content $log
     Ok "Cambios aplicados."
+}
+
+# ============================================================
+#  Sistema de TAREAS (crear proyectos: plantillas, WordPress, git)
+#  El panel deja un .job en tmp\jobs\; el watcher lo ejecuta aqui.
+# ============================================================
+function Set-JobStatus($id, $name, $type, $state, $msg) {
+    $jd = Join-Path $TmpDir "jobs"; New-Item -ItemType Directory -Force -Path $jd | Out-Null
+    $o = @{ id=$id; name=$name; type=$type; state=$state; msg=$msg; time=(Get-Date -Format "HH:mm:ss") }
+    [System.IO.File]::WriteAllText((Join-Path $jd "$id.status"), ($o | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+}
+function Add-SiteToConfig($name, $php) {
+    $cfg = Get-Config
+    if (-not $cfg.sites.PSObject.Properties.Name.Contains($name)) { $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{ php=$php }) -Force }
+    else { $cfg.sites.$name.php = $php }
+    Save-Config $cfg
+}
+function Download-WordPress($dir, $log) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $zip = Join-Path $TmpDir "wp-latest.zip"
+    "Descargando WordPress..." | Add-Content $log
+    Invoke-WebRequest "https://wordpress.org/latest.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 300
+    $work = Join-Path $TmpDir ("wp-" + [System.IO.Path]::GetRandomFileName())
+    Expand-Archive $zip $work -Force
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Get-ChildItem (Join-Path $work "wordpress") -Force | Move-Item -Destination $dir -Force
+    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    "WordPress descomprimido." | Add-Content $log
+}
+function Run-Job($id, $job) {
+    $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"
+    $logDir = Join-Path $Root "logs\jobs"; New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $log = Join-Path $logDir "$id.log"
+    $dir = Join-Path $Www $name
+    $phpExe = Join-Path $PhpBase "$php\php.exe"
+    $composer = Join-Path $Root "bin\composer\composer.phar"
+    Set-JobStatus $id $name $type "running" "Creando..."
+    "== $type :: $name (PHP $php) ==" | Out-File $log -Encoding utf8
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $ok = $true; $err = ""
+    try {
+        switch ($type) {
+            "blank"     { New-Item -ItemType Directory -Force -Path $dir | Out-Null; Set-Content (Join-Path $dir "index.php") "<?php`r`nphpinfo();" -Encoding utf8 }
+            "laravel"   { & $phpExe $composer create-project laravel/laravel "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
+            "symfony"   { & $phpExe $composer create-project symfony/skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
+            "slim"      { & $phpExe $composer create-project slim/slim-skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
+            "wordpress" { Download-WordPress $dir $log }
+            "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
+            default     { $ok=$false; $err="Tipo desconocido: $type" }
+        }
+        if ($ok -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+    } catch { $ok=$false; $err=$_.Exception.Message }
+    $ErrorActionPreference = $prev
+    if ($ok) {
+        Add-SiteToConfig $name $php
+        Set-PhpInis | Out-Null
+        Regenerate-Vhosts
+        if (Test-HttpdConfig) { Restart-Apache }
+        Set-JobStatus $id $name $type "done" "Listo -> http://$name.$Tld"
+        "== DONE ==" | Add-Content $log
+    } else {
+        Set-JobStatus $id $name $type "error" $err
+        "== ERROR: $err ==" | Add-Content $log
+    }
+}
+function Process-Jobs {
+    $jd = Join-Path $TmpDir "jobs"
+    if (-not (Test-Path $jd)) { return }
+    foreach ($jf in (Get-ChildItem $jd -Filter *.job -ErrorAction SilentlyContinue)) {
+        $id = $jf.BaseName; $job = $null
+        try { $job = Get-Content $jf.FullName -Raw | ConvertFrom-Json } catch {}
+        Remove-Item $jf.FullName -Force -ErrorAction SilentlyContinue
+        if ($job) { try { Run-Job $id $job } catch { Set-JobStatus $id "$($job.name)" "$($job.type)" "error" $_.Exception.Message } }
+    }
 }
 
 function Update-Hosts {
