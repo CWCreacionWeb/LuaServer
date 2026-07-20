@@ -8,6 +8,8 @@
 
 # ===== generado automaticamente =====
 /config/apache/vhosts/*.conf
+/config/apache/ssl.conf
+/config/https.on
 
 # ===== proyectos: NO versionar (cada proyecto es tuyo / tiene su propio repo) =====
 /www/*
