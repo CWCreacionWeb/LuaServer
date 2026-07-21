@@ -32,7 +32,8 @@ $items = @(
   @{ n="php-8.2.32-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/php-8.2.32-nts-Win32-vs16-x64.zip"; php="8.2" },
   @{ n="php-8.1.34-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-8.1.34-nts-Win32-vs16-x64.zip"; php="8.1" },
   @{ n="php-7.4.33-nts-Win32-vc15-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.4.33-nts-Win32-vc15-x64.zip"; php="7.4" },
-  @{ n="php-7.1.33-nts-Win32-VC14-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.1.33-nts-Win32-VC14-x64.zip"; php="7.1" }
+  @{ n="php-7.1.33-nts-Win32-VC14-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.1.33-nts-Win32-VC14-x64.zip"; php="7.1" },
+  @{ n="mariadb-11.8.8-winx64.zip";          u="https://archive.mariadb.org/mariadb-11.8.8/winx64-packages/mariadb-11.8.8-winx64.zip" }
 )
 foreach ($it in $items) {
     $out = Join-Path $dl $it.n
@@ -59,6 +60,13 @@ foreach ($it in ($items | Where-Object { $_.php })) {
     if (Test-Path $dest) { Get-ChildItem $dest -Force | Remove-Item -Recurse -Force }
     Expand-Archive (Join-Path $dl $it.n) $dest -Force
 }
+
+Say "extrayendo MariaDB..."
+$mdw = Join-Path $tmp "md"; Expand-Archive (Join-Path $dl "mariadb-11.8.8-winx64.zip") $mdw -Force
+$mdDest = Join-Path $root "bin\mariadb"
+if (Test-Path $mdDest) { Get-ChildItem $mdDest -Force | Remove-Item -Recurse -Force } else { New-Item -ItemType Directory -Force -Path $mdDest | Out-Null }
+Get-ChildItem $mdw -Directory | Select-Object -First 1 | Get-ChildItem -Force | Move-Item -Destination $mdDest -Force
+
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Say "descargando Composer..."

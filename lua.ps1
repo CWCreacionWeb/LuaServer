@@ -58,6 +58,15 @@ $SslKey     = Join-Path $SslDir "lua-key.pem"
 # --- Mailpit (captura de correo) ---
 $Mailpit     = Join-Path $Bin  "mailpit\mailpit.exe"
 $MailpitFlag = Join-Path $Root "config\mailpit.on"
+# --- MySQL (MariaDB) ---
+$MariaDb       = Join-Path $Bin  "mariadb"
+$Mysqld        = Join-Path $MariaDb "bin\mysqld.exe"
+$MariaInstall  = Join-Path $MariaDb "bin\mariadb-install-db.exe"
+$MariaAdmin    = Join-Path $MariaDb "bin\mariadb-admin.exe"
+$MyIni         = Join-Path $Root "config\mariadb\my.ini"
+$MariaDataDir  = Join-Path $Root "data\mariadb"
+$MariaLogDir   = Join-Path $Root "logs\mariadb"
+$MariaDbFlag   = Join-Path $Root "config\mariadb.on"
 
 $SvcApache  = "luaApache"
 $Tld        = "lua.test"
@@ -298,11 +307,12 @@ function Get-SiteDomain($cfg, $name) {
 
 function Cmd-Init {
     Info "Ajustando el stack a: $Root"
-    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$SslDir,(Join-Path $Root 'logs\php'))) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$SslDir,(Join-Path $Root 'logs\php'),$MariaLogDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     if (-not (Test-Path $SitesJson)) { Save-Config (Get-Config) }
     Set-HttpdConf
     Set-PhpInis
     Set-Ssl
+    Set-MariaDbIni
     Regenerate-Vhosts
     if (Test-Path $Httpd) { Info "Validando Apache..."; if (Test-HttpdConfig) { Ok "Config de Apache: OK" } else { Err "Revisa la config de Apache (.\lua.ps1 logs)" } }
     Ok "Init completo. Arranca con:  .\lua.ps1 start"
@@ -329,12 +339,56 @@ function Start-Mailpit {
 }
 function Stop-Mailpit { Get-Process mailpit -ErrorAction SilentlyContinue | Stop-Process -Force }
 
+# Reescribe config\mariadb\my.ini con las rutas absolutas de ESTA instalacion
+# (portable: se recalculan en cada init/start, igual que httpd.conf).
+function Set-MariaDbIni {
+    if (-not (Test-Path $MyIni)) { return }
+    New-Item -ItemType Directory -Force -Path $MariaLogDir | Out-Null
+    $dd   = Fwd $MariaDataDir
+    $sock = Fwd (Join-Path $TmpDir "mysql.sock")
+    $log  = Fwd (Join-Path $MariaLogDir "error.log")
+    $c = Get-Content $MyIni -Raw
+    $c = $c -replace '(?m)^(\s*datadir\s*=).*',       "`$1 $dd"
+    $c = $c -replace '(?m)^(\s*socket\s*=).*',        "`$1 $sock"
+    $c = $c -replace '(?m)^(\s*log-error\s*=).*',     "`$1 $log"
+    $c = $c -replace '(?m)^(\s*bind-address\s*=).*',  '${1} 127.0.0.1'
+    Set-Content -Path $MyIni -Value $c -Encoding ascii
+}
+function MariaDb-Up { [bool](Get-Process mysqld -ErrorAction SilentlyContinue) }
+function MariaDb-Initialized { Test-Path (Join-Path $MariaDataDir "mysql") }
+function Initialize-MariaDb {
+    if (MariaDb-Initialized) { return $true }
+    if (-not (Test-Path $MariaInstall)) { return $false }
+    New-Item -ItemType Directory -Force -Path $MariaDataDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $MariaLogDir  | Out-Null
+    $log = Join-Path $MariaLogDir "install.log"
+    & $MariaInstall "--datadir=$MariaDataDir" *> $log
+    return (MariaDb-Initialized)
+}
+function Start-MariaDb {
+    if (-not (Test-Path $Mysqld)) { return }
+    if (MariaDb-Up) { return }
+    Set-MariaDbIni
+    if (-not (Initialize-MariaDb)) { return }
+    Start-Process -FilePath $Mysqld -WindowStyle Hidden -ArgumentList @("--defaults-file=`"$MyIni`"")
+}
+function Stop-MariaDb {
+    if ((Test-Path $MariaAdmin) -and (MariaDb-Up)) {
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $null = & $MariaAdmin --host=127.0.0.1 --port=3306 --user=root shutdown 2>&1
+        $ErrorActionPreference = $prev
+        for ($i=0; $i -lt 20; $i++) { if (-not (MariaDb-Up)) { break }; Start-Sleep -Milliseconds 250 }
+    }
+    Get-Process mysqld -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 function Cmd-Start {
     if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
     elseif (Apache-Up) { Info "Apache ya estaba arriba" }
     else { Start-Process -FilePath $Httpd -WindowStyle Hidden; Ok "Apache arrancado" }
     Start-Watcher
     if (Test-Path $MailpitFlag) { Start-Mailpit }
+    if (Test-Path $MariaDbFlag) { Start-MariaDb }
     Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
@@ -343,6 +397,7 @@ function Cmd-Stop {
     $pf = Join-Path $TmpDir "watch.pid"
     if (Test-Path $pf) { $wp = Get-Content $pf -ErrorAction SilentlyContinue; if ($wp) { Stop-Process -Id ([int]$wp) -Force -ErrorAction SilentlyContinue }; Remove-Item $pf -Force -ErrorAction SilentlyContinue }
     Stop-Mailpit
+    Stop-MariaDb
     Ok "Apache detenido."
 }
 
@@ -362,6 +417,10 @@ function Cmd-Watch {
             $mpOn = Test-Path $MailpitFlag
             if ($mpOn -and (Test-Path $Mailpit) -and -not (Mailpit-Up)) { Start-Mailpit }
             if (-not $mpOn -and (Mailpit-Up)) { Stop-Mailpit }
+            # Reconciliar MariaDB con su flag
+            $mdOn = Test-Path $MariaDbFlag
+            if ($mdOn -and (Test-Path $Mysqld) -and -not (MariaDb-Up)) { Start-MariaDb }
+            if (-not $mdOn -and (MariaDb-Up)) { Stop-MariaDb }
             Process-Jobs
         } catch {}
         Start-Sleep -Seconds 1
@@ -410,6 +469,40 @@ function Add-SiteToConfig($name, $php) {
     else { $cfg.sites.$name.php = $php }
     Save-Config $cfg
 }
+# Pone/reemplaza una variable en un .env (formato KEY=valor). Si no existe, la anade al final.
+function Set-EnvVar($envFile, $key, $value) {
+    if (-not (Test-Path $envFile)) { return }
+    $lines = Get-Content $envFile
+    $found = $false
+    # tambien reemplaza la linea si viene comentada (# KEY=...), tipico de los .env de ejemplo
+    $out = foreach ($l in $lines) {
+        if ($l -match "^\s*#?\s*$key\s*=") { $found = $true; "$key=$value" } else { $l }
+    }
+    if (-not $found) { $out += "$key=$value" }
+    Set-Content -Path $envFile -Value $out -Encoding utf8
+}
+# Crea (si no existe) una base de datos MySQL a juego con el proyecto. Silencioso si MariaDB no esta arriba.
+function New-ProjectDb($dbname, $projectDir, $projectType) {
+    if (-not (MariaDb-Up)) { return $null }
+    $mariadbExe = Join-Path $MariaDb "bin\mariadb.exe"
+    if (-not (Test-Path $mariadbExe)) { return $null }
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $sql = 'CREATE DATABASE IF NOT EXISTS `' + $dbname + '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
+        $null = & $mariadbExe --host=127.0.0.1 --port=3306 --user=root -e $sql 2>&1
+        if ($projectType -eq 'laravel') {
+            $envFile = Join-Path $projectDir ".env"
+            Set-EnvVar $envFile "DB_CONNECTION" "mysql"
+            Set-EnvVar $envFile "DB_HOST" "127.0.0.1"
+            Set-EnvVar $envFile "DB_PORT" "3306"
+            Set-EnvVar $envFile "DB_DATABASE" $dbname
+            Set-EnvVar $envFile "DB_USERNAME" "root"
+            Set-EnvVar $envFile "DB_PASSWORD" ""
+        }
+        return $dbname
+    } catch { return $null }
+    finally { $ErrorActionPreference = $prev }
+}
 function Download-WordPress($dir, $log) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $zip = Join-Path $TmpDir "wp-latest.zip"
@@ -423,7 +516,7 @@ function Download-WordPress($dir, $log) {
     "WordPress descomprimido." | Add-Content $log
 }
 function Run-Job($id, $job) {
-    $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"
+    $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"; $withdb=[bool]$job.withdb
     $logDir = Join-Path $Root "logs\jobs"; New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $log = Join-Path $logDir "$id.log"
     $dir = Join-Path $Www $name
@@ -443,9 +536,27 @@ function Run-Job($id, $job) {
             "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
             "xdebug"    { $dest = Join-Path $PhpBase "$php\ext\php_xdebug.dll"; "Descargando Xdebug: $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 20000)) { $ok=$false; $err="No se descargo la DLL de Xdebug"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Xdebug descargado ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
             "mailpit"   { $mpDir = Join-Path $Bin "mailpit"; New-Item -ItemType Directory -Force -Path $mpDir | Out-Null; $zip = Join-Path $mpDir "mailpit.zip"; "Descargando Mailpit..." | Add-Content $log; & curl.exe -s -L -o "$zip" "https://github.com/axllent/mailpit/releases/latest/download/mailpit-windows-amd64.zip" 2>&1 | Add-Content $log; if (Test-Path $zip) { Expand-Archive $zip $mpDir -Force; Remove-Item $zip -Force -ErrorAction SilentlyContinue }; if (-not (Test-Path $Mailpit)) { $ok=$false; $err="No se descargo Mailpit" } else { "Mailpit descargado." | Add-Content $log } }
+            "mariadb"   {
+                $mdDir = Join-Path $Bin "mariadb"; New-Item -ItemType Directory -Force -Path $mdDir | Out-Null
+                $zip = Join-Path $mdDir "mariadb.zip"
+                "Descargando MariaDB 11.8 LTS (esto puede tardar)..." | Add-Content $log
+                & curl.exe -s -L -o "$zip" "https://archive.mariadb.org/mariadb-11.8.8/winx64-packages/mariadb-11.8.8-winx64.zip" 2>&1 | Add-Content $log
+                if (Test-Path $zip) {
+                    $work = Join-Path $TmpDir ("md-" + [System.IO.Path]::GetRandomFileName())
+                    Expand-Archive $zip $work -Force
+                    $inner = Get-ChildItem $work -Directory | Select-Object -First 1
+                    if ($inner) {
+                        Get-ChildItem $mdDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'mariadb.zip' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $inner.FullName -Force | Move-Item -Destination $mdDir -Force
+                    }
+                    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                }
+                if (-not (Test-Path $Mysqld)) { $ok=$false; $err="No se descargo MariaDB" } else { "MariaDB descargado." | Add-Content $log }
+            }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -458,12 +569,22 @@ function Run-Job($id, $job) {
             Start-Mailpit
             if (Test-HttpdConfig) { Restart-Apache }
             Set-JobStatus $id $name $type "done" "Mailpit activo: buzon en http://localhost:8025"
+        } elseif ($type -eq 'mariadb') {
+            Start-MariaDb
+            if (MariaDb-Up) { Set-JobStatus $id $name $type "done" "MySQL activo en 127.0.0.1:3306 (usuario root, sin contrasena)" }
+            else { Set-JobStatus $id $name $type "error" "MariaDB se descargo pero no arranco (revisa logs\mariadb\error.log)" }
         } else {
             Add-SiteToConfig $name $php
             Set-PhpInis | Out-Null
             Regenerate-Vhosts
             if (Test-HttpdConfig) { Restart-Apache }
-            Set-JobStatus $id $name $type "done" "Listo -> http://$name.$Tld"
+            $dbNote = ""
+            if ($withdb -and $type -ne 'git') {
+                $dbname = ($name -replace '[^a-zA-Z0-9_]','_')
+                if (New-ProjectDb $dbname $dir $type) { $dbNote = " [BD: $dbname]" }
+                else { $dbNote = " [aviso: no se pudo crear la BD, MySQL sigue apagado o no instalado]" }
+            }
+            Set-JobStatus $id $name $type "done" "Listo -> http://$name.$Tld$dbNote"
         }
         "== DONE ==" | Add-Content $log
     } else {
@@ -571,6 +692,8 @@ function Cmd-Status {
     $apTxt = "parado"; $apC = "Yellow"; if (Apache-Up -or ((Service-Exists $SvcApache) -and (Get-Service $SvcApache).Status -eq 'Running')) { $apTxt="corriendo"; $apC="Green" }
     Write-Host "  Apache          : " -NoNewline; Write-Host $apTxt -ForegroundColor $apC
     Write-Host ("  PHP instalados  : {0}" -f ((Get-PhpVersions) -join ', '))
+    $mdTxt = "apagado"; $mdC = "Yellow"; if (MariaDb-Up) { $mdTxt="corriendo (127.0.0.1:3306)"; $mdC="Green" }
+    Write-Host "  MySQL (MariaDB) : " -NoNewline; Write-Host $mdTxt -ForegroundColor $mdC
     Write-Host "  Sitios:"; Cmd-ListSites; Write-Host ""
 }
 function Cmd-Hosts {

@@ -12,6 +12,7 @@
 /config/apache/ssl.conf
 /config/https.on
 /config/mailpit.on
+/config/mariadb.on
 /config/terminal.on
 
 # ===== registro de proyectos: estado de cada maquina (plantilla: sites.example.json) =====
