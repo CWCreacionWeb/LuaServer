@@ -388,7 +388,7 @@ function Set-JobStatus($id, $name, $type, $state, $msg) {
 }
 function Add-SiteToConfig($name, $php) {
     $cfg = Get-Config
-    if (-not $cfg.sites.PSObject.Properties.Name.Contains($name)) { $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{ php=$php }) -Force }
+    if (-not ($cfg.sites.PSObject.Properties.Name -contains $name)) { $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{ php=$php }) -Force }
     else { $cfg.sites.$name.php = $php }
     Save-Config $cfg
 }
@@ -495,7 +495,7 @@ function Cmd-AddSite($name, $php) {
         Set-Content -Path (Join-Path $dir "index.php") -Value "<?php`r`nphpinfo();`r`n" -Encoding utf8
         Ok "Carpeta creada: www\$name (con index.php)"
     }
-    if (-not $cfg.sites.PSObject.Properties.Name.Contains($name)) { $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{ php = $php }) -Force }
+    if (-not ($cfg.sites.PSObject.Properties.Name -contains $name)) { $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{ php = $php }) -Force }
     else { $cfg.sites.$name.php = $php }
     Save-Config $cfg
     Cmd-Reload
@@ -505,7 +505,7 @@ function Cmd-AddSite($name, $php) {
 function Cmd-RemoveSite($name) {
     if (-not $name) { Err "Uso: .\lua.ps1 remove-site <nombre>"; return }
     $cfg = Get-Config
-    if ($cfg.sites.PSObject.Properties.Name.Contains($name)) { $cfg.sites.PSObject.Properties.Remove($name); Save-Config $cfg; Cmd-Reload; Ok "Sitio '$name' eliminado (carpeta intacta)." }
+    if (($cfg.sites.PSObject.Properties.Name -contains $name)) { $cfg.sites.PSObject.Properties.Remove($name); Save-Config $cfg; Cmd-Reload; Ok "Sitio '$name' eliminado (carpeta intacta)." }
     else { Warn "No existe '$name'." }
 }
 function Cmd-SwitchPhp($name, $php) {
@@ -513,7 +513,7 @@ function Cmd-SwitchPhp($name, $php) {
     $av = Get-PhpVersions
     if ($av -and ($av -notcontains $php)) { Err "PHP $php no instalado. Disponibles: $($av -join ', ')"; return }
     $cfg = Get-Config
-    if (-not $cfg.sites.PSObject.Properties.Name.Contains($name)) { Err "No existe '$name'."; return }
+    if (-not ($cfg.sites.PSObject.Properties.Name -contains $name)) { Err "No existe '$name'."; return }
     $cfg.sites.$name.php = $php; Save-Config $cfg; Cmd-Reload; Ok "'$name' ahora usa PHP $php."
 }
 function Cmd-ListSites {

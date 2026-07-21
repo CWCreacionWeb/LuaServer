@@ -49,6 +49,18 @@ function lua_hosts(){ lua_flag('hosts'); }
 
 function tail_file($f,$n=250){ if(!is_file($f)) return ''; $lines=@file($f,FILE_IGNORE_NEW_LINES); if($lines===false) return ''; return implode("\n",array_slice($lines,-$n)); }
 function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n : ''; }
+// Bloqueo de proyecto: existe si la raiz del proyecto contiene CUALQUIER archivo *.lua.
+// El panel crea/quita el marcador .locked.lua, pero cualquier .lua puesto a mano
+// tambien protege el proyecto contra el borrado.
+define('LUA_LOCK_MARKER', '.locked.lua');
+function project_locked($dir){
+    if(!is_dir($dir)) return false;
+    foreach(scandir($dir) as $f){
+        if($f==='.'||$f==='..') continue;
+        if(is_file($dir.'/'.$f) && strtolower(substr($f,-4))==='.lua') return true;
+    }
+    return false;
+}
 function read_jobs($dir){
     $out=[];
     if(is_dir($dir)){
@@ -70,6 +82,18 @@ function job_log_tail($root,$id,$n=16){
     if(!is_file($f)) return '';
     $lines=@file($f,FILE_IGNORE_NEW_LINES); if(!$lines) return '';
     return implode("\n", array_slice($lines,-$n));
+}
+// El watcher es un proceso PowerShell independiente (arrancado por 'lua.ps1 start'),
+// no un hijo de Apache: se comprueba igual que hace lua.ps1 (pid en tmp/watch.pid + tasklist).
+function watcher_alive($root){
+    $pf = $root.'/tmp/watch.pid';
+    if (!is_file($pf)) return false;
+    $pid = (int)trim((string)@file_get_contents($pf));
+    if ($pid <= 0) return false;
+    $out = [];
+    @exec('tasklist /FI "PID eq '.$pid.'" 2>NUL', $out);
+    foreach ($out as $line) { if (strpos($line, (string)$pid) !== false) return true; }
+    return false;
 }
 function parse_overrides($file, $curatedKeys){
     $vals=[]; $extra=[];
@@ -151,9 +175,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     elseif ($action === 'delete') {
         $name=$_POST['name']??'';
-        if (isset($cfg['sites'][$name])) {
+        if (!isset($cfg['sites'][$name])) { $msg='error:No existe ese proyecto.'; }
+        elseif (project_locked("$WWW/$name")) { $msg='error:"'.$name.'" está bloqueado (tiene un archivo .lua). Desbloquéalo antes de eliminarlo.'; }
+        else {
             unset($cfg['sites'][$name]); write_json($CFG_FILE,$cfg); lua_apply();
             $msg='applied:Proyecto "'.$name.'" eliminado (la carpeta www\\'.$name.' se conserva).';
+        }
+    }
+    elseif ($action === 'lock') {
+        $name=$_POST['name']??'';
+        if (isset($cfg['sites'][$name]) && is_dir("$WWW/$name")) {
+            $marker = "$WWW/$name/".LUA_LOCK_MARKER;
+            @file_put_contents($marker, "; lua-server :: proyecto bloqueado\r\n; Mientras exista un archivo .lua en la raiz de este proyecto,\r\n; no se puede eliminar desde el panel (http://localhost).\r\n");
+            if (is_file($marker)) { $msg='applied:Proyecto "'.$name.'" bloqueado. No se podrá eliminar mientras exista el archivo .lua.'; }
+            else { $msg='error:No se pudo crear el archivo de bloqueo en www\\'.$name.'.'; }
+        } else { $msg='error:No existe ese proyecto.'; }
+    }
+    elseif ($action === 'unlock') {
+        $name=$_POST['name']??'';
+        if (isset($cfg['sites'][$name]) && is_dir("$WWW/$name")) {
+            $marker = "$WWW/$name/".LUA_LOCK_MARKER;
+            if (is_file($marker)) @unlink($marker);
+            if (project_locked("$WWW/$name")) { $msg='info:Quité el marcador, pero "'.$name.'" sigue bloqueado: hay otro archivo .lua en su carpeta.'; }
+            else { $msg='applied:Proyecto "'.$name.'" desbloqueado. Ya se puede eliminar.'; }
         } else { $msg='error:No existe ese proyecto.'; }
     }
     elseif ($action === 'phpini') {
@@ -176,13 +220,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $msg='applied:php.ini de PHP '.$ver.' guardado.';
         } else { $msg='error:Versión no válida.'; }
     }
-    elseif ($action === 'hosts') { lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
+    elseif ($action === 'hosts') { $tab='config'; lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
     elseif ($action === 'https') {
+        $tab='config';
         $enable = ($_POST['enable'] ?? '') === '1';
         if ($enable) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); $msg='info:Activando HTTPS: acepta el aviso de Windows (UAC) para instalar la CA. Recarga en unos segundos.'; }
         else { @unlink($ROOT.'/config/https.on'); lua_apply(); $msg='applied:HTTPS desactivado.'; }
     }
     elseif ($action === 'mailpit') {
+        $tab='config';
         $enable = ($_POST['enable'] ?? '') === '1';
         if ($enable) {
             @file_put_contents($ROOT.'/config/mailpit.on','1');
@@ -213,6 +259,7 @@ $msg = $_GET['msg'] ?? '';
 $curPhp = PHP_VERSION;
 $jobs = read_jobs($ROOT.'/tmp/jobs');
 $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['running','queued'],true)){$anyJobRun=true;break;} }
+$watcherAlive = watcher_alive($ROOT);
 ?>
 <!doctype html>
 <html lang="es">
@@ -222,72 +269,137 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
 <title>lua-server</title>
 <?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
 <?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},7000);</script><?php endif; ?>
-<?php if ($tab==='proyectos' && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
+<?php if (($tab==='proyectos' || $tab==='config') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
 <style>
-  :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; --ok:#3fb950; --warn:#d29922; --err:#f85149; --in:#11141c; }
-  @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; --in:#fff; } }
-  *{box-sizing:border-box} body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--tx)}
-  .wrap{max-width:900px;margin:0 auto;padding:34px 20px 60px}
-  header{display:flex;align-items:center;gap:16px;margin-bottom:6px}
-  .logo{width:50px;height:50px;border-radius:12px;background:linear-gradient(135deg,var(--ac),#9b6efe);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:19px;color:#fff;letter-spacing:1px}
-  h1{margin:0;font-size:21px} .sub{color:var(--mut);font-size:13px;margin-top:2px}
-  .tabs{display:flex;gap:6px;margin:22px 0 18px;border-bottom:1px solid var(--line)}
-  .tabs a{padding:9px 16px;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px}
+  :root{
+    --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0;
+    --ac:#6ea8fe; --ac-hover:#5a97f0; --ok:#3fb950; --warn:#d29922; --err:#f85149; --in:#11141c;
+    --brand-start:#6ea8fe; --brand-end:#9b6efe;
+  }
+  @media (prefers-color-scheme:light){
+    :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; --ac-hover:#1a5ae8; --in:#fff; }
+  }
+  *{box-sizing:border-box}
+  html{height:100%}
+  body{margin:0;height:100vh;overflow:hidden;display:flex;flex-direction:column;background:var(--bg);color:var(--tx);font-family:system-ui,'Segoe UI',Roboto,sans-serif}
+  a{color:var(--ac);text-decoration:none}
+  a:hover{color:var(--ac-hover)}
+
+  header{display:flex;align-items:center;gap:14px;padding:10px 40px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
+  .logo{width:44px;height:44px;border-radius:6px;background:linear-gradient(135deg,var(--brand-start),var(--brand-end));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#fff;letter-spacing:1px;flex-shrink:0}
+  h1{margin:0;font-size:19px;font-weight:700;line-height:1.2}
+  .sub{color:var(--mut);font-size:12px;margin-top:1px}
+  .spacer{flex:1}
+  .badges{display:flex;gap:6px;align-items:center;flex-shrink:0}
+
+  .tabbar{padding:0 40px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
+  .tabs{display:flex;gap:6px}
+  .tabs a{padding:9px 16px;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px;display:inline-block}
   .tabs a.on{color:var(--ac);border-color:var(--ac)}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+
+  .content{flex:1;overflow-y:auto;padding:28px 40px 48px}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:18px 20px;margin-bottom:14px}
   .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   .row .name{font-weight:700;font-size:16px;min-width:150px}
-  .row .url{color:var(--mut);font-size:13px;text-decoration:none} .row .url:hover{color:var(--ac)}
-  .spacer{flex:1}
+  .row .url{color:var(--mut);font-size:13px} .row .url:hover{color:var(--ac)}
+
   label{display:block;font-size:12px;color:var(--mut);margin:0 0 4px}
-  input,select,textarea{background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:14px;font-family:inherit}
-  input:focus,select,textarea:focus{outline:none;border-color:var(--ac)}
-  textarea{width:100%;min-height:90px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
-  .btn{background:var(--ac);color:#fff;border:none;border-radius:9px;padding:9px 16px;font-size:14px;font-weight:600;cursor:pointer}
+  input,select,textarea{background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:5px;padding:8px 10px;font-size:14px;font-family:inherit}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--ac)}
+  textarea{width:100%;min-height:70px;font-family:ui-monospace,Consolas,monospace;font-size:13px;resize:vertical}
+
+  .btn{background:var(--ac);color:#fff;border:1px solid transparent;border-radius:5px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer;transition:filter .12s,background .12s,color .12s,border-color .12s}
   .btn:hover{filter:brightness(1.08)}
-  .btn.ghost{background:transparent;border:1px solid var(--line);color:var(--tx)}
-  .btn.danger{background:transparent;border:1px solid var(--line);color:var(--err)}
-  .btn.danger:hover{background:var(--err);color:#fff;border-color:var(--err)}
+  .btn.sm{padding:4px 10px;font-size:13px}
+  .btn.ghost{background:transparent;border-color:var(--line);color:var(--tx)}
+  .btn.ghost:hover{border-color:var(--ac);color:var(--ac);filter:none}
+  .btn.danger{background:transparent;border-color:var(--line);color:var(--err)}
+  .btn.danger:hover{background:var(--err);color:#fff;border-color:var(--err);filter:none}
+
+  .sitegrid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
+  .sitecard{position:relative;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;min-width:0}
+  .sitecard.is-locked{border-color:var(--warn)}
+  .sitecard .name{font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:24px}
+  .sitecard .url{color:var(--mut);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+  .sitecard select,.sitecard .btn{width:100%;text-align:center}
+  .lockform{position:absolute;top:10px;right:10px;margin:0}
+  .lockbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;background:transparent;border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
+  .lockbtn:hover{color:var(--ac);border-color:var(--ac)}
+  .sitecard.is-locked .lockbtn{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.12)}
+  .sitecard.is-locked .lockbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.12)}
+
+  /* ---------- Modal de confirmacion ---------- */
+  .modal-overlay{position:fixed;inset:0;background:rgba(6,7,10,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
+  .modal-overlay[hidden]{display:none}
+  .modal-box{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:26px 26px 22px;max-width:400px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.45)}
+  .modal-ic{width:48px;height:48px;border-radius:999px;background:rgba(248,81,73,.12);color:var(--err);display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 14px}
+  .modal-box h3{margin:0 0 10px;font-size:17px;font-weight:700}
+  .modal-tx{color:var(--mut);font-size:13px;line-height:1.5;margin:0 0 20px}
+  .modal-tx strong{color:var(--tx)}
+  .modal-actions{display:flex;gap:8px;justify-content:center}
+  .modal-actions .btn{width:auto;padding:8px 18px}
+
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
   .tag{display:inline-block;font-size:12px;color:var(--ac);background:rgba(110,168,254,.12);padding:2px 9px;border-radius:999px}
-  .banner{padding:11px 15px;border-radius:10px;margin-bottom:16px;font-size:14px;border:1px solid}
+
+  .banner{padding:11px 15px;border-radius:8px;margin-bottom:16px;font-size:14px;border:1px solid}
   .banner.applied{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
   .banner.info{background:rgba(110,168,254,.12);border-color:var(--ac);color:var(--ac)}
   .banner.error{background:rgba(248,81,73,.12);border-color:var(--err);color:var(--err)}
   .banner.job{background:rgba(210,153,34,.12);border-color:var(--warn);color:var(--warn)}
-  .jstate{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;letter-spacing:.3px}
+
+  .jstate{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;letter-spacing:.3px;display:inline-block}
   .jstate.ok{background:rgba(63,185,80,.15);color:var(--ok)}
   .jstate.err{background:rgba(248,81,73,.15);color:var(--err)}
   .jstate.run{background:rgba(110,168,254,.15);color:var(--ac)}
-  .joblog{background:var(--in);border:1px solid var(--line);border-radius:8px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;max-height:180px;overflow:auto;color:var(--mut)}
-  details{border:1px solid var(--line);border-radius:12px;margin-bottom:12px;background:var(--card)}
+  .jstate.warn{background:rgba(210,153,34,.15);color:var(--warn)}
+
+  .joblog{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;max-height:72px;overflow:auto;color:var(--mut)}
+  .logview{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;font-family:ui-monospace,Consolas,monospace;font-size:13px;white-space:pre-wrap;max-height:62vh;overflow:auto;color:var(--mut)}
+
+  details{border:1px solid var(--line);border-radius:6px;margin-bottom:12px;background:var(--card);overflow:hidden}
   summary{padding:14px 18px;cursor:pointer;font-weight:700;font-size:16px;list-style:none;display:flex;align-items:center;gap:10px}
   summary::-webkit-details-marker{display:none}
   summary .op{font-size:12px;color:var(--mut);font-weight:500}
+  summary .arrow{margin-left:auto;font-size:12px;color:var(--mut)}
+  summary .arrow::after{content:'▼'}
+  details[open] summary .arrow::after{content:'▲'}
   .pane{padding:4px 18px 18px}
-  h2{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;margin:26px 0 12px}
-  code{background:rgba(128,128,128,.16);padding:2px 6px;border-radius:6px;font-size:13px}
-  .muted{color:var(--mut);font-size:13px}
+
+  h2{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;margin:26px 0 12px}
+  code{background:rgba(128,128,128,.16);padding:2px 6px;border-radius:3px;font-size:13px}
+  .muted{color:var(--mut);font-size:12px}
   .inline{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
-  footer{margin-top:34px;color:var(--mut);font-size:12px;text-align:center}
+
+  footer{padding:8px 40px;color:var(--mut);font-size:12px;text-align:center;border-top:1px solid var(--line);flex-shrink:0}
 </style>
 </head>
 <body>
-<div class="wrap">
   <header>
     <div class="logo">LUA</div>
     <div>
       <h1>lua-server</h1>
       <div class="sub">Servidor PHP local &middot; <?= count($sites) ?> proyecto(s) &middot; PHP: <?= e(implode(', ',$vers)) ?></div>
     </div>
+    <div class="spacer"></div>
+    <div class="badges">
+      <span class="jstate ok">Apache UP</span>
+      <span class="jstate <?= $watcherAlive?'run':'err' ?>"><?= $watcherAlive?'Watcher activo':'Watcher inactivo' ?></span>
+    </div>
   </header>
 
-  <div class="tabs">
-    <a href="?tab=proyectos" class="<?= $tab==='proyectos'?'on':'' ?>">Proyectos</a>
-    <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
-    <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">Logs</a>
+  <div class="tabbar">
+    <div class="tabs">
+      <a href="?tab=proyectos" class="<?= $tab==='proyectos'?'on':'' ?>">Proyectos</a>
+      <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
+      <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">Logs</a>
+      <a href="?tab=config" class="<?= $tab==='config'?'on':'' ?>">Configuración del servidor</a>
+    </div>
   </div>
+
+  <div class="content">
 
   <?php if ($mtext): ?>
     <div class="banner <?= e($mtype) ?>">
@@ -339,10 +451,10 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
       <div class="row" style="margin:22px 0 10px">
         <h2 style="margin:0">Tareas</h2>
         <div class="spacer"></div>
-        <form method="post"><input type="hidden" name="action" value="clearjobs"><button class="btn ghost" style="padding:5px 12px">Limpiar historial</button></form>
+        <form method="post"><input type="hidden" name="action" value="clearjobs"><button class="btn ghost sm">Limpiar historial</button></form>
       </div>
       <?php foreach (array_slice($jobs,0,8) as $j):
-            $st=$j['state']??'?'; $cls=['done'=>'ok','error'=>'err','running'=>'run','queued'=>'run'];
+            $st=$j['state']??'?'; $cls=['done'=>'ok','error'=>'err','running'=>'run','queued'=>'warn'];
             $c=$cls[$st]??'run';
             $tail = in_array($st,['running','error','queued'],true) ? job_log_tail($ROOT, $j['id']??'') : ''; ?>
         <div class="card" style="padding:12px 16px">
@@ -361,70 +473,77 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
     <h2>Proyectos</h2>
     <?php if (!$sites): ?>
       <div class="card muted">Aún no hay proyectos. Crea el primero arriba.</div>
-    <?php else: foreach ($sites as $name => $info):
-          $ver = is_array($info)?($info['php']??'?'):$info;
-          $dom = (is_array($info) && !empty($info['domain'])) ? $info['domain'] : $name.'.'.$tld; ?>
-      <div class="card row">
-        <div class="name"><?= e($name) ?></div>
-        <a class="url" href="http://<?= e($dom) ?>" target="_blank"><?= e($dom) ?> &#8599;</a>
-        <div class="spacer"></div>
-        <form method="post" class="inline" style="gap:6px">
-          <input type="hidden" name="action" value="switch">
-          <input type="hidden" name="name" value="<?= e($name) ?>">
-          <select name="php" onchange="this.form.submit()">
-            <?php foreach ($vers as $v): ?>
-              <option value="<?= e($v) ?>" <?= $v===$ver?'selected':'' ?>>PHP <?= e($v) ?></option>
-            <?php endforeach; ?>
-          </select>
-        </form>
-        <form method="post" onsubmit="return confirm('¿Eliminar el proyecto <?= e($name) ?>? (la carpeta se conserva)')">
+    <?php else: ?>
+      <div class="sitegrid">
+        <?php foreach ($sites as $name => $info):
+              $ver = is_array($info)?($info['php']??'?'):$info;
+              $dom = (is_array($info) && !empty($info['domain'])) ? $info['domain'] : $name.'.'.$tld;
+              $locked = project_locked("$WWW/$name"); ?>
+          <div class="sitecard<?= $locked?' is-locked':'' ?>">
+            <form method="post" class="lockform">
+              <input type="hidden" name="action" value="<?= $locked?'unlock':'lock' ?>">
+              <input type="hidden" name="name" value="<?= e($name) ?>">
+              <button type="submit" class="lockbtn" title="<?= $locked?'Desbloquear (permitirá eliminar el proyecto)':'Bloquear (impide eliminar el proyecto)' ?>" aria-label="<?= $locked?'Desbloquear':'Bloquear' ?>">
+                <?php if ($locked): ?>
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+                <?php else: ?>
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>
+                <?php endif; ?>
+              </button>
+            </form>
+            <div class="name" title="<?= e($name) ?>"><?= e($name) ?></div>
+            <a class="url" href="http://<?= e($dom) ?>" target="_blank"><?= e($dom) ?> &#8599;</a>
+            <form method="post">
+              <input type="hidden" name="action" value="switch">
+              <input type="hidden" name="name" value="<?= e($name) ?>">
+              <select name="php" onchange="this.form.submit()">
+                <?php foreach ($vers as $v): ?>
+                  <option value="<?= e($v) ?>" <?= $v===$ver?'selected':'' ?>>PHP <?= e($v) ?></option>
+                <?php endforeach; ?>
+              </select>
+            </form>
+            <?php if (!$locked): ?>
+              <button class="btn danger" type="button" onclick="luaAskDelete('<?= e($name) ?>')">Eliminar</button>
+            <?php endif; ?>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endif; ?>
+
+    <!-- Modal de confirmacion de borrado -->
+    <div id="delModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDelete()">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delTitle">
+        <div class="modal-ic">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+        </div>
+        <h3 id="delTitle">¿Eliminar proyecto?</h3>
+        <p class="modal-tx">Se quitará <strong id="delName"></strong> del panel y se recargará Apache.
+          La carpeta <code>www\<span id="delFolder"></span></code> y todos sus archivos <strong>se conservan</strong> en disco.</p>
+        <form method="post" class="modal-actions">
           <input type="hidden" name="action" value="delete">
-          <input type="hidden" name="name" value="<?= e($name) ?>">
-          <button class="btn danger" type="submit">Eliminar</button>
+          <input type="hidden" name="name" id="delNameInput">
+          <button type="button" class="btn ghost" onclick="luaCloseDelete()">Cancelar</button>
+          <button type="submit" class="btn danger">Sí, eliminar</button>
         </form>
       </div>
-    <?php endforeach; endif; ?>
-
-    <div class="card row">
-      <div>
-        <div style="font-weight:600">Dominios <code>.<?= e($tld) ?></code> en el navegador</div>
-        <div class="muted">Para que <code>&lt;nombre&gt;.<?= e($tld) ?></code> abra en el navegador hay que registrarlos en Windows (una vez).</div>
-      </div>
-      <div class="spacer"></div>
-      <form method="post">
-        <input type="hidden" name="action" value="hosts">
-        <button class="btn ghost" type="submit">Sincronizar dominios</button>
-      </form>
     </div>
-
-    <?php $httpsOn = is_file($ROOT.'/config/https.on') && is_file($ROOT.'/data/ssl/lua.pem'); ?>
-    <div class="card row">
-      <div>
-        <div style="font-weight:600">HTTPS local <span class="jstate <?= $httpsOn?'ok':'err' ?>" style="margin-left:6px"><?= $httpsOn?'ACTIVO':'INACTIVO' ?></span></div>
-        <div class="muted">Certificados de confianza para <code>https://&lt;proyecto&gt;.<?= e($tld) ?></code> (candado verde). Al activar, Windows pedirá permiso para instalar la CA (una vez).</div>
-      </div>
-      <div class="spacer"></div>
-      <form method="post">
-        <input type="hidden" name="action" value="https">
-        <input type="hidden" name="enable" value="<?= $httpsOn?'0':'1' ?>">
-        <button class="btn <?= $httpsOn?'danger':'ghost' ?>" type="submit"><?= $httpsOn?'Desactivar':'Activar' ?> HTTPS</button>
-      </form>
-    </div>
-
-    <?php $mailOn = is_file($ROOT.'/config/mailpit.on'); ?>
-    <div class="card row">
-      <div>
-        <div style="font-weight:600">Mailpit <span class="jstate <?= $mailOn?'ok':'err' ?>" style="margin-left:6px"><?= $mailOn?'ACTIVO':'INACTIVO' ?></span></div>
-        <div class="muted">Atrapa los emails que envían tus proyectos PHP (SMTP <code>127.0.0.1:1025</code>) y los muestra en un buzón web. No salen a internet.</div>
-      </div>
-      <div class="spacer"></div>
-      <?php if ($mailOn): ?><a class="btn ghost" href="http://localhost:8025" target="_blank">Abrir buzón &#8599;</a><?php endif; ?>
-      <form method="post">
-        <input type="hidden" name="action" value="mailpit">
-        <input type="hidden" name="enable" value="<?= $mailOn?'0':'1' ?>">
-        <button class="btn <?= $mailOn?'danger':'ghost' ?>" type="submit"><?= $mailOn?'Desactivar':'Activar' ?> Mailpit</button>
-      </form>
-    </div>
+    <script>
+      function luaAskDelete(name){
+        document.getElementById('delName').textContent = name;
+        document.getElementById('delFolder').textContent = name;
+        document.getElementById('delNameInput').value = name;
+        document.getElementById('delModal').hidden = false;
+        document.addEventListener('keydown', luaEscDelete);
+      }
+      function luaCloseDelete(){
+        document.getElementById('delModal').hidden = true;
+        document.removeEventListener('keydown', luaEscDelete);
+      }
+      function luaEscDelete(e){ if(e.key==='Escape') luaCloseDelete(); }
+    </script>
 
   <?php elseif ($tab==='php'): /* ---------- PESTAÑA PHP ---------- */ ?>
 
@@ -436,7 +555,7 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
     <?php else: $openVer = $_GET['ver'] ?? ''; foreach ($vers as $v):
         [$vals,$extra] = parse_overrides("$OVR_DIR/$v.overrides.ini", array_keys($CURATED)); ?>
       <details <?= $v===$openVer?'open':'' ?>>
-        <summary>PHP <?= e($v) ?> <span class="op">&mdash; config/php/<?= e($v) ?>.overrides.ini</span></summary>
+        <summary>PHP <?= e($v) ?> <span class="op">&mdash; config/php/<?= e($v) ?>.overrides.ini</span><span class="arrow"></span></summary>
         <div class="pane">
           <?php $xon = is_file($OVR_DIR.'/'.$v.'.xdebug.on'); $xdll = is_file($PHP_BASE.'/'.$v.'/ext/php_xdebug.dll'); $xactive=($xon&&$xdll); $xnourl=(empty($XDEBUG_URLS[$v]) && !$xdll); ?>
           <div class="row" style="margin-bottom:4px">
@@ -493,20 +612,64 @@ $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['runn
   ?>
     <div class="row" style="margin-bottom:14px;gap:8px;flex-wrap:wrap">
       <?php foreach ($logFiles as $lf): ?>
-        <a href="?tab=logs&log=<?= urlencode($lf) ?><?= $refresh?'&refresh=1':'' ?>" class="btn <?= $lf===$sel?'':'ghost' ?>" style="padding:6px 12px;font-size:13px"><?= e($lf) ?></a>
+        <a href="?tab=logs&log=<?= urlencode($lf) ?><?= $refresh?'&refresh=1':'' ?>" class="btn <?= $lf===$sel?'':'ghost' ?> sm"><?= e($lf) ?></a>
       <?php endforeach; ?>
       <div class="spacer"></div>
-      <a href="?tab=logs&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost" style="padding:6px 12px;font-size:13px"><?= $refresh?'⏸ Auto-refresco ON':'▶ Auto-refresco' ?></a>
+      <a href="?tab=logs&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost sm"><?= $refresh?'⏸ Auto-refresco ON':'▶ Auto-refresco' ?></a>
       <form method="post" onsubmit="return confirm('¿Vaciar <?= e($sel) ?>?')" style="display:inline">
         <input type="hidden" name="action" value="clearlog"><input type="hidden" name="log" value="<?= e($sel) ?>">
-        <button class="btn ghost" style="padding:6px 12px;font-size:13px">Vaciar</button>
+        <button class="btn ghost sm">Vaciar</button>
       </form>
     </div>
-    <pre class="joblog" style="max-height:62vh"><?= $content!=='' ? e($content) : '(vacío)' ?></pre>
+    <pre class="logview"><?= $content!=='' ? e($content) : '(vacío)' ?></pre>
+
+  <?php elseif ($tab==='config'): /* ---------- PESTAÑA CONFIGURACIÓN DEL SERVIDOR ---------- */ ?>
+
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Dominios <code>.<?= e($tld) ?></code> en el navegador</div>
+        <div class="muted">Para que <code>&lt;nombre&gt;.<?= e($tld) ?></code> abra en el navegador hay que registrarlos en Windows (una vez).</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post">
+        <input type="hidden" name="action" value="hosts">
+        <button class="btn ghost" type="submit">Sincronizar dominios</button>
+      </form>
+    </div>
+
+    <?php $httpsOn = is_file($ROOT.'/config/https.on') && is_file($ROOT.'/data/ssl/lua.pem'); ?>
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">HTTPS local <span class="jstate <?= $httpsOn?'ok':'err' ?>" style="margin-left:6px"><?= $httpsOn?'ACTIVO':'INACTIVO' ?></span></div>
+        <div class="muted">Certificados de confianza para <code>https://&lt;proyecto&gt;.<?= e($tld) ?></code> (candado verde). Al activar, Windows pedirá permiso para instalar la CA (una vez).</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post">
+        <input type="hidden" name="action" value="https">
+        <input type="hidden" name="enable" value="<?= $httpsOn?'0':'1' ?>">
+        <button class="btn <?= $httpsOn?'danger':'ghost' ?>" type="submit"><?= $httpsOn?'Desactivar':'Activar' ?> HTTPS</button>
+      </form>
+    </div>
+
+    <?php $mailOn = is_file($ROOT.'/config/mailpit.on'); ?>
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Mailpit <span class="jstate <?= $mailOn?'ok':'err' ?>" style="margin-left:6px"><?= $mailOn?'ACTIVO':'INACTIVO' ?></span></div>
+        <div class="muted">Atrapa los emails que envían tus proyectos PHP (SMTP <code>127.0.0.1:1025</code>) y los muestra en un buzón web. No salen a internet.</div>
+      </div>
+      <div class="spacer"></div>
+      <?php if ($mailOn): ?><a class="btn ghost" href="http://localhost:8025" target="_blank">Abrir buzón &#8599;</a><?php endif; ?>
+      <form method="post">
+        <input type="hidden" name="action" value="mailpit">
+        <input type="hidden" name="enable" value="<?= $mailOn?'0':'1' ?>">
+        <button class="btn <?= $mailOn?'danger':'ghost' ?>" type="submit"><?= $mailOn?'Desactivar':'Activar' ?> Mailpit</button>
+      </form>
+    </div>
 
   <?php endif; ?>
 
+  </div>
+
   <footer>lua-server &middot; Apache + mod_fcgid &middot; panel solo accesible desde esta máquina</footer>
-</div>
 </body>
 </html>
