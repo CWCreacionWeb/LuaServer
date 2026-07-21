@@ -63,6 +63,21 @@ function lua_flag($name){ @file_put_contents(dirname(__DIR__,2).'/tmp/'.$name.'.
 function lua_apply(){ lua_flag('apply'); }
 function lua_hosts(){ lua_flag('hosts'); }
 
+// ---------------- Terminal (sin PTY: ejecuta comandos, streamea su salida) ----------------
+// Cada comando se lanza DESATENDIDO via COM(WScript.Shell) contra un .cmd generado,
+// que redirige stdout+stderr a un .out. El panel hace polling del .out por offset.
+// El cwd persiste entre comandos (el .cmd vuelca su directorio final a next.cwd).
+function term_enabled($root){ return is_file($root.'/config/terminal.on'); }
+function term_valid_sid($s){ return (bool)preg_match('/^[a-f0-9]{8,40}$/', (string)$s); }
+function term_dir($root,$sid){ return $root.'/tmp/terminal/'.$sid; }
+function term_default_cwd($root){ $w=$root.'/www'; return str_replace('/', '\\', is_dir($w)?$w:$root); }
+function term_get_cwd($root,$sid){
+    $f = term_dir($root,$sid).'/cwd';
+    if (is_file($f)) { $c=trim((string)@file_get_contents($f)); if ($c!=='' && is_dir($c)) return $c; }
+    return term_default_cwd($root);
+}
+function term_win($p){ return str_replace('/', '\\', $p); }
+
 function tail_file($f,$n=250){ if(!is_file($f)) return ''; $lines=@file($f,FILE_IGNORE_NEW_LINES); if($lines===false) return ''; return implode("\n",array_slice($lines,-$n)); }
 function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n : ''; }
 // Bloqueo de proyecto: existe si la raiz del proyecto contiene CUALQUIER archivo *.lua.
@@ -122,6 +137,92 @@ function parse_overrides($file, $curatedKeys){
         }
     }
     return [$vals,$extra];
+}
+
+// ---------------- Endpoints AJAX de la terminal (devuelven JSON, no PRG) ----------------
+$__ta = $_REQUEST['action'] ?? '';
+if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
+    header('Content-Type: application/json; charset=utf-8');
+    $reply = function($o){ echo json_encode($o); exit; };
+
+    if (!term_enabled($ROOT)) { $reply(['error'=>'La terminal está desactivada. Actívala en Configuración del servidor.']); }
+    $sid = $_REQUEST['sid'] ?? '';
+    if (!term_valid_sid($sid)) { $reply(['error'=>'Sesión no válida.']); }
+    $dir = term_dir($ROOT,$sid);
+    @mkdir($dir, 0777, true);
+
+    if ($__ta==='term_run') {
+        $cmd = (string)($_POST['cmd'] ?? '');
+        if (trim($cmd)==='') { $reply(['error'=>'Comando vacío.']); }
+        if (strlen($cmd) > 8000) { $reply(['error'=>'Comando demasiado largo.']); }
+        // limpieza: borrar sesiones antiguas (>1 dia) para que tmp\terminal no crezca sin fin
+        foreach ((array)@glob($ROOT.'/tmp/terminal/*', GLOB_ONLYDIR) as $old) {
+            if (@filemtime($old) < time()-86400) { foreach ((array)@glob($old.'/*') as $f) @unlink($f); @rmdir($old); }
+        }
+        $runid = bin2hex(random_bytes(8));
+        $cwd   = term_get_cwd($ROOT,$sid);
+        $cmdf  = $dir.'/'.$runid.'.cmd';
+        $outf  = $dir.'/'.$runid.'.out';
+        $cwdf  = $dir.'/'.$runid.'.cwd';
+        // Wrapper .cmd: titulo unico (para poder matar el arbol), cwd persistente,
+        // captura de exit code y del nuevo cwd, marca de fin.
+        $wr  = "@echo off\r\n";
+        $wr .= "title lua_".$runid."\r\n";
+        $wr .= "chcp 65001 >NUL\r\n";
+        $wr .= "cd /d \"".term_win($cwd)."\"\r\n";
+        $wr .= rtrim($cmd)."\r\n";
+        $wr .= "set __LUA_EC=%ERRORLEVEL%\r\n";
+        $wr .= "cd > \"".term_win($cwdf)."\"\r\n";
+        $wr .= "echo __LUA_DONE__%__LUA_EC%\r\n";
+        file_put_contents($cmdf, $wr);
+        @file_put_contents($outf, '');
+        $launch = 'cmd /c ""'.term_win($cmdf).'" > "'.term_win($outf).'" 2>&1"';
+        try {
+            $sh = new COM('WScript.Shell');
+            $sh->Run($launch, 0, false);   // ventana oculta, sin esperar (no bloquea Apache)
+        } catch (Throwable $e) {
+            $reply(['error'=>'No se pudo lanzar el comando: '.$e->getMessage()]);
+        }
+        $reply(['runid'=>$runid, 'cwd'=>$cwd]);
+    }
+
+    if ($__ta==='term_poll') {
+        $runid = $_REQUEST['runid'] ?? '';
+        if (!preg_match('/^[a-f0-9]{16}$/', $runid)) { $reply(['error'=>'runid no válido.']); }
+        $off  = max(0, (int)($_REQUEST['off'] ?? 0));
+        $outf = $dir.'/'.$runid.'.out';
+        $data = '';
+        if (is_file($outf)) {
+            $fh = @fopen($outf,'rb');
+            if ($fh) { if ($off>0) fseek($fh,$off); $data=stream_get_contents($fh); fclose($fh); }
+        }
+        $newoff = $off + strlen($data);
+        // ¿terminó? detectar la marca de fin
+        $done=false; $code=null;
+        if (preg_match('/__LUA_DONE__(\d+)\s*$/', $data, $m)) {
+            $done=true; $code=(int)$m[1];
+            $data = preg_replace('/\r?\n?__LUA_DONE__\d+\s*$/', '', $data);
+        }
+        $cwd=null;
+        if ($done) {
+            $cwdf = $dir.'/'.$runid.'.cwd';
+            if (is_file($cwdf)) { $c=trim((string)@file_get_contents($cwdf)); if ($c!=='' && is_dir($c)) { @file_put_contents($dir.'/cwd',$c); $cwd=$c; } }
+            @unlink($cmdf ?? ($dir.'/'.$runid.'.cmd')); @unlink($outf); @unlink($dir.'/'.$runid.'.cwd');
+        }
+        $reply(['data'=>$data, 'off'=>$newoff, 'done'=>$done, 'code'=>$code, 'cwd'=>$cwd]);
+    }
+
+    if ($__ta==='term_stop') {
+        $runid = $_REQUEST['runid'] ?? '';
+        if (!preg_match('/^[a-f0-9]{16}$/', $runid)) { $reply(['error'=>'runid no válido.']); }
+        // matar el arbol de procesos por el titulo de ventana unico del wrapper
+        @exec('taskkill /F /T /FI "WINDOWTITLE eq lua_'.$runid.'*" 2>&1');
+        // al matar el proceso, el wrapper no escribe la marca de fin: la añadimos
+        // nosotros para que el polling del panel termine limpio (código 130 = interrumpido).
+        $outf = $dir.'/'.$runid.'.out';
+        if (is_file($outf)) { @file_put_contents($outf, "\r\n[detenido]\r\n__LUA_DONE__130", FILE_APPEND); }
+        $reply(['stopped'=>true]);
+    }
 }
 
 // ---------------- POST (patron PRG) ----------------
@@ -270,6 +371,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         } else { @unlink($ROOT.'/config/mailpit.on'); lua_apply(); $msg='applied:Mailpit desactivado.'; }
     }
+    elseif ($action === 'terminal') {
+        $tab='config';
+        $enable = ($_POST['enable'] ?? '') === '1';
+        if ($enable) { @file_put_contents($ROOT.'/config/terminal.on','1'); $msg='applied:Terminal activada. Ejecuta comandos desde la pestaña Terminal.'; }
+        else { @unlink($ROOT.'/config/terminal.on'); $msg='applied:Terminal desactivada.'; }
+    }
 
     header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').'&msg='.urlencode($msg));
     exit;
@@ -404,6 +511,22 @@ $watcherAlive = watcher_alive($ROOT);
   .muted{color:var(--mut);font-size:12px}
   .inline{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
 
+  /* ---------- Terminal ---------- */
+  .termwrap{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--in)}
+  .termbar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--card);border-bottom:1px solid var(--line);font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .termout{padding:12px 14px;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:13px;line-height:1.5;white-space:pre-wrap;word-break:break-word;overflow-y:auto;height:58vh;color:var(--tx)}
+  .termin{display:flex;align-items:center;gap:8px;padding:8px 14px;border-top:1px solid var(--line);background:var(--card)}
+  .termprompt{color:var(--ac);font-family:ui-monospace,Consolas,monospace;font-weight:700}
+  #termcmd{flex:1;background:transparent;border:none;color:var(--tx);font-family:ui-monospace,Consolas,monospace;font-size:13px;padding:4px 0}
+  #termcmd:focus{outline:none}
+  #termcmd:disabled{opacity:.5}
+  .termout .a-prompt{color:var(--ac);font-weight:700}
+  .termout .a-bold{font-weight:700}
+  .a-k{color:#5b6172}.a-r{color:var(--err)}.a-g{color:var(--ok)}.a-y{color:var(--warn)}
+  .a-b{color:var(--ac)}.a-m{color:#9b6efe}.a-c{color:#3fc7d4}.a-w{color:var(--tx)}
+  .a-K{color:#8b90a0}.a-R{color:#ff7b72}.a-G{color:#56d364}.a-Y{color:#e3b341}
+  .a-B{color:#79c0ff}.a-M{color:#d2a8ff}.a-C{color:#56d4dd}.a-W{color:#fff}
+
   footer{padding:8px 40px;color:var(--mut);font-size:12px;text-align:center;border-top:1px solid var(--line);flex-shrink:0}
 </style>
 </head>
@@ -426,6 +549,7 @@ $watcherAlive = watcher_alive($ROOT);
       <a href="?tab=proyectos" class="<?= $tab==='proyectos'?'on':'' ?>">Proyectos</a>
       <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
       <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">Logs</a>
+      <a href="?tab=terminal" class="<?= $tab==='terminal'?'on':'' ?>">Terminal</a>
       <a href="?tab=config" class="<?= $tab==='config'?'on':'' ?>">Configuración del servidor</a>
     </div>
   </div>
@@ -718,6 +842,142 @@ $watcherAlive = watcher_alive($ROOT);
         <button class="btn <?= $mailOn?'danger':'ghost' ?>" type="submit"><?= $mailOn?'Desactivar':'Activar' ?> Mailpit</button>
       </form>
     </div>
+
+    <?php $termOn = is_file($ROOT.'/config/terminal.on'); ?>
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Terminal <span class="jstate <?= $termOn?'ok':'err' ?>" style="margin-left:6px"><?= $termOn?'ACTIVA':'INACTIVA' ?></span></div>
+        <div class="muted">Ejecuta comandos (composer, git, npm, artisan…) desde el navegador con la misma cuenta que Apache. Desactivada por defecto por seguridad: solo actívala si confías en quién tiene acceso a esta máquina.</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post">
+        <input type="hidden" name="action" value="terminal">
+        <input type="hidden" name="enable" value="<?= $termOn?'0':'1' ?>">
+        <button class="btn <?= $termOn?'danger':'ghost' ?>" type="submit"><?= $termOn?'Desactivar':'Activar' ?> Terminal</button>
+      </form>
+    </div>
+
+  <?php elseif ($tab==='terminal'): /* ---------- PESTAÑA TERMINAL ---------- */
+      $termOn = is_file($ROOT.'/config/terminal.on'); ?>
+
+    <?php if (!$termOn): ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:6px">La terminal está desactivada</div>
+        <div class="muted" style="margin-bottom:14px">Por seguridad, la terminal viene apagada. Permite ejecutar cualquier comando en esta máquina con los permisos de Apache. Actívala solo si confías en quién puede acceder a este panel.</div>
+        <form method="post">
+          <input type="hidden" name="action" value="terminal">
+          <input type="hidden" name="enable" value="1">
+          <button class="btn" type="submit">Activar terminal</button>
+        </form>
+      </div>
+    <?php else: ?>
+      <div class="termwrap">
+        <div class="termbar">
+          <span class="muted" id="termcwd">…</span>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" id="termstop" disabled>Detener</button>
+          <button class="btn ghost sm" id="termclear">Limpiar</button>
+        </div>
+        <div id="termout" class="termout" aria-live="polite"></div>
+        <div class="termin">
+          <span class="termprompt">&gt;</span>
+          <input id="termcmd" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+                 placeholder="escribe un comando y pulsa Enter (p.ej. git status)" autofocus>
+        </div>
+      </div>
+      <div class="muted" style="margin-top:10px;font-size:12px">
+        Sesión con directorio persistente (<code>cd</code> se mantiene). No es un PTY:
+        programas interactivos a pantalla completa (vim, nano, prompts) no funcionan.
+        Historial con ↑/↓ · Ctrl+L limpia.
+      </div>
+      <script>
+      (function(){
+        var out=document.getElementById('termout');
+        var inp=document.getElementById('termcmd');
+        var cwdEl=document.getElementById('termcwd');
+        var stopBtn=document.getElementById('termstop');
+        var clearBtn=document.getElementById('termclear');
+        var sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
+        var hist=[], hi=-1, running=false, curRun=null;
+
+        // --- parser ANSI SGR basico -> spans con clase de color ---
+        var ANSI={30:'k',31:'r',32:'g',33:'y',34:'b',35:'m',36:'c',37:'w',90:'K',91:'R',92:'G',93:'Y',94:'B',95:'M',96:'C',97:'W'};
+        function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+        function ansiToHtml(s){
+          var res='', open=false, cls='', bold=false;
+          var re=/\x1b\[([0-9;]*)m/g, last=0, m;
+          function span(t){ if(!t)return; if(open){res+='<span class="a-'+cls+(bold?' a-bold':'')+'">'+esc(t)+'</span>';} else {res+=esc(t);} }
+          while((m=re.exec(s))!==null){
+            span(s.slice(last,m.index)); last=re.lastIndex;
+            var codes=m[1].split(';').filter(x=>x!=='').map(Number); if(codes.length===0)codes=[0];
+            codes.forEach(function(c){
+              if(c===0){open=false;cls='';bold=false;}
+              else if(c===1){bold=true;}
+              else if(ANSI[c]){cls=ANSI[c];open=true;}
+            });
+          }
+          span(s.slice(last));
+          return res;
+        }
+        function append(html){ out.insertAdjacentHTML('beforeend', html); out.scrollTop=out.scrollHeight; }
+        function setCwd(c){ if(c){cwdEl.textContent=c;} }
+
+        clearBtn.onclick=function(){ out.innerHTML=''; inp.focus(); };
+        stopBtn.onclick=function(){
+          if(!running||!curRun)return;
+          fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'action=term_stop&sid='+sid+'&runid='+curRun}).then(()=>{});
+        };
+
+        function poll(runid, off, fails){
+          fails = fails||0;
+          fetch('?action=term_poll&sid='+sid+'&runid='+runid+'&off='+off)
+          .then(r=>r.json()).then(function(j){
+            if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); finish(); return; }
+            if(j.data){ append(ansiToHtml(j.data)); }
+            if(j.done){
+              if(out.textContent && !out.textContent.endsWith('\n')) append('\n');
+              if(j.code && j.code!==0){ append('<span class="a-r">[salida '+j.code+']</span>\n'); }
+              if(j.cwd) setCwd(j.cwd);
+              finish();
+            } else {
+              setTimeout(function(){ poll(runid, j.off, 0); }, 300);
+            }
+          }).catch(function(){
+            // un poll suelto puede fallar (mod_fcgid saturado); reintentar antes de rendirse
+            if(fails >= 5){ append('<span class="a-r">[error de red: se perdió la conexión con el comando]</span>\n'); finish(); return; }
+            setTimeout(function(){ poll(runid, off, fails+1); }, 500);
+          });
+        }
+        function finish(){ running=false; curRun=null; stopBtn.disabled=true; inp.disabled=false; inp.focus(); }
+
+        function run(cmd){
+          running=true; inp.disabled=true; stopBtn.disabled=false;
+          append('<span class="a-prompt">'+esc(cwdEl.textContent)+'&gt; </span>'+esc(cmd)+'\n');
+          var body='action=term_run&sid='+sid+'&cmd='+encodeURIComponent(cmd);
+          fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
+          .then(r=>r.json()).then(function(j){
+            if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); finish(); return; }
+            curRun=j.runid; if(j.cwd) setCwd(j.cwd);
+            poll(j.runid, 0);
+          }).catch(function(){ append('<span class="a-r">[no se pudo lanzar]</span>\n'); finish(); });
+        }
+
+        inp.addEventListener('keydown', function(e){
+          if(e.key==='Enter'){
+            var cmd=inp.value; if(!cmd.trim()||running) return;
+            hist.push(cmd); hi=hist.length; inp.value='';
+            if(cmd.trim()==='clear'||cmd.trim()==='cls'){ out.innerHTML=''; return; }
+            run(cmd);
+          } else if(e.key==='ArrowUp'){ if(hi>0){hi--; inp.value=hist[hi]; e.preventDefault();} }
+          else if(e.key==='ArrowDown'){ if(hi<hist.length-1){hi++; inp.value=hist[hi];} else {hi=hist.length; inp.value='';} }
+          else if(e.key==='l' && e.ctrlKey){ out.innerHTML=''; e.preventDefault(); }
+        });
+        cwdEl.textContent=<?= json_encode(term_win(term_default_cwd($ROOT))) ?>;
+        inp.focus();
+      })();
+      </script>
+    <?php endif; ?>
 
   <?php endif; ?>
 
