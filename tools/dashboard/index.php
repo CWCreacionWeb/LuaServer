@@ -41,6 +41,22 @@ function e($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 function php_versions($base){
     $v=[]; if(is_dir($base)){ foreach(scandir($base) as $d){ if($d[0]==='.')continue; if(is_file("$base/$d/php-cgi.exe")) $v[]=$d; } } natsort($v); return array_values($v);
 }
+// Carpetas en www\ que no estan registradas en sites.json (creadas a mano,
+// copiadas de otra maquina, etc.). No se publican solas: hay que "adoptarlas".
+function unregistered_projects($www, $sites){
+    $out=[];
+    if (is_dir($www)) {
+        foreach (scandir($www) as $d) {
+            if ($d==='.'||$d==='..') continue;
+            if (!is_dir("$www/$d")) continue;
+            if (isset($sites[$d])) continue;
+            if (!valid_name($d)) continue;
+            $out[]=$d;
+        }
+    }
+    sort($out);
+    return $out;
+}
 // El panel NO lanza procesos: solo deja un archivo-senal en tmp\ que el watcher
 // (proceso independiente arrancado por 'lua.ps1 start') ejecuta en ~1 segundo.
 function lua_flag($name){ @file_put_contents(dirname(__DIR__,2).'/tmp/'.$name.'.flag', (string)time()); }
@@ -182,6 +198,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $msg='applied:Proyecto "'.$name.'" eliminado (la carpeta www\\'.$name.' se conserva).';
         }
     }
+    elseif ($action === 'adopt') {
+        $name=$_POST['name']??'';
+        $php=$_POST['php']??($cfg['defaultPhp']??'8.4');
+        if (!valid_name($name)) { $msg='error:Nombre de carpeta no válido.'; }
+        elseif (isset($cfg['sites'][$name])) { $msg='error:"'.$name.'" ya está registrado.'; }
+        elseif (!is_dir("$WWW/$name")) { $msg='error:No existe la carpeta www\\'.$name.'.'; }
+        elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
+        else {
+            $cfg['sites'][$name]=['php'=>$php]; write_json($CFG_FILE,$cfg); lua_apply();
+            $msg='applied:Proyecto "'.$name.'" adoptado -> http://'.$name.'.'.($cfg['tld']??'lua.test').' [PHP '.$php.']';
+        }
+    }
     elseif ($action === 'lock') {
         $name=$_POST['name']??'';
         if (isset($cfg['sites'][$name]) && is_dir("$WWW/$name")) {
@@ -253,6 +281,7 @@ $tld = $cfg['tld'] ?? 'lua.test';
 $sites = $cfg['sites'] ?? [];
 $defaultPhp = $cfg['defaultPhp'] ?? '8.4';
 $vers = php_versions($PHP_BASE);
+$unreg = unregistered_projects($WWW, $sites);
 $tab = $_GET['tab'] ?? 'proyectos';
 $msg = $_GET['msg'] ?? '';
 [$mtype,$mtext] = array_pad(explode(':',$msg,2),2,'');
@@ -329,6 +358,8 @@ $watcherAlive = watcher_alive($ROOT);
   .lockbtn:hover{color:var(--ac);border-color:var(--ac)}
   .sitecard.is-locked .lockbtn{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.12)}
   .sitecard.is-locked .lockbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.12)}
+  .sitecard.unregistered{background:transparent;border-style:dashed;border-color:var(--line)}
+  .sitecard.unregistered .name{color:var(--mut);font-weight:600}
 
   /* ---------- Modal de confirmacion ---------- */
   .modal-overlay{position:fixed;inset:0;background:rgba(6,7,10,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
@@ -505,6 +536,28 @@ $watcherAlive = watcher_alive($ROOT);
             <?php if (!$locked): ?>
               <button class="btn danger" type="button" onclick="luaAskDelete('<?= e($name) ?>')">Eliminar</button>
             <?php endif; ?>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endif; ?>
+
+    <?php if ($unreg): ?>
+      <h2>Sin registrar <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">— carpetas en <code>www\</code> que no aparecen arriba</span></h2>
+      <div class="sitegrid">
+        <?php foreach ($unreg as $name): ?>
+          <div class="sitecard unregistered">
+            <div class="name" title="<?= e($name) ?>"><?= e($name) ?></div>
+            <div class="muted" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">www\<?= e($name) ?></div>
+            <form method="post">
+              <input type="hidden" name="action" value="adopt">
+              <input type="hidden" name="name" value="<?= e($name) ?>">
+              <select name="php">
+                <?php foreach ($vers as $v): ?>
+                  <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+                <?php endforeach; ?>
+              </select>
+              <button class="btn ghost" type="submit" style="width:100%;margin-top:8px">Adoptar</button>
+            </form>
           </div>
         <?php endforeach; ?>
       </div>
