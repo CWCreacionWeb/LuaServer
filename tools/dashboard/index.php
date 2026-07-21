@@ -36,7 +36,13 @@ $XDEBUG_URLS = [
 function read_json($f){ $r=@file_get_contents($f); if($r===false)return null; $r=preg_replace('/^\xEF\xBB\xBF/','',$r); return json_decode($r,true); }
 function write_json($f,$d){ file_put_contents($f, json_encode($d, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE)); }
 function valid_name($n){ return (bool)preg_match('/^[a-z0-9][a-z0-9_-]{0,40}$/', $n); }
+function valid_domain($d){ return (bool)preg_match('/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i', $d); }
 function e($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+// Carpeta raiz de un proyecto: su 'path' (ruta externa) si esta definido, si no www\<name>.
+function project_dir($WWW, $info, $name){
+    if (is_array($info) && !empty($info['path']) && is_dir($info['path'])) return $info['path'];
+    return $WWW.'/'.$name;
+}
 
 function php_versions($base){
     $v=[]; if(is_dir($base)){ foreach(scandir($base) as $d){ if($d[0]==='.')continue; if(is_file("$base/$d/php-cgi.exe")) $v[]=$d; } } natsort($v); return array_values($v);
@@ -77,6 +83,20 @@ function term_get_cwd($root,$sid){
     return term_default_cwd($root);
 }
 function term_win($p){ return str_replace('/', '\\', $p); }
+
+// ---------------- Caratula (cover) por proyecto ----------------
+// Se guarda en data\covers\<name>.<ext> (runtime, fuera del docroot y de git).
+// Se sirve via ?cover=<name>. Un solo archivo por proyecto.
+function cover_exts(){ return ['jpg','jpeg','png','webp','gif','svg']; }
+function cover_path($root,$name){
+    foreach (cover_exts() as $e) { $f=$root.'/data/covers/'.$name.'.'.$e; if (is_file($f)) return $f; }
+    return null;
+}
+function cover_mime($f){
+    $ext = strtolower(pathinfo($f, PATHINFO_EXTENSION));
+    $map = ['jpg'=>'image/jpeg','jpeg'=>'image/jpeg','png'=>'image/png','webp'=>'image/webp','gif'=>'image/gif','svg'=>'image/svg+xml'];
+    return $map[$ext] ?? 'application/octet-stream';
+}
 
 function tail_file($f,$n=250){ if(!is_file($f)) return ''; $lines=@file($f,FILE_IGNORE_NEW_LINES); if($lines===false) return ''; return implode("\n",array_slice($lines,-$n)); }
 function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n : ''; }
@@ -137,6 +157,18 @@ function parse_overrides($file, $curatedKeys){
         }
     }
     return [$vals,$extra];
+}
+
+// ---------------- Servir la caratula de un proyecto: ?cover=<name> ----------------
+if (isset($_GET['cover'])) {
+    $name = (string)$_GET['cover'];
+    $f = valid_name($name) ? cover_path($ROOT,$name) : null;
+    if ($f) {
+        header('Content-Type: '.cover_mime($f));
+        header('Cache-Control: no-cache');
+        readfile($f); exit;
+    }
+    http_response_code(404); exit;
 }
 
 // ---------------- Endpoints AJAX de la terminal (devuelven JSON, no PRG) ----------------
@@ -253,6 +285,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $msg='job:Creando "'.$name.'" ('.$labels[$type].')… mira el progreso abajo.';
         }
     }
+    elseif ($action === 'add_external') {
+        $name   = strtolower(trim($_POST['name'] ?? ''));
+        $path   = trim($_POST['path'] ?? '');
+        $domain = strtolower(trim($_POST['domain'] ?? ''));
+        $php    = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
+        $pathN  = rtrim(str_replace('\\','/',$path), '/');
+        if (!valid_name($name)) { $msg='error:Nombre no válido (minúsculas, números, - o _).'; }
+        elseif (isset($cfg['sites'][$name])) { $msg='error:Ya existe un proyecto "'.$name.'".'; }
+        elseif ($path==='' || !is_dir($pathN)) { $msg='error:La ruta no existe o no es una carpeta: '.$path; }
+        elseif ($domain!=='' && !valid_domain($domain)) { $msg='error:Dominio no válido (ej.: portal.ersm.test).'; }
+        elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
+        else {
+            $entry = ['php'=>$php, 'path'=>$pathN];
+            if ($domain!=='') $entry['domain']=$domain;
+            $cfg['sites'][$name]=$entry; write_json($CFG_FILE,$cfg); lua_apply();
+            $dom = $domain!=='' ? $domain : $name.'.'.($cfg['tld']??'lua.test');
+            $hasPublic = is_dir($pathN.'/public');
+            $msg='applied:Proyecto externo "'.$name.'" registrado -> http://'.$dom.' [PHP '.$php.']'.($hasPublic?' (docroot: public/)':'').'. Si el dominio no abre, pulsa "Sincronizar dominios".';
+        }
+    }
     elseif ($action === 'clearjobs') {
         foreach (glob($ROOT.'/tmp/jobs/*.status') as $f) @unlink($f);
         $msg='info:Historial de tareas limpiado.';
@@ -310,6 +362,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $cfg['sites'][$name]=['php'=>$php]; write_json($CFG_FILE,$cfg); lua_apply();
             $msg='applied:Proyecto "'.$name.'" adoptado -> http://'.$name.'.'.($cfg['tld']??'lua.test').' [PHP '.$php.']';
         }
+    }
+    elseif ($action === 'cover') {
+        $name=$_POST['name']??'';
+        if (!isset($cfg['sites'][$name])) { $msg='error:No existe ese proyecto.'; }
+        elseif (empty($_FILES['img']) || ($_FILES['img']['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_OK) {
+            $msg='error:No se recibió la imagen (¿demasiado grande? máx. según php.ini).';
+        } else {
+            $tmp=$_FILES['img']['tmp_name']; $size=$_FILES['img']['size'];
+            $orig=strtolower($_FILES['img']['name']);
+            $ext=pathinfo($orig, PATHINFO_EXTENSION); if($ext==='jpeg')$ext='jpg';
+            $okImg=false; $info=@getimagesize($tmp);
+            if ($info!==false) $okImg=true;
+            elseif ($ext==='svg') { $head=@file_get_contents($tmp,false,null,0,512); if($head!==false && stripos($head,'<svg')!==false) $okImg=true; }
+            if ($size > 5*1024*1024) { $msg='error:La imagen supera 5 MB.'; }
+            elseif (!in_array($ext, cover_exts(), true) || !$okImg) { $msg='error:Formato no válido. Usa JPG, PNG, WEBP, GIF o SVG.'; }
+            else {
+                $dir=$ROOT.'/data/covers'; @mkdir($dir,0777,true);
+                foreach (cover_exts() as $e) @unlink($dir.'/'.$name.'.'.$e); // quitar la anterior
+                if (@move_uploaded_file($tmp, $dir.'/'.$name.'.'.$ext)) { $msg='applied:Carátula de "'.$name.'" actualizada.'; }
+                else { $msg='error:No se pudo guardar la imagen.'; }
+            }
+        }
+    }
+    elseif ($action === 'cover_remove') {
+        $name=$_POST['name']??'';
+        if (isset($cfg['sites'][$name])) {
+            foreach (cover_exts() as $e) @unlink($ROOT.'/data/covers/'.$name.'.'.$e);
+            $msg='applied:Carátula de "'.$name.'" eliminada.';
+        } else { $msg='error:No existe ese proyecto.'; }
     }
     elseif ($action === 'lock') {
         $name=$_POST['name']??'';
@@ -402,6 +483,7 @@ $watcherAlive = watcher_alive($ROOT);
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
 <title>lua-server</title>
 <?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
 <?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},7000);</script><?php endif; ?>
@@ -423,7 +505,8 @@ $watcherAlive = watcher_alive($ROOT);
   a:hover{color:var(--ac-hover)}
 
   header{display:flex;align-items:center;gap:14px;padding:10px 40px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
-  .logo{width:44px;height:44px;border-radius:6px;background:linear-gradient(135deg,var(--brand-start),var(--brand-end));display:flex;align-items:center;justify-content:center;font-weight:800;font-size:17px;color:#fff;letter-spacing:1px;flex-shrink:0}
+  .logo{width:44px;height:44px;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+  .logo img{width:100%;height:100%;display:block}
   h1{margin:0;font-size:19px;font-weight:700;line-height:1.2}
   .sub{color:var(--mut);font-size:12px;margin-top:1px}
   .spacer{flex:1}
@@ -460,13 +543,32 @@ $watcherAlive = watcher_alive($ROOT);
   .sitecard .name{font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:24px}
   .sitecard .url{color:var(--mut);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
   .sitecard select,.sitecard .btn{width:100%;text-align:center}
-  .lockform{position:absolute;top:10px;right:10px;margin:0}
-  .lockbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;background:transparent;border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
+  .lockform{position:absolute;top:10px;right:10px;margin:0;z-index:3}
+  .lockbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
   .lockbtn:hover{color:var(--ac);border-color:var(--ac)}
   .sitecard.is-locked .lockbtn{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.12)}
   .sitecard.is-locked .lockbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.12)}
   .sitecard.unregistered{background:transparent;border-style:dashed;border-color:var(--line)}
   .sitecard.unregistered .name{color:var(--mut);font-weight:600}
+  .exttag{font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--ac);background:rgba(110,168,254,.14);padding:1px 5px;border-radius:999px;vertical-align:middle}
+  .extpath{color:var(--mut);font-size:10px;font-family:ui-monospace,Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:-4px}
+  details.extform{padding:0}
+  details.extform>summary{padding:16px 20px;cursor:pointer;font-weight:600;font-size:14px;list-style:none}
+  details.extform>summary::-webkit-details-marker{display:none}
+  details.extform>summary::before{content:'+ ';color:var(--ac);font-weight:700}
+  details.extform[open]>summary::before{content:'– '}
+  details.extform>form{padding:0 20px 18px}
+  /* Caratula */
+  .coverform{margin:-14px -16px 4px;display:block}
+  .cover{position:relative;display:block;width:100%;height:78px;padding:0;border:0;cursor:pointer;border-radius:8px 8px 0 0;background-color:var(--in);background-size:cover;background-position:center;background-repeat:no-repeat;border-bottom:1px solid var(--line)}
+  .cover.empty{background-image:linear-gradient(135deg,rgba(110,168,254,.08),rgba(155,110,254,.08))}
+  .cover-hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:6px;font-size:11px;font-weight:600;letter-spacing:.2px}
+  .cover.empty .cover-hint{color:var(--mut)}
+  .cover.has .cover-hint{color:#fff;background:rgba(10,12,18,.5);opacity:0;transition:opacity .12s}
+  .cover.has:hover .cover-hint{opacity:1}
+  .coverdel{position:absolute;top:8px;left:8px;margin:0;z-index:3}
+  .coverdelbtn{display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;border-radius:5px;background:rgba(10,12,18,.55);color:#fff;font-size:15px;line-height:1;cursor:pointer}
+  .coverdelbtn:hover{background:var(--err)}
 
   /* ---------- Modal de confirmacion ---------- */
   .modal-overlay{position:fixed;inset:0;background:rgba(6,7,10,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
@@ -532,7 +634,7 @@ $watcherAlive = watcher_alive($ROOT);
 </head>
 <body>
   <header>
-    <div class="logo">LUA</div>
+    <div class="logo"><img src="assets/logo.svg" alt="lua-server"></div>
     <div>
       <h1>lua-server</h1>
       <div class="sub">Servidor PHP local &middot; <?= count($sites) ?> proyecto(s) &middot; PHP: <?= e(implode(', ',$vers)) ?></div>
@@ -602,6 +704,37 @@ $watcherAlive = watcher_alive($ROOT);
       <div class="muted" style="margin-top:10px">Laravel/Symfony/Slim usan Composer; WordPress se descarga; Git clona el repo (y ejecuta <code>composer install</code> si hay <code>composer.json</code>). Se hace en segundo plano.</div>
     </div>
 
+    <details class="card extform">
+      <summary>Registrar proyecto existente en otra carpeta del disco <span class="muted">(p.ej. <code>C:\proyectos\ersmportal</code> con dominio propio)</span></summary>
+      <form method="post" style="margin-top:14px">
+        <input type="hidden" name="action" value="add_external">
+        <div class="inline">
+          <div>
+            <label>Nombre (identificador)</label>
+            <input name="name" placeholder="ersmportal" pattern="[a-z0-9][a-z0-9_-]*" required>
+          </div>
+          <div style="flex:1;min-width:280px">
+            <label>Ruta de la carpeta en disco</label>
+            <input name="path" placeholder="C:\proyectos\ersmportal" style="width:100%" required>
+          </div>
+          <div>
+            <label>Dominio</label>
+            <input name="domain" placeholder="portal.ersm.test">
+          </div>
+          <div>
+            <label>PHP</label>
+            <select name="php">
+              <?php foreach ($vers as $v): ?>
+                <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <button class="btn" type="submit">Registrar</button>
+        </div>
+        <div class="muted" style="margin-top:10px">No copia ni mueve nada: apunta el vhost a esa carpeta (usa <code>public/</code> si existe, para Laravel/Symfony). Si pones un dominio propio, luego pulsa <b>Sincronizar dominios</b> en Configuración del servidor para registrarlo en Windows.</div>
+      </form>
+    </details>
+
     <?php if ($jobs): ?>
       <div class="row" style="margin:22px 0 10px">
         <h2 style="margin:0">Tareas</h2>
@@ -633,7 +766,10 @@ $watcherAlive = watcher_alive($ROOT);
         <?php foreach ($sites as $name => $info):
               $ver = is_array($info)?($info['php']??'?'):$info;
               $dom = (is_array($info) && !empty($info['domain'])) ? $info['domain'] : $name.'.'.$tld;
-              $locked = project_locked("$WWW/$name"); ?>
+              $pdir = project_dir($WWW, $info, $name);
+              $extPath = (is_array($info) && !empty($info['path'])) ? $info['path'] : null;
+              $locked = project_locked($pdir);
+              $hasCover = (bool)cover_path($ROOT,$name); ?>
           <div class="sitecard<?= $locked?' is-locked':'' ?>">
             <form method="post" class="lockform">
               <input type="hidden" name="action" value="<?= $locked?'unlock':'lock' ?>">
@@ -646,8 +782,25 @@ $watcherAlive = watcher_alive($ROOT);
                 <?php endif; ?>
               </button>
             </form>
-            <div class="name" title="<?= e($name) ?>"><?= e($name) ?></div>
+            <form method="post" enctype="multipart/form-data" class="coverform" id="cover-<?= e($name) ?>">
+              <input type="hidden" name="action" value="cover">
+              <input type="hidden" name="name" value="<?= e($name) ?>">
+              <input type="file" name="img" accept="image/*" hidden onchange="this.form.submit()">
+              <button type="button" class="cover<?= $hasCover?' has':' empty' ?>" title="<?= $hasCover?'Cambiar carátula':'Subir carátula' ?>"
+                      onclick="this.parentNode.querySelector('input[type=file]').click()"
+                      <?= $hasCover?'style="background-image:url(\'?cover='.e(rawurlencode($name)).'&t='.(cover_path($ROOT,$name)?filemtime(cover_path($ROOT,$name)):0).'\')"':'' ?>>
+                <span class="cover-hint">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                  <?= $hasCover?'Cambiar':'Carátula' ?>
+                </span>
+              </button>
+            </form>
+            <?php if ($hasCover): ?>
+              <form method="post" class="coverdel"><input type="hidden" name="action" value="cover_remove"><input type="hidden" name="name" value="<?= e($name) ?>"><button type="submit" class="coverdelbtn" title="Quitar carátula">&times;</button></form>
+            <?php endif; ?>
+            <div class="name" title="<?= e($name) ?>"><?= e($name) ?><?php if($extPath): ?> <span class="exttag" title="Proyecto externo: <?= e($extPath) ?>">ext</span><?php endif; ?></div>
             <a class="url" href="http://<?= e($dom) ?>" target="_blank"><?= e($dom) ?> &#8599;</a>
+            <?php if($extPath): ?><div class="extpath" title="<?= e($extPath) ?>"><?= e($extPath) ?></div><?php endif; ?>
             <form method="post">
               <input type="hidden" name="action" value="switch">
               <input type="hidden" name="name" value="<?= e($name) ?>">

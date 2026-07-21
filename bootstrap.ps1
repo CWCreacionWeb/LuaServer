@@ -1,7 +1,7 @@
 <#
 ============================================================
  lua-server :: bootstrap  (solo Apache + PHP)
- Descarga y prepara los binarios (Apache + PHP x6) en esta
+ Descarga y prepara los binarios (Apache + PHP 7.1-8.5) en esta
  carpeta. Ejecutalo en un PC nuevo tras clonar el repo, o
  para reinstalar los binarios.
 
@@ -31,7 +31,8 @@ $items = @(
   @{ n="php-8.3.32-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/php-8.3.32-nts-Win32-vs16-x64.zip"; php="8.3" },
   @{ n="php-8.2.32-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/php-8.2.32-nts-Win32-vs16-x64.zip"; php="8.2" },
   @{ n="php-8.1.34-nts-Win32-vs16-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-8.1.34-nts-Win32-vs16-x64.zip"; php="8.1" },
-  @{ n="php-7.4.33-nts-Win32-vc15-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.4.33-nts-Win32-vc15-x64.zip"; php="7.4" }
+  @{ n="php-7.4.33-nts-Win32-vc15-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.4.33-nts-Win32-vc15-x64.zip"; php="7.4" },
+  @{ n="php-7.1.33-nts-Win32-VC14-x64.zip";  u="https://windows.php.net/downloads/releases/archives/php-7.1.33-nts-Win32-VC14-x64.zip"; php="7.1" }
 )
 foreach ($it in $items) {
     $out = Join-Path $dl $it.n

@@ -14,6 +14,7 @@
    reload                    Regenera vhosts desde sites.json y recarga
    status                    Estado, versiones PHP y sitios
    add-site <nombre> [ver]   Crea un proyecto (carpeta + vhost). ver = version PHP
+   add-external <n> <ruta> [dom] [ver]  Registra un proyecto externo (fuera de www)
    remove-site <nombre>      Elimina el vhost (NO borra la carpeta)
    list-sites                Lista proyectos y su version de PHP
    switch-php <nombre> <ver> Cambia la version de PHP de un proyecto
@@ -27,7 +28,9 @@
 param(
     [Parameter(Position = 0)][string]$Command = "help",
     [Parameter(Position = 1)][string]$Arg1,
-    [Parameter(Position = 2)][string]$Arg2
+    [Parameter(Position = 2)][string]$Arg2,
+    [Parameter(Position = 3)][string]$Arg3,
+    [Parameter(Position = 4)][string]$Arg4
 )
 $ErrorActionPreference = "Stop"
 
@@ -97,10 +100,16 @@ function Get-PhpVersions {
     if (-not (Test-Path $PhpBase)) { return @() }
     Get-ChildItem $PhpBase -Directory | Where-Object { Test-Path (Join-Path $_.FullName "php-cgi.exe") } | ForEach-Object { $_.Name } | Sort-Object
 }
-function Get-DocRoot($name) {
-    $base = Join-Path $Www $name
-    $pub  = Join-Path $base "public"
+function Get-DocRoot($base) {
+    # $base = carpeta raiz del proyecto (www\<name> o una ruta externa).
+    # Si tiene public\ (Laravel/Symfony) se usa como docroot.
+    $pub = Join-Path $base "public"
     if (Test-Path $pub) { return $pub } else { return $base }
+}
+# Carpeta raiz de un sitio: su 'path' (ruta externa) si esta definido, si no www\<name>.
+function Get-SiteBase($site, $name) {
+    if ($site -and ($site.PSObject.Properties.Name -contains 'path') -and $site.path -and (Test-Path $site.path)) { return $site.path }
+    return (Join-Path $Www $name)
 }
 function Get-LanIp {
     $ip = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -156,19 +165,26 @@ function Set-PhpInis {
     foreach ($pd in (Get-ChildItem $PhpBase -Directory | Where-Object { Test-Path "$($_.FullName)\php-cgi.exe" })) {
         $ver = $pd.Name; $dir = $pd.FullName
         $ext = Join-Path $dir "ext"; $ini = Join-Path $dir "php.ini"
+        # PHP < 7.2 exige el nombre completo de la DLL (extension=php_curl.dll);
+        # 7.2+ acepta la forma corta (extension=curl).
+        $oldStyle = $false; try { $oldStyle = ([version]$ver -lt [version]'7.2') } catch {}
+        $extName = { param($n) if ($oldStyle) { "php_$n.dll" } else { $n } }
         $dev = Join-Path $dir "php.ini-development"; $prod = Join-Path $dir "php.ini-production"
         if (Test-Path $dev) { Copy-Item $dev $ini -Force } elseif (Test-Path $prod) { Copy-Item $prod $ini -Force } else { Set-Content $ini "" -Encoding ascii }
         $lines = Get-Content $ini | ForEach-Object { if ($_ -match '^\s*(zend_)?extension\s*=') { ';' + $_ } else { $_ } }
         $enable = New-Object System.Collections.Generic.List[string]
-        foreach ($e in $WantExts) { if (Test-Path (Join-Path $ext "php_$e.dll")) { $enable.Add("extension=$e") } }
-        if     (Test-Path (Join-Path $ext "php_gd.dll"))  { $enable.Add("extension=gd") }
-        elseif (Test-Path (Join-Path $ext "php_gd2.dll")) { $enable.Add("extension=gd2") }
+        foreach ($e in $WantExts) { if (Test-Path (Join-Path $ext "php_$e.dll")) { $enable.Add("extension=$(& $extName $e)") } }
+        if     (Test-Path (Join-Path $ext "php_gd.dll"))  { $enable.Add("extension=$(& $extName 'gd')") }
+        elseif (Test-Path (Join-Path $ext "php_gd2.dll")) { $enable.Add("extension=$(& $extName 'gd2')") }
         $hasOp = Test-Path (Join-Path $ext "php_opcache.dll")
         $tmpF = Fwd $TmpDir
         $b = New-Object System.Collections.Generic.List[string]
         $b.Add(""); $b.Add("; ===== lua-server ====="); $b.Add("extension_dir = `"$(Fwd $ext)`"")
         $b.AddRange([string[]]$enable)
-        if ($hasOp) { $b.Add("zend_extension=opcache"); $b.Add("opcache.enable = 1"); $b.Add("opcache.enable_cli = 0"); $b.Add("opcache.validate_timestamps = 1"); $b.Add("opcache.revalidate_freq = 0") }
+        # opcache: se omite en PHP < 7.2. Con mod_fcgid (php-cgi persistente) en Windows,
+        # opcache en esas versiones antiguas provoca crashes del proceso php-cgi
+        # ("End of script output before headers" / OS 109 broken pipe).
+        if ($hasOp -and -not $oldStyle) { $b.Add("zend_extension=$(& $extName 'opcache')"); $b.Add("opcache.enable = 1"); $b.Add("opcache.enable_cli = 0"); $b.Add("opcache.validate_timestamps = 1"); $b.Add("opcache.revalidate_freq = 0") }
         $b.Add("cgi.fix_pathinfo = 1")
         $b.Add("upload_tmp_dir = `"$tmpF`""); $b.Add("sys_temp_dir = `"$tmpF`""); $b.Add("session.save_path = `"$tmpF`"")
         # --- overrides editables desde el panel (sobreviven a las regeneraciones) ---
@@ -192,7 +208,7 @@ function Set-PhpInis {
         $xon = Join-Path $ovrDir "$ver.xdebug.on"
         if ((Test-Path $xon) -and (Test-Path (Join-Path $ext "php_xdebug.dll"))) {
             $b.Add(""); $b.Add("; ===== Xdebug (panel) =====")
-            $b.Add("zend_extension=xdebug")
+            $b.Add("zend_extension=$(& $extName 'xdebug')")
             $b.Add("xdebug.mode=debug")
             $b.Add("xdebug.start_with_request=yes")
             $b.Add("xdebug.client_host=127.0.0.1")
@@ -229,9 +245,10 @@ SSLSessionCacheTimeout 300
         Set-Content -Path $SslConf -Value "# HTTPS desactivado" -Encoding ascii
     }
 }
-function New-VhostFile($name, $php, $domain) {
+function New-VhostFile($name, $php, $domain, $base) {
     if (-not $domain) { $domain = "$name.$Tld" }
-    $docroot = Fwd (Get-DocRoot $name)
+    if (-not $base)   { $base = Join-Path $Www $name }
+    $docroot = Fwd (Get-DocRoot $base)
     $phpdir  = Fwd (Join-Path $PhpBase $php)
     $phpcgi  = Fwd (Join-Path $PhpBase "$php\php-cgi.exe")
     $logdir  = Fwd $ApacheLog
@@ -269,7 +286,8 @@ function Regenerate-Vhosts {
     foreach ($p in $cfg.sites.PSObject.Properties.Name) {
         $s = $cfg.sites.$p; $dom = $null
         if (($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { $dom = $s.domain }
-        New-VhostFile $p $s.php $dom
+        $base = Get-SiteBase $s $p
+        New-VhostFile $p $s.php $dom $base
     }
 }
 function Get-SiteDomain($cfg, $name) {
@@ -502,6 +520,26 @@ function Cmd-AddSite($name, $php) {
     Ok "Sitio '$name' -> http://$name.$Tld  [PHP $php]"
     if (-not (Test-Admin)) { Warn "Para abrirlo en el navegador anade a hosts (como admin):  127.0.0.1 $name.$Tld" }
 }
+# Registra un proyecto que vive FUERA de www\ (ruta externa) con dominio propio.
+function Cmd-AddExternal($name, $path, $domain, $php) {
+    if (-not $name -or -not $path) { Err "Uso: .\lua.ps1 add-external <nombre> <ruta> [dominio] [version-php]"; return }
+    if ($name -notmatch '^[a-z0-9][a-z0-9_-]{0,40}$') { Err "Nombre no valido (minusculas, numeros, - o _)."; return }
+    if (-not (Test-Path $path)) { Err "La ruta no existe: $path"; return }
+    $cfg = Get-Config
+    if (-not $php) { $php = $cfg.defaultPhp }
+    $av = Get-PhpVersions
+    if ($av -and ($av -notcontains $php)) { Err "PHP $php no instalado. Disponibles: $($av -join ', ')"; return }
+    $full = (Resolve-Path $path).Path
+    $obj = [pscustomobject]@{ php = $php; path = (Fwd $full) }
+    if ($domain) { $obj | Add-Member -NotePropertyName domain -NotePropertyValue $domain -Force }
+    if ($cfg.sites.PSObject.Properties.Name -contains $name) { $cfg.sites.PSObject.Properties.Remove($name) }
+    $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue $obj -Force
+    Save-Config $cfg
+    Cmd-Reload
+    $dom = if ($domain) { $domain } else { "$name.$Tld" }
+    Ok "Proyecto externo '$name' -> http://$dom  [PHP $php]  ($full)"
+    if (-not (Test-Admin)) { Warn "Anade a hosts (como admin):  127.0.0.1 $dom" }
+}
 function Cmd-RemoveSite($name) {
     if (-not $name) { Err "Uso: .\lua.ps1 remove-site <nombre>"; return }
     $cfg = Get-Config
@@ -575,6 +613,7 @@ switch ($Command.ToLower()) {
     "reload"      { Cmd-Reload }
     "status"      { Cmd-Status }
     "add-site"    { Cmd-AddSite $Arg1 $Arg2 }
+    "add-external" { Cmd-AddExternal $Arg1 $Arg2 $Arg3 $Arg4 }
     "remove-site" { Cmd-RemoveSite $Arg1 }
     "switch-php"  { Cmd-SwitchPhp $Arg1 $Arg2 }
     "list-sites"  { Cmd-ListSites }
