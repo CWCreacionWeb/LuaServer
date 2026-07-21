@@ -265,6 +265,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $vers = php_versions($PHP_BASE);
     $tab='proyectos'; $msg='';
 
+    if ($action === 'shutdown') {
+        // Apagar el servidor. Como al parar Apache muere este propio PHP, lanzamos
+        // 'lua.ps1 stop' en un proceso desatendido (con un respiro para que esta
+        // respuesta llegue al navegador) y devolvemos una página de despedida.
+        $luaWin = str_replace('/', '\\', $ROOT).'\\lua.ps1';
+        $cmdf = $ROOT.'/tmp/_shutdown.cmd';
+        @mkdir($ROOT.'/tmp', 0777, true);
+        $wr  = "@echo off\r\n";
+        $wr .= "ping -n 3 127.0.0.1 >NUL\r\n";  // ~2s para que el navegador reciba la página
+        $wr .= "powershell -NoProfile -ExecutionPolicy Bypass -File \"".$luaWin."\" stop\r\n";
+        @file_put_contents($cmdf, $wr);
+        try { $sh = new COM('WScript.Shell'); $sh->Run('cmd /c "'.str_replace('/', '\\', $cmdf).'"', 0, false); } catch (Throwable $e) {}
+        header('Content-Type: text/html; charset=utf-8');
+        ?>
+<!doctype html><html lang="es"><head><meta charset="utf-8"><title>lua-server — apagando</title>
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<style>
+  :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; }
+  @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; } }
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--tx);font-family:system-ui,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center}
+  .box{text-align:center;max-width:420px;padding:32px}
+  .ic{width:56px;height:56px;border-radius:999px;background:rgba(139,144,160,.15);color:var(--mut);display:flex;align-items:center;justify-content:center;margin:0 auto 18px}
+  h1{font-size:20px;margin:0 0 10px}
+  p{color:var(--mut);font-size:14px;line-height:1.5;margin:0 0 6px}
+  code{background:rgba(128,128,128,.16);padding:2px 7px;border-radius:5px;font-size:13px}
+</style></head><body>
+  <div class="box">
+    <div class="ic"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg></div>
+    <h1>Apagando el servidor…</h1>
+    <p>Apache, el watcher y Mailpit se están deteniendo. Esta página ya no responderá.</p>
+    <p style="margin-top:14px">Para volver a arrancar, en una terminal:<br><code>.\lua.ps1 start</code></p>
+  </div>
+</body></html>
+        <?php
+        exit;
+    }
+
+    if ($action === 'restart') {
+        // Reiniciar Apache. El proceso PHP muere al reiniciar; lo lanzamos desatendido
+        // y devolvemos una página que se recarga sola cuando Apache vuelve.
+        $luaWin = str_replace('/', '\\', $ROOT).'\\lua.ps1';
+        $cmdf = $ROOT.'/tmp/_restart.cmd';
+        @mkdir($ROOT.'/tmp', 0777, true);
+        $wr  = "@echo off\r\n";
+        $wr .= "ping -n 2 127.0.0.1 >NUL\r\n";  // deja llegar esta respuesta antes de tumbar Apache
+        $wr .= "powershell -NoProfile -ExecutionPolicy Bypass -File \"".$luaWin."\" restart\r\n";
+        @file_put_contents($cmdf, $wr);
+        try { $sh = new COM('WScript.Shell'); $sh->Run('cmd /c "'.str_replace('/', '\\', $cmdf).'"', 0, false); } catch (Throwable $e) {}
+        header('Content-Type: text/html; charset=utf-8');
+        ?>
+<!doctype html><html lang="es"><head><meta charset="utf-8"><title>lua-server — reiniciando</title>
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<meta http-equiv="refresh" content="9;url=?tab=proyectos">
+<style>
+  :root{ --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0; --ac:#6ea8fe; }
+  @media (prefers-color-scheme:light){ :root{ --bg:#f4f6fb; --card:#fff; --line:#e3e7f0; --tx:#1a1d27; --mut:#5b6172; --ac:#2b6cff; } }
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--tx);font-family:system-ui,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center}
+  .box{text-align:center;max-width:420px;padding:32px}
+  .ic{width:56px;height:56px;border-radius:999px;background:rgba(110,168,254,.14);color:var(--ac);display:flex;align-items:center;justify-content:center;margin:0 auto 18px}
+  .ic svg{animation:spin 1.1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  h1{font-size:20px;margin:0 0 10px}
+  p{color:var(--mut);font-size:14px;line-height:1.5;margin:0}
+</style></head><body>
+  <div class="box">
+    <div class="ic"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg></div>
+    <h1>Reiniciando el servidor…</h1>
+    <p>Apache está reiniciándose. Esta página se recargará sola en unos segundos.</p>
+  </div>
+</body></html>
+        <?php
+        exit;
+    }
+
     if ($action === 'create') {
         $name = strtolower(trim($_POST['name'] ?? ''));
         $php  = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
@@ -511,6 +587,11 @@ $watcherAlive = watcher_alive($ROOT);
   .sub{color:var(--mut);font-size:12px;margin-top:1px}
   .spacer{flex:1}
   .badges{display:flex;gap:6px;align-items:center;flex-shrink:0}
+  .iconbtn{display:flex;align-items:center;justify-content:center;width:34px;height:34px;flex-shrink:0;background:transparent;border:1px solid var(--line);border-radius:8px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
+  .restartbtn{margin-left:12px}
+  .restartbtn:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.10)}
+  .powerbtn{margin-left:6px}
+  .powerbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.10)}
 
   .tabbar{padding:0 40px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
   .tabs{display:flex;gap:6px}
@@ -575,6 +656,8 @@ $watcherAlive = watcher_alive($ROOT);
   .modal-overlay[hidden]{display:none}
   .modal-box{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:26px 26px 22px;max-width:400px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,.45)}
   .modal-ic{width:48px;height:48px;border-radius:999px;background:rgba(248,81,73,.12);color:var(--err);display:flex;align-items:center;justify-content:center;font-size:22px;margin:0 auto 14px}
+  .modal-ic-off{background:rgba(139,144,160,.15);color:var(--mut)}
+  .modal-ic-info{background:rgba(110,168,254,.14);color:var(--ac)}
   .modal-box h3{margin:0 0 10px;font-size:17px;font-weight:700}
   .modal-tx{color:var(--mut);font-size:13px;line-height:1.5;margin:0 0 20px}
   .modal-tx strong{color:var(--tx)}
@@ -644,7 +727,52 @@ $watcherAlive = watcher_alive($ROOT);
       <span class="jstate ok">Apache UP</span>
       <span class="jstate <?= $watcherAlive?'run':'err' ?>"><?= $watcherAlive?'Watcher activo':'Watcher inactivo' ?></span>
     </div>
+    <button type="button" class="iconbtn restartbtn" title="Reiniciar el servidor" aria-label="Reiniciar el servidor" onclick="luaAskRestart()">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>
+    </button>
+    <button type="button" class="iconbtn powerbtn" title="Apagar el servidor" aria-label="Apagar el servidor" onclick="luaAskShutdown()">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+    </button>
   </header>
+
+  <!-- Modal de confirmación de apagado -->
+  <div id="offModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseShutdown()">
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="offTitle">
+      <div class="modal-ic modal-ic-off">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+      </div>
+      <h3 id="offTitle">¿Apagar el servidor?</h3>
+      <p class="modal-tx">Se detendrán Apache, el watcher y Mailpit. Los sitios dejarán de responder hasta que vuelvas a arrancar con <code>.\lua.ps1 start</code>.</p>
+      <form method="post" class="modal-actions">
+        <input type="hidden" name="action" value="shutdown">
+        <button type="button" class="btn ghost" onclick="luaCloseShutdown()">Cancelar</button>
+        <button type="submit" class="btn danger">Sí, apagar</button>
+      </form>
+    </div>
+  </div>
+  <!-- Modal de confirmación de reinicio -->
+  <div id="rebootModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseRestart()">
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="rebootTitle">
+      <div class="modal-ic modal-ic-info">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>
+      </div>
+      <h3 id="rebootTitle">¿Reiniciar el servidor?</h3>
+      <p class="modal-tx">Apache se detendrá y volverá a arrancar en unos segundos. Los sitios no responderán durante el reinicio. La página se recargará sola al terminar.</p>
+      <form method="post" class="modal-actions">
+        <input type="hidden" name="action" value="restart">
+        <button type="button" class="btn ghost" onclick="luaCloseRestart()">Cancelar</button>
+        <button type="submit" class="btn">Sí, reiniciar</button>
+      </form>
+    </div>
+  </div>
+  <script>
+    function luaAskShutdown(){ document.getElementById('offModal').hidden=false; document.addEventListener('keydown',luaEscOff); }
+    function luaCloseShutdown(){ document.getElementById('offModal').hidden=true; document.removeEventListener('keydown',luaEscOff); }
+    function luaAskRestart(){ document.getElementById('rebootModal').hidden=false; document.addEventListener('keydown',luaEscReboot); }
+    function luaCloseRestart(){ document.getElementById('rebootModal').hidden=true; document.removeEventListener('keydown',luaEscReboot); }
+    function luaEscOff(e){ if(e.key==='Escape') luaCloseShutdown(); }
+    function luaEscReboot(e){ if(e.key==='Escape') luaCloseRestart(); }
+  </script>
 
   <div class="tabbar">
     <div class="tabs">
