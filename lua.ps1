@@ -72,7 +72,7 @@ $MariaLogDir   = Join-Path $Root "logs\mariadb"
 $MariaDbFlag   = Join-Path $Root "config\mariadb.on"
 
 $SvcApache  = "luaApache"
-$Tld        = "lua.test"
+$DefaultTld = "lua.test"
 $HostsBegin = "# === lua-server BEGIN (no editar a mano) ==="
 $HostsEnd   = "# === lua-server END ==="
 
@@ -101,12 +101,17 @@ function Require-Admin {
 }
 
 function Get-Config {
-    if (-not (Test-Path $SitesJson)) { return ([pscustomobject]@{ defaultPhp='8.4'; tld=$Tld; sites=([pscustomobject]@{}) }) }
+    if (-not (Test-Path $SitesJson)) { return ([pscustomobject]@{ defaultPhp='8.4'; tld=$DefaultTld; sites=([pscustomobject]@{}) }) }
     Get-Content $SitesJson -Raw | ConvertFrom-Json
 }
 function Save-Config($cfg) {
     $json = $cfg | ConvertTo-Json -Depth 6
     [System.IO.File]::WriteAllText($SitesJson, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+# Dominio local (.test por defecto): configurable desde el panel, guardado en sites.json.
+function Get-Tld {
+    $c = Get-Config
+    if ($c.tld) { return $c.tld } else { return $DefaultTld }
 }
 function Get-PhpVersions {
     if (-not (Test-Path $PhpBase)) { return @() }
@@ -232,7 +237,7 @@ function Set-PhpInis {
             $b.Add(""); $b.Add("; ===== Mailpit (captura de correo) =====")
             $b.Add("SMTP = 127.0.0.1")
             $b.Add("smtp_port = 1025")
-            $b.Add("sendmail_from = dev@$Tld")
+            $b.Add("sendmail_from = dev@$(Get-Tld)")
         }
         Set-Content -Path $ini -Value (@($lines) + $b.ToArray()) -Encoding ascii
     }
@@ -258,7 +263,7 @@ SSLSessionCacheTimeout 300
     }
 }
 function New-VhostFile($name, $php, $domain, $base) {
-    if (-not $domain) { $domain = "$name.$Tld" }
+    if (-not $domain) { $domain = "$name.$(Get-Tld)" }
     if (-not $base)   { $base = Join-Path $Www $name }
     $docroot = Fwd (Get-DocRoot $base)
     $phpdir  = Fwd (Join-Path $PhpBase $php)
@@ -305,7 +310,7 @@ function Regenerate-Vhosts {
 function Get-SiteDomain($cfg, $name) {
     $s = $cfg.sites.$name
     if ($s -and ($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { return $s.domain }
-    return "$name.$Tld"
+    return "$name.$(Get-Tld)"
 }
 
 function Cmd-Init {
@@ -561,9 +566,37 @@ function Run-Job($id, $job) {
                 }
                 if (-not (Test-Path $Mysqld)) { $ok=$false; $err="No se descargo MariaDB" } else { "MariaDB descargado." | Add-Content $log }
             }
+            "ftp_deploy" {
+                $ftpHost = "$($job.ftpHost)"; $ftpPort = "$($job.ftpPort)"; $ftpUser = "$($job.ftpUser)"; $ftpPass = "$($job.ftpPass)"
+                $ftpPath = "$($job.ftpPath)".Trim('/'); $ftpSsl = [bool]$job.ftpSsl
+                $exclude = @('.git') + @("$($job.ftpExclude)" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                if (-not (Test-Path $dir)) { $ok=$false; $err="No existe la carpeta del proyecto" }
+                else {
+                    $files = Get-ChildItem $dir -Recurse -File | Where-Object {
+                        $rel = $_.FullName.Substring($dir.Length+1) -replace '\\','/'
+                        $skip = $false
+                        foreach ($pat in $exclude) { if ($rel -like "*$pat*") { $skip = $true; break } }
+                        -not $skip
+                    }
+                    $total = $files.Count; $i = 0; $failCount = 0
+                    "Subiendo $total archivo(s) a $ftpHost..." | Add-Content $log
+                    foreach ($f in $files) {
+                        $i++
+                        $rel = $f.FullName.Substring($dir.Length+1) -replace '\\','/'
+                        $segments = (($ftpPath + '/' + $rel).Trim('/') -split '/') | ForEach-Object { [uri]::EscapeDataString($_) }
+                        $remoteUrl = "ftp://" + $ftpHost + ":" + $ftpPort + "/" + ($segments -join '/')
+                        $curlArgs = @('-s','-S','--ftp-create-dirs','-T', $f.FullName, $remoteUrl, '--user', "${ftpUser}:${ftpPass}", '--connect-timeout','15')
+                        if ($ftpSsl) { $curlArgs += '--ssl-reqd' }
+                        $curlOut = & curl.exe @curlArgs 2>&1
+                        if ($LASTEXITCODE -ne 0) { $failCount++; "[$i/$total] FALLO: $rel -> $curlOut" | Add-Content $log }
+                        elseif ($i % 10 -eq 0 -or $i -eq $total) { "[$i/$total] subido: $rel" | Add-Content $log }
+                    }
+                    if ($failCount -gt 0) { $ok=$false; $err="$failCount de $total archivo(s) fallaron (ver log)" }
+                }
+            }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'ftp_deploy') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -580,6 +613,8 @@ function Run-Job($id, $job) {
             Start-MariaDb
             if (MariaDb-Up) { Set-JobStatus $id $name $type "done" "MySQL activo en 127.0.0.1:3306 (usuario root, sin contrasena)" }
             else { Set-JobStatus $id $name $type "error" "MariaDB se descargo pero no arranco (revisa logs\mariadb\error.log)" }
+        } elseif ($type -eq 'ftp_deploy') {
+            Set-JobStatus $id $name $type "done" "Desplegado por FTP a $ftpHost ($total archivo(s))"
         } else {
             Add-SiteToConfig $name $php
             Set-PhpInis | Out-Null
@@ -591,7 +626,7 @@ function Run-Job($id, $job) {
                 if (New-ProjectDb $dbname $dir $type) { $dbNote = " [BD: $dbname]" }
                 else { $dbNote = " [aviso: no se pudo crear la BD, MySQL sigue apagado o no instalado]" }
             }
-            Set-JobStatus $id $name $type "done" "Listo -> http://$name.$Tld$dbNote"
+            Set-JobStatus $id $name $type "done" "Listo -> http://$name.$(Get-Tld)$dbNote"
         }
         "== DONE ==" | Add-Content $log
     } else {
@@ -619,7 +654,8 @@ function Update-Hosts {
     # navegador puede seguir cayendo ahi. Dejamos la entrada (no hace dano) pero la
     # alternativa que SI funciona siempre es "lua.test" a secas (no es un nombre
     # reservado, respeta el hosts al 100%) -> tambien sirve el panel.
-    $entries = @("127.0.0.1 localhost", "127.0.0.1 localhost.$Tld", "127.0.0.1 $Tld")
+    $tld = if ($cfg.tld) { $cfg.tld } else { $DefaultTld }
+    $entries = @("127.0.0.1 localhost", "127.0.0.1 localhost.$tld", "127.0.0.1 $tld")
     foreach ($p in $cfg.sites.PSObject.Properties.Name) { $dom = Get-SiteDomain $cfg $p; $entries += "127.0.0.1 $dom www.$dom" }
     $content = Get-Content $HostsFile -ErrorAction SilentlyContinue
     $kept = @(); $inside = $false
@@ -651,8 +687,9 @@ function Cmd-AddSite($name, $php) {
     else { $cfg.sites.$name.php = $php }
     Save-Config $cfg
     Cmd-Reload
-    Ok "Sitio '$name' -> http://$name.$Tld  [PHP $php]"
-    if (-not (Test-Admin)) { Warn "Para abrirlo en el navegador anade a hosts (como admin):  127.0.0.1 $name.$Tld" }
+    $tld = Get-Tld
+    Ok "Sitio '$name' -> http://$name.$tld  [PHP $php]"
+    if (-not (Test-Admin)) { Warn "Para abrirlo en el navegador anade a hosts (como admin):  127.0.0.1 $name.$tld" }
 }
 # Registra un proyecto que vive FUERA de www\ (ruta externa) con dominio propio.
 function Cmd-AddExternal($name, $path, $domain, $php) {
@@ -670,7 +707,7 @@ function Cmd-AddExternal($name, $path, $domain, $php) {
     $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue $obj -Force
     Save-Config $cfg
     Cmd-Reload
-    $dom = if ($domain) { $domain } else { "$name.$Tld" }
+    $dom = if ($domain) { $domain } else { "$name.$(Get-Tld)" }
     Ok "Proyecto externo '$name' -> http://$dom  [PHP $php]  ($full)"
     if (-not (Test-Admin)) { Warn "Anade a hosts (como admin):  127.0.0.1 $dom" }
 }
@@ -718,18 +755,19 @@ function Cmd-Hosts {
 }
 function Cmd-Logs { Get-Content (Join-Path $ApacheLog "error.log") -Tail 40 -ErrorAction SilentlyContinue }
 function Cmd-HttpsSetup {
+    $tld = Get-Tld
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     New-Item -ItemType Directory -Force -Path $SslDir | Out-Null
     if (-not (Test-Path $Mkcert)) { Err "Falta mkcert (bin\mkcert\mkcert.exe). Ejecuta bootstrap.ps1."; $ErrorActionPreference=$prev; return }
     Info "Instalando CA local de confianza (mkcert -install)..."
     & $Mkcert -install
-    Info "Generando certificado para *.$Tld ..."
-    & $Mkcert -cert-file "$SslCert" -key-file "$SslKey" "*.$Tld" "$Tld" "localhost" "127.0.0.1" "::1"
+    Info "Generando certificado para *.$tld ..."
+    & $Mkcert -cert-file "$SslCert" -key-file "$SslKey" "*.$tld" "$tld" "localhost" "127.0.0.1" "::1"
     $ErrorActionPreference = $prev
     if ((Test-Path $SslCert) -and (Test-Path $SslKey)) {
         Set-Content -Path $HttpsFlag -Value "1" -Encoding ascii
         Set-Ssl; Regenerate-Vhosts
-        if (Test-HttpdConfig) { Restart-Apache; Ok "HTTPS activado: los sitios responden en https://<proyecto>.$Tld con candado verde." }
+        if (Test-HttpdConfig) { Restart-Apache; Ok "HTTPS activado: los sitios responden en https://<proyecto>.$tld con candado verde." }
         else { Err "La config SSL no es valida; revisa .\lua.ps1 logs" }
     } else { Err "No se genero el certificado." }
 }

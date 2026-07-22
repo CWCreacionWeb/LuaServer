@@ -15,6 +15,7 @@
 /config/mariadb.on
 /config/terminal.on
 /config/mysql_root.pass
+/config/ftp/
 
 # ===== registro de proyectos: estado de cada maquina (plantilla: sites.example.json) =====
 /config/sites.json

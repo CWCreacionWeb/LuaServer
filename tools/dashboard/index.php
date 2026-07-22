@@ -141,7 +141,8 @@ function tree_node_html($abs, $rel, $lazyMode, &$count, $cap){
     foreach ($files as $e) {
         if ($count >= $cap) { $out .= '<div class="tnode-more">&hellip; truncado, hay más entradas de las mostradas</div>'; return $out; }
         $count++;
-        $out .= '<div class="trow tfile">'.ticon_file().'<span>'.e($e).'</span></div>';
+        $childRel = ($rel !== '' ? $rel.'/' : '').$e;
+        $out .= '<div class="trow tfile" data-rel="'.e($childRel).'" title="Clic para editar">'.ticon_file().'<span>'.e($e).'</span></div>';
     }
     return $out;
 }
@@ -160,6 +161,22 @@ function unregistered_projects($www, $sites){
     }
     sort($out);
     return $out;
+}
+// Detecta el framework de un proyecto por sus archivos caracteristicos. Se llama solo
+// al integrar (no en cada carga): el resultado se guarda en sites.json como 'type'.
+function detect_project_type($dir){
+    if (is_file("$dir/wp-load.php") || is_file("$dir/wp-config.php") || is_file("$dir/wp-config-sample.php")) return 'wordpress';
+    if (is_file("$dir/artisan")) return 'laravel';
+    $composerFile = "$dir/composer.json";
+    if (is_file($composerFile)) {
+        $data = json_decode((string)@file_get_contents($composerFile), true);
+        $require = array_merge((array)($data['require'] ?? []), (array)($data['require-dev'] ?? []));
+        foreach (array_keys($require) as $pkg) {
+            if ($pkg === 'laravel/framework') return 'laravel';
+            if (strpos($pkg, 'symfony/') === 0) return 'symfony';
+        }
+    }
+    return null;
 }
 // Borrado recursivo de una carpeta sin registrar (no hay sites.json que "desregistrar": es on/off).
 function rrmdir($dir){
@@ -246,7 +263,32 @@ function cover_mime($f){
     return $map[$ext] ?? 'application/octet-stream';
 }
 
+// ---------------- Despliegue por FTP: config guardada por proyecto (fuera de git) ----------------
+function ftp_config_path($root,$name){ return $root.'/config/ftp/'.$name.'.json'; }
+function ftp_config_get($root,$name){
+    $f = ftp_config_path($root,$name);
+    if (!is_file($f)) return null;
+    $d = json_decode((string)@file_get_contents($f), true);
+    return is_array($d) ? $d : null;
+}
+
 function tail_file($f,$n=250){ if(!is_file($f)) return ''; $lines=@file($f,FILE_IGNORE_NEW_LINES); if($lines===false) return ''; return implode("\n",array_slice($lines,-$n)); }
+// Resalta por severidad los logs de error de Apache/PHP (fatal/warning/deprecated/notice).
+// Devuelve HTML ya escapado: no volver a pasar por e().
+function highlight_error_log($text){
+    if ($text === '') return '';
+    $lines = explode("\n", $text);
+    $out = [];
+    foreach ($lines as $line) {
+        if (preg_match('/\b(Fatal error|Parse error|Uncaught)\b/i', $line)) { $cls = 'log-fatal'; }
+        elseif (preg_match('/\bWarning\b/i', $line)) { $cls = 'log-warning'; }
+        elseif (preg_match('/\bDeprecated\b/i', $line)) { $cls = 'log-deprecated'; }
+        elseif (preg_match('/\bNotice\b/i', $line)) { $cls = 'log-notice'; }
+        else { $cls = 'log-info'; }
+        $out[] = '<span class="'.$cls.'">'.e($line).'</span>';
+    }
+    return implode("\n", $out);
+}
 function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n : ''; }
 // Bloqueo de proyecto: existe si la raiz del proyecto contiene CUALQUIER archivo *.lua.
 // El panel crea/quita el marcador .locked.lua, pero cualquier .lua puesto a mano
@@ -336,7 +378,9 @@ if (isset($_GET['export_db'])) {
     if (!is_file($dumpExe)) { http_response_code(503); exit('MariaDB no está instalado.'); }
     header('Content-Type: application/sql; charset=utf-8');
     header('Content-Disposition: attachment; filename="'.$db.'-'.date('Y-m-d_His').'.sql"');
-    $cmd = '"'.$dumpExe.'" --host=127.0.0.1 --port=3306 --user=root --single-transaction --routines --events '.escapeshellarg($db);
+    $rootPass = mysql_root_pass($ROOT);
+    $passArg = $rootPass !== '' ? ' --password='.escapeshellarg($rootPass) : '';
+    $cmd = '"'.$dumpExe.'" --host=127.0.0.1 --port=3306 --user=root'.$passArg.' --single-transaction --routines --events '.escapeshellarg($db);
     passthru($cmd);
     exit;
 }
@@ -357,7 +401,52 @@ if (($_GET['ajax'] ?? '') === 'tree') {
     $tInside = $tTarget!==false && is_dir($tTarget) && ($tTargetN===$tBaseN || strpos($tTargetN, $tBaseN.'/')===0);
     if (!$tInside) { echo json_encode(['error'=>'Ruta no válida.']); exit; }
     $tCount = 0;
-    echo json_encode(['html'=>tree_node_html($tTarget, $tRel, true, $tCount, 400)]);
+    echo json_encode(['html'=>tree_node_html($tTarget, $tRel, true, $tCount, 2000)]);
+    exit;
+}
+
+// ---------------- AJAX: leer un archivo del proyecto para el editor de codigo ----------------
+if (($_GET['ajax'] ?? '') === 'file_read') {
+    header('Content-Type: application/json; charset=utf-8');
+    $fName = (string)($_GET['name'] ?? '');
+    $fRel  = (string)($_GET['rel'] ?? '');
+    $fCfg   = read_json($CFG_FILE) ?: ['sites'=>[]];
+    $fSites = $fCfg['sites'] ?? [];
+    if (!valid_name($fName) || !isset($fSites[$fName])) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $fBase = realpath(project_dir($WWW, $fSites[$fName], $fName));
+    if ($fBase === false) { echo json_encode(['error'=>'No se encontró el proyecto.']); exit; }
+    $fTarget = realpath($fBase.'/'.$fRel);
+    $fBaseN = rtrim(str_replace('\\','/',$fBase),'/');
+    $fTargetN = $fTarget!==false ? rtrim(str_replace('\\','/',$fTarget),'/') : '';
+    $fInside = $fTarget!==false && is_file($fTarget) && ($fTargetN===$fBaseN || strpos($fTargetN, $fBaseN.'/')===0);
+    if (!$fInside) { echo json_encode(['error'=>'Ruta no válida.']); exit; }
+    if (filesize($fTarget) > 2*1024*1024) { echo json_encode(['error'=>'Archivo demasiado grande para editar aquí (>2 MB).']); exit; }
+    $fData = @file_get_contents($fTarget);
+    if ($fData === false) { echo json_encode(['error'=>'No se pudo leer el archivo.']); exit; }
+    if (strpos($fData, "\0") !== false) { echo json_encode(['error'=>'Parece un archivo binario: no se puede editar como texto.']); exit; }
+    echo json_encode(['content'=>$fData]);
+    exit;
+}
+
+// ---------------- AJAX: guardar un archivo editado desde el arbol del proyecto ----------------
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_write') {
+    header('Content-Type: application/json; charset=utf-8');
+    $fName = (string)($_POST['name'] ?? '');
+    $fRel  = (string)($_POST['rel'] ?? '');
+    $fContent = (string)($_POST['content'] ?? '');
+    $fCfg   = read_json($CFG_FILE) ?: ['sites'=>[]];
+    $fSites = $fCfg['sites'] ?? [];
+    if (!valid_name($fName) || !isset($fSites[$fName])) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $fBase = realpath(project_dir($WWW, $fSites[$fName], $fName));
+    if ($fBase === false) { echo json_encode(['error'=>'No se encontró el proyecto.']); exit; }
+    $fTarget = realpath($fBase.'/'.$fRel);
+    $fBaseN = rtrim(str_replace('\\','/',$fBase),'/');
+    $fTargetN = $fTarget!==false ? rtrim(str_replace('\\','/',$fTarget),'/') : '';
+    $fInside = $fTarget!==false && is_file($fTarget) && ($fTargetN===$fBaseN || strpos($fTargetN, $fBaseN.'/')===0);
+    if (!$fInside) { echo json_encode(['error'=>'Ruta no válida.']); exit; }
+    if (strlen($fContent) > 2*1024*1024) { echo json_encode(['error'=>'Contenido demasiado grande (>2 MB).']); exit; }
+    if (@file_put_contents($fTarget, $fContent) === false) { echo json_encode(['error'=>'No se pudo guardar el archivo (¿permisos?).']); exit; }
+    echo json_encode(['ok'=>true]);
     exit;
 }
 
@@ -471,7 +560,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'lua.test','sites'=>[]];
     if(!isset($cfg['sites'])||!is_array($cfg['sites'])) $cfg['sites']=[];
     $vers = php_versions($PHP_BASE);
-    $tab='proyectos'; $msg='';
+    $tab='proyectos'; $msg=''; $redirName=null;
 
     if ($action === 'shutdown') {
         // Apagar el servidor. Como al parar Apache muere este propio PHP, lanzamos
@@ -651,9 +740,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         elseif (!is_dir("$WWW/$name")) { $msg='error:No existe la carpeta www\\'.$name.'.'; }
         elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
         else {
-            $cfg['sites'][$name]=['php'=>$php]; write_json($CFG_FILE,$cfg); lua_apply();
-            $msg='applied:"'.$name.'" integrado. Sincroniza dominios si no abre.';
+            $site = ['php'=>$php];
+            $type = detect_project_type("$WWW/$name");
+            if ($type) { $site['type'] = $type; }
+            $cfg['sites'][$name] = $site; write_json($CFG_FILE,$cfg); lua_apply();
+            $typeLabel = ['wordpress'=>'WordPress','laravel'=>'Laravel','symfony'=>'Symfony'][$type] ?? null;
+            $msg='applied:"'.$name.'" integrado'.($typeLabel?' ('.$typeLabel.' detectado)':'').'. Sincroniza dominios si no abre.';
         }
+    }
+    elseif ($action === 'integrate_all') {
+        $php = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
+        $todo = unregistered_projects($WWW, $cfg['sites']);
+        foreach ($todo as $name) {
+            $site = ['php'=>$php];
+            $type = detect_project_type("$WWW/$name");
+            if ($type) { $site['type'] = $type; }
+            $cfg['sites'][$name] = $site;
+        }
+        if ($todo) { write_json($CFG_FILE,$cfg); lua_apply(); $msg='applied:'.count($todo).' proyecto(s) integrado(s). Sincroniza dominios si no abren.'; }
+        else { $msg='error:No había nada que integrar.'; }
+    }
+    elseif ($action === 'detect_types') {
+        $tab = 'proyectos';
+        $n = 0;
+        foreach ($cfg['sites'] as $sName => &$sInfo) {
+            if (!is_array($sInfo)) { $sInfo = ['php'=>$sInfo]; }
+            if (!empty($sInfo['type'])) continue;
+            $sDir = project_dir($WWW, $sInfo, $sName);
+            $t = detect_project_type($sDir);
+            if ($t) { $sInfo['type'] = $t; $n++; }
+        }
+        unset($sInfo);
+        if ($n > 0) { write_json($CFG_FILE,$cfg); $msg='applied:'.$n.' proyecto(s) detectado(s) (WordPress/Laravel/Symfony).'; }
+        else { $msg='info:No se detectó ningún framework en los proyectos sin tipo.'; }
     }
     elseif ($action === 'delete_unregistered') {
         $name=$_POST['name']??'';
@@ -664,6 +783,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         else {
             rrmdir($dir); clearstatcache();
             $msg='applied:Carpeta "'.$name.'" eliminada de www\\.';
+        }
+    }
+    elseif ($action === 'ftp_save') {
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        if (!valid_name($name) || !isset($cfg['sites'][$name])) { $msg = 'error:Proyecto no válido.'; }
+        else {
+            $existing = ftp_config_get($ROOT, $name) ?: [];
+            $newPass = (string)($_POST['ftp_pass'] ?? '');
+            $port = (int)($_POST['ftp_port'] ?? 21); if ($port <= 0) { $port = 21; }
+            $conf = [
+                'host'    => trim((string)($_POST['ftp_host'] ?? '')),
+                'port'    => $port,
+                'user'    => trim((string)($_POST['ftp_user'] ?? '')),
+                'pass'    => $newPass !== '' ? $newPass : ($existing['pass'] ?? ''),
+                'path'    => trim((string)($_POST['ftp_path'] ?? '/')) ?: '/',
+                'ssl'     => ($_POST['ftp_ssl'] ?? '') === '1',
+                'exclude' => trim((string)($_POST['ftp_exclude'] ?? '.git, node_modules, .idea')),
+            ];
+            @mkdir($ROOT.'/config/ftp', 0777, true);
+            file_put_contents(ftp_config_path($ROOT,$name), json_encode($conf, JSON_PRETTY_PRINT));
+            $msg = 'applied:Configuración FTP guardada.';
+        }
+    }
+    elseif ($action === 'ftp_deploy') {
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $conf = ftp_config_get($ROOT, $name);
+        if (!valid_name($name) || !isset($cfg['sites'][$name])) { $msg = 'error:Proyecto no válido.'; }
+        elseif (!$conf || $conf['host'] === '') { $msg = 'error:Configura primero el host/usuario FTP.'; }
+        else {
+            $id = 'ftp-'.$name.'-'.time();
+            $job = [
+                'id'=>$id, 'name'=>$name, 'php'=>($cfg['defaultPhp']??'8.4'), 'type'=>'ftp_deploy', 'url'=>'',
+                'ftpHost'=>$conf['host'], 'ftpPort'=>$conf['port'] ?? 21, 'ftpUser'=>$conf['user'] ?? '',
+                'ftpPass'=>$conf['pass'] ?? '', 'ftpPath'=>$conf['path'] ?? '/', 'ftpSsl'=>!empty($conf['ssl']),
+                'ftpExclude'=>$conf['exclude'] ?? '',
+            ];
+            @mkdir($ROOT.'/tmp/jobs', 0777, true);
+            file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+            $msg = 'job:Desplegando "'.$name.'" por FTP… mira el progreso abajo.';
         }
     }
     elseif ($action === 'cover') {
@@ -734,6 +894,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else { $msg='error:Versión no válida.'; }
     }
     elseif ($action === 'hosts') { $tab='config'; lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
+    elseif ($action === 'set_tld') {
+        $tab = 'config';
+        $new = strtolower(trim($_POST['tld'] ?? ''));
+        if (!preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/', $new)) {
+            $msg = 'error:Dominio no válido (letras, números, guiones y puntos).';
+        } else {
+            $cfg['tld'] = $new;
+            write_json($CFG_FILE, $cfg);
+            lua_apply();
+            $httpsOn = is_file($ROOT.'/config/https.on');
+            if ($httpsOn) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); }
+            $msg = 'applied:Dominio cambiado a "'.$new.'". Pulsa "Sincronizar dominios" para que Windows lo reconozca.'.($httpsOn?' El certificado HTTPS se está regenerando.':'');
+        }
+    }
     elseif ($action === 'https') {
         $tab='config';
         $enable = ($_POST['enable'] ?? '') === '1';
@@ -780,7 +954,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         else { @file_put_contents($ROOT.'/tmp/startup-off.flag',(string)time()); $msg='info:Desactivando arranque con Windows: acepta el aviso de Windows (UAC).'; }
     }
     elseif ($action === 'db_create') {
-        $tab = ($_POST['from_tab'] ?? '') === 'proyectos' ? 'proyectos' : 'config';
+        $tab = 'bd';
         $db = trim($_POST['dbname'] ?? '');
         if (!valid_dbname($db)) { $msg='error:Nombre de base de datos no válido (letras, números, _).'; }
         else {
@@ -790,7 +964,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
     elseif ($action === 'db_drop') {
-        $tab = ($_POST['from_tab'] ?? '') === 'proyectos' ? 'proyectos' : 'config';
+        $tab = 'bd';
         $db = $_POST['dbname'] ?? '';
         if (!valid_dbname($db)) { $msg='error:Nombre de base de datos no válido.'; }
         else {
@@ -800,14 +974,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
     elseif ($action === 'db_import') {
-        $tab = ($_POST['from_tab'] ?? '') === 'proyectos' ? 'proyectos' : 'config';
+        $tab = 'bd';
         $db = $_POST['dbname'] ?? '';
         $mysqlExe = $ROOT.'/bin/mariadb/bin/mariadb.exe';
         if (!valid_dbname($db)) { $msg='error:Nombre de base de datos no válido.'; }
         elseif (empty($_FILES['sqlfile']) || ($_FILES['sqlfile']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) { $msg='error:No se recibió el archivo .sql.'; }
         elseif (!is_file($mysqlExe)) { $msg='error:MariaDB no está instalado.'; }
         else {
-            $cmd = '"'.$mysqlExe.'" --host=127.0.0.1 --port=3306 --user=root '.escapeshellarg($db);
+            $rootPass = mysql_root_pass($ROOT);
+            $passArg = $rootPass !== '' ? ' --password='.escapeshellarg($rootPass) : '';
+            $cmd = '"'.$mysqlExe.'" --host=127.0.0.1 --port=3306 --user=root'.$passArg.' '.escapeshellarg($db);
             $descriptors = [0=>['file',$_FILES['sqlfile']['tmp_name'],'r'], 1=>['pipe','w'], 2=>['pipe','w']];
             $proc = @proc_open($cmd, $descriptors, $pipes);
             if (!is_resource($proc)) { $msg='error:No se pudo ejecutar mariadb.exe.'; }
@@ -869,7 +1045,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         else { @unlink($ROOT.'/config/terminal.on'); $msg='applied:Terminal desactivada.'; }
     }
 
-    header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').'&msg='.urlencode($msg));
+    header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').($redirName?'&name='.urlencode($redirName):'').'&msg='.urlencode($msg));
     exit;
 }
 
@@ -905,7 +1081,7 @@ $watcherAlive = watcher_alive($ROOT);
 <title>lua-server</title>
 <?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
 <?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},7000);</script><?php endif; ?>
-<?php if (($tab==='proyectos' || $tab==='config') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
+<?php if (($tab==='proyectos' || $tab==='config' || $tab==='proyecto') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
 <style>
   :root{
@@ -999,6 +1175,10 @@ $watcherAlive = watcher_alive($ROOT);
   .sitecard.unregistered{background:var(--line);border-style:dashed;border-color:var(--line);opacity:.55}
   .sitecard.unregistered .name{color:var(--mut);font-weight:600}
   .exttag{font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--ac);background:rgba(110,168,254,.14);padding:1px 5px;border-radius:999px;vertical-align:middle}
+  .typetag{font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:1px 5px;border-radius:999px;vertical-align:middle}
+  .typetag-wordpress{color:var(--ac);background:rgba(110,168,254,.14)}
+  .typetag-laravel{color:var(--err);background:rgba(248,81,73,.14)}
+  .typetag-symfony{color:var(--ok);background:rgba(63,185,80,.14)}
   .extpath{color:var(--mut);font-size:10px;font-family:ui-monospace,Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:-4px}
   details.extform{padding:0}
   details.extform>summary{padding:16px 20px;cursor:pointer;font-weight:600;font-size:14px;list-style:none}
@@ -1069,6 +1249,41 @@ $watcherAlive = watcher_alive($ROOT);
 
   .joblog{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;max-height:72px;overflow:auto;color:var(--mut)}
   .logview{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;font-family:ui-monospace,Consolas,monospace;font-size:13px;white-space:pre-wrap;max-height:62vh;overflow:auto;color:var(--mut)}
+  .logview .log-fatal{color:var(--err);font-weight:700}
+  .logview .log-warning{color:var(--warn);font-weight:600}
+  .logview .log-deprecated{color:var(--mut);opacity:.6}
+  .logview .log-notice{color:var(--ac)}
+  .logview .log-info{color:var(--tx)}
+
+  /* ---------- Editor de codigo (tema propio de CodeMirror, sigue la paleta del panel) ---------- */
+  #fileEditorHost .CodeMirror{height:100%;background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:6px;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:13px;line-height:1.5}
+  .cm-s-lua.CodeMirror{background:var(--in);color:var(--tx)}
+  .cm-s-lua .CodeMirror-gutters{background:var(--card);border-right:1px solid var(--line)}
+  .cm-s-lua .CodeMirror-linenumber{color:var(--mut)}
+  .cm-s-lua .CodeMirror-cursor{border-left:1px solid var(--tx)}
+  .cm-s-lua div.CodeMirror-selected{background:rgba(110,168,254,.25)}
+  .cm-s-lua .CodeMirror-activeline-background{background:rgba(110,168,254,.06)}
+  .cm-s-lua .CodeMirror-matchingbracket{color:var(--ok) !important;outline:1px solid var(--ok)}
+  .cm-s-lua .cm-keyword{color:var(--ac);font-weight:600}
+  .cm-s-lua .cm-atom{color:var(--ac)}
+  .cm-s-lua .cm-number{color:var(--warn)}
+  .cm-s-lua .cm-def{color:var(--tx);font-weight:600}
+  .cm-s-lua .cm-variable{color:var(--tx)}
+  .cm-s-lua .cm-variable-2{color:var(--tx)}
+  .cm-s-lua .cm-variable-3{color:var(--ac)}
+  .cm-s-lua .cm-property{color:var(--tx)}
+  .cm-s-lua .cm-operator{color:var(--mut)}
+  .cm-s-lua .cm-comment{color:var(--mut);opacity:.8;font-style:italic}
+  .cm-s-lua .cm-string{color:var(--ok)}
+  .cm-s-lua .cm-string-2{color:var(--ok)}
+  .cm-s-lua .cm-meta{color:var(--mut)}
+  .cm-s-lua .cm-tag{color:var(--ac)}
+  .cm-s-lua .cm-attribute{color:var(--warn)}
+  .cm-s-lua .cm-qualifier{color:var(--warn)}
+  .cm-s-lua .cm-builtin{color:var(--ac)}
+  .cm-s-lua .cm-bracket{color:var(--mut)}
+  .cm-s-lua .cm-error{color:var(--err)}
+  .cm-s-lua .cm-invalidchar{color:var(--err)}
 
   /* ---------- Ficha de proyecto: arbol de archivos ---------- */
   .tree{font-size:13px;font-family:ui-monospace,Consolas,monospace;max-height:60vh;overflow:auto}
@@ -1078,7 +1293,8 @@ $watcherAlive = watcher_alive($ROOT);
   .trow .tchev{flex:0 0 auto;color:var(--mut);transition:transform .12s}
   .trow.tdir.open>.tchev{transform:rotate(90deg)}
   .trow .ticon{flex:0 0 auto;color:var(--mut)}
-  .trow.tfile{color:var(--mut)}
+  .trow.tfile{color:var(--mut);cursor:pointer;user-select:none}
+  .trow.tfile:hover{background:var(--in);color:var(--tx)}
   .tchildren{margin-left:9px;padding-left:11px;border-left:1px dashed var(--line)}
   .tnode-more{color:var(--mut);font-size:12px;padding:4px 0 4px 20px;font-style:italic}
 
@@ -1268,40 +1484,6 @@ $watcherAlive = watcher_alive($ROOT);
       </div>
     </div>
 
-    <?php if ($mariaOn): $dbList = mysql_databases(); ?>
-      <div class="card">
-        <div class="row" style="margin-bottom:12px">
-          <h2 style="margin:0;font-size:15px">Bases de datos MySQL</h2>
-          <div class="spacer"></div>
-          <form method="post" class="row" style="gap:6px">
-            <input type="hidden" name="action" value="db_create">
-            <input type="hidden" name="from_tab" value="proyectos">
-            <input name="dbname" placeholder="nombre_basedatos" pattern="[a-zA-Z0-9_]{1,64}" style="width:200px" required>
-            <button class="btn ghost sm" type="submit">+ Crear BD</button>
-          </form>
-        </div>
-        <?php if ($dbList === null): ?>
-          <div class="muted">No se pudo conectar con MySQL (¿acaba de activarse? espera unos segundos y recarga).</div>
-        <?php elseif (!$dbList): ?>
-          <div class="muted">No hay bases de datos todavía. Crea la primera arriba.</div>
-        <?php else: foreach ($dbList as $db): ?>
-          <div class="dbrow">
-            <div class="dbname"><?= e($db) ?></div>
-            <div class="spacer"></div>
-            <a class="btn ghost sm" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
-            <form method="post" enctype="multipart/form-data" class="dbimport" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
-              <input type="hidden" name="action" value="db_import">
-              <input type="hidden" name="dbname" value="<?= e($db) ?>">
-              <input type="hidden" name="from_tab" value="proyectos">
-              <input type="file" name="sqlfile" accept=".sql" required>
-              <button class="btn ghost sm" type="submit">Importar</button>
-            </form>
-            <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
-          </div>
-        <?php endforeach; endif; ?>
-      </div>
-    <?php endif; ?>
-
     <details class="card extform">
       <summary>Registrar proyecto existente en otra carpeta del disco <span class="muted">(p.ej. <code>C:\proyectos\ersmportal</code> con dominio propio)</span></summary>
       <form method="post" style="margin-top:14px">
@@ -1356,8 +1538,48 @@ $watcherAlive = watcher_alive($ROOT);
       <?php endforeach; ?>
     <?php endif; ?>
 
+    <div class="row" style="margin-bottom:14px;gap:10px">
+      <input type="search" id="projectSearch" placeholder="Buscar proyecto por nombre o dominio…" style="flex:1;max-width:320px">
+      <span class="muted" id="projectSearchCount" style="font-size:12px"></span>
+    </div>
+    <script>
+      (function(){
+        var input = document.getElementById('projectSearch');
+        var countEl = document.getElementById('projectSearchCount');
+        if (!input) return;
+        function norm(s){ return (s||'').toLowerCase(); }
+        function filter(){
+          var q = norm(input.value.trim());
+          var totalShown = 0;
+          ['secProyectos','secUnreg'].forEach(function(secId){
+            var sec = document.getElementById(secId);
+            if (!sec) return;
+            var shown = 0;
+            sec.querySelectorAll('.sitecard').forEach(function(card){
+              var name = card.querySelector('.name');
+              var url = card.querySelector('.url');
+              var text = norm((name?name.textContent:'') + ' ' + (url?url.textContent:''));
+              var match = !q || text.indexOf(q) !== -1;
+              card.style.display = match ? '' : 'none';
+              if (match) { shown++; totalShown++; }
+            });
+            if (q && shown > 0) { sec.open = true; }
+          });
+          countEl.textContent = q ? (totalShown + ' resultado(s)') : '';
+        }
+        input.addEventListener('input', filter);
+      })();
+    </script>
+
+    <?php $sitesSinTipo = 0; foreach ($sitesView as $sInfo) { if (is_array($sInfo) && empty($sInfo['type'])) $sitesSinTipo++; } ?>
     <details class="sectioncollapse" id="secProyectos" open>
       <summary>Proyectos <span class="op">(<?= count($sitesView) ?>)</span>
+        <?php if ($sitesSinTipo > 0): ?>
+        <form method="post" onclick="event.stopPropagation()" title="Detecta WordPress/Laravel/Symfony en los proyectos ya registrados">
+          <input type="hidden" name="action" value="detect_types">
+          <button type="submit" class="btn ghost sm">Detectar tipos (<?= $sitesSinTipo ?>)</button>
+        </form>
+        <?php endif; ?>
         <div class="viewtoggle" onclick="event.stopPropagation()">
           <button type="button" class="viewbtn" data-view="grid" title="Vista de cuadrícula" aria-label="Vista de cuadrícula">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
@@ -1381,7 +1603,9 @@ $watcherAlive = watcher_alive($ROOT);
               $locked = project_locked($pdir);
               $hasCover = (bool)cover_path($ROOT,$name);
               $hasComposer = is_file($pdir.'/composer.json');
-              $hasNpm = is_file($pdir.'/package.json'); ?>
+              $hasNpm = is_file($pdir.'/package.json');
+              $pType = is_array($info) ? ($info['type'] ?? null) : null;
+              $pTypeLabel = ['wordpress'=>'WordPress','laravel'=>'Laravel','symfony'=>'Symfony'][$pType] ?? null; ?>
           <div class="sitecard<?= $locked?' is-locked':'' ?>">
             <div class="cardactions">
               <a class="lockbtn" href="?tab=proyecto&name=<?= e(rawurlencode($name)) ?>" title="Ver detalles del proyecto" aria-label="Ver detalles del proyecto">
@@ -1426,7 +1650,7 @@ $watcherAlive = watcher_alive($ROOT);
               <form method="post" class="coverdel"><input type="hidden" name="action" value="cover_remove"><input type="hidden" name="name" value="<?= e($name) ?>"><button type="submit" class="coverdelbtn" title="Quitar carátula">&times;</button></form>
             <?php endif; ?>
             <div class="namerow">
-              <div class="name" title="<?= e($name) ?>"><?= e($name) ?><?php if($extPath): ?> <span class="exttag" title="Proyecto externo: <?= e($extPath) ?>">ext</span><?php endif; ?></div>
+              <div class="name" title="<?= e($name) ?>"><?= e($name) ?><?php if($pTypeLabel): ?> <span class="typetag typetag-<?= e($pType) ?>"><?= e($pTypeLabel) ?></span><?php endif; ?><?php if($extPath): ?> <span class="exttag" title="Proyecto externo: <?= e($extPath) ?>">ext</span><?php endif; ?></div>
               <form method="post" class="phpselform">
                 <input type="hidden" name="action" value="switch">
                 <input type="hidden" name="name" value="<?= e($name) ?>">
@@ -1448,7 +1672,14 @@ $watcherAlive = watcher_alive($ROOT);
 
     <?php if ($unreg): ?>
     <details class="sectioncollapse" id="secUnreg">
-      <summary>Sin registrar <span class="op">(<?= count($unreg) ?>) — carpetas en <code>www\</code> que no aparecen arriba</span><span class="arrow"></span></summary>
+      <summary>Sin registrar <span class="op">(<?= count($unreg) ?>) — carpetas en <code>www\</code> que no aparecen arriba</span>
+        <form method="post" onclick="event.stopPropagation()" onsubmit="return confirm('Integrar las <?= count($unreg) ?> carpetas sin registrar con PHP <?= e($defaultPhp) ?>?')">
+          <input type="hidden" name="action" value="integrate_all">
+          <input type="hidden" name="php" value="<?= e($defaultPhp) ?>">
+          <button class="btn ghost sm" type="submit">Integrar todo</button>
+        </form>
+        <span class="arrow"></span>
+      </summary>
       <div class="pane">
       <div class="sitegrid">
         <?php foreach ($unreg as $name): ?>
@@ -1571,77 +1802,6 @@ $watcherAlive = watcher_alive($ROOT);
       function luaEscDeleteUnreg(e){ if(e.key==='Escape') luaCloseDeleteUnreg(); }
     </script>
 
-    <!-- Modal de confirmacion de borrado de base de datos -->
-    <div id="delDbModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDropDb()">
-      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delDbTitle">
-        <div class="modal-ic">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
-          </svg>
-        </div>
-        <h3 id="delDbTitle">¿Eliminar base de datos?</h3>
-        <p class="modal-tx">Se borrará <strong id="delDbName"></strong> y <strong>todas sus tablas</strong> de forma permanente. Esto no se puede deshacer.</p>
-        <form method="post" class="modal-actions">
-          <input type="hidden" name="action" value="db_drop">
-          <input type="hidden" name="from_tab" value="proyectos">
-          <input type="hidden" name="dbname" id="delDbNameInput">
-          <button type="button" class="btn ghost" onclick="luaCloseDropDb()">Cancelar</button>
-          <button type="submit" class="btn danger">Sí, eliminar</button>
-        </form>
-      </div>
-    </div>
-    <script>
-      function luaAskDropDb(name){
-        document.getElementById('delDbName').textContent = name;
-        document.getElementById('delDbNameInput').value = name;
-        document.getElementById('delDbModal').hidden = false;
-        document.addEventListener('keydown', luaEscDropDb);
-      }
-      function luaCloseDropDb(){
-        document.getElementById('delDbModal').hidden = true;
-        document.removeEventListener('keydown', luaEscDropDb);
-      }
-      function luaEscDropDb(e){ if(e.key==='Escape') luaCloseDropDb(); }
-    </script>
-
-    <!-- Modal de confirmacion de importar backup (puede sobrescribir tablas existentes) -->
-    <div id="importDbModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseImportDb()">
-      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="importDbTitle">
-        <div class="modal-ic">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-          </svg>
-        </div>
-        <h3 id="importDbTitle">¿Importar backup?</h3>
-        <p class="modal-tx">Se importará el archivo en <strong id="importDbName"></strong>. Si el <code>.sql</code> incluye tablas con el mismo nombre, <strong>se sobrescribirán</strong>.</p>
-        <div class="modal-actions">
-          <button type="button" class="btn ghost" onclick="luaCloseImportDb()">Cancelar</button>
-          <button type="button" class="btn danger" onclick="luaConfirmImportDb()">Sí, importar</button>
-        </div>
-      </div>
-    </div>
-    <script>
-      var luaImportDbForm = null;
-      function luaAskImportDb(ev, form, dbname){
-        ev.preventDefault();
-        luaImportDbForm = form;
-        document.getElementById('importDbName').textContent = dbname;
-        document.getElementById('importDbModal').hidden = false;
-        document.addEventListener('keydown', luaEscImportDb);
-        return false;
-      }
-      function luaConfirmImportDb(){
-        luaCloseImportDb();
-        if (luaImportDbForm) luaImportDbForm.submit();
-      }
-      function luaCloseImportDb(){
-        document.getElementById('importDbModal').hidden = true;
-        document.removeEventListener('keydown', luaEscImportDb);
-      }
-      function luaEscImportDb(e){ if(e.key==='Escape') luaCloseImportDb(); }
-    </script>
-
     <!-- Modal: runner de Composer/NPM por proyecto (reutiliza los endpoints de la Terminal) -->
     <div id="runnerModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseRunner()">
       <div class="modal-box" role="dialog" aria-modal="true" style="max-width:640px;text-align:left">
@@ -1754,7 +1914,9 @@ $watcherAlive = watcher_alive($ROOT);
         $pHasComposer = is_file($pDir.'/composer.json');
         $pHasNpm = is_file($pDir.'/package.json');
         $pGit = is_dir($pDir) ? git_info($pDir) : null;
-        $pErrLog = tail_file($ROOT.'/logs/apache/'.$pName.'-error.log', 200); ?>
+        $pErrLog = tail_file($ROOT.'/logs/apache/'.$pName.'-error.log', 200);
+        $pType = is_array($pInfo) ? ($pInfo['type'] ?? null) : null;
+        $pTypeLabel = ['wordpress'=>'WordPress','laravel'=>'Laravel','symfony'=>'Symfony'][$pType] ?? null; ?>
 
       <div class="card row" style="align-items:flex-start;flex-wrap:wrap;gap:16px">
         <?php if ($pCoverFile): ?>
@@ -1763,6 +1925,7 @@ $watcherAlive = watcher_alive($ROOT);
         <div style="min-width:240px;flex:1">
           <div class="row" style="gap:8px">
             <span style="font-size:20px;font-weight:700"><?= e($pName) ?></span>
+            <?php if ($pTypeLabel): ?><span class="typetag typetag-<?= e($pType) ?>"><?= e($pTypeLabel) ?></span><?php endif; ?>
             <?php if ($pExtPath): ?><span class="exttag" title="Proyecto externo: <?= e($pExtPath) ?>">ext</span><?php endif; ?>
             <span class="jstate <?= $pLocked?'warn':'ok' ?>"><?= $pLocked?'Bloqueado':'Desbloqueado' ?></span>
             <span class="jstate run">PHP <?= e($pVer) ?></span>
@@ -1815,22 +1978,30 @@ $watcherAlive = watcher_alive($ROOT);
           <?php if ($pErrLog===''): ?>
             <div class="muted">Sin errores recientes.</div>
           <?php else: ?>
-            <pre class="logview"><?= e($pErrLog) ?></pre>
+            <pre class="logview"><?= highlight_error_log($pErrLog) ?></pre>
           <?php endif; ?>
         </div>
       </div>
 
+      <div class="pgrid2">
       <div class="card">
         <div style="font-weight:600;margin-bottom:10px">Archivos</div>
         <?php if (!is_dir($pDir)): ?>
           <div class="muted">No se encontró la carpeta del proyecto.</div>
         <?php else: $tCount=0; ?>
-          <div class="tree" id="projTree"><?= tree_node_html($pDir, '', false, $tCount, 1200) ?></div>
+          <div class="tree" id="projTree"><?= tree_node_html($pDir, '', true, $tCount, 4000) ?></div>
           <script>
           (function(){
             var root = document.getElementById('projTree');
             if(!root) return;
             root.addEventListener('click', function(ev){
+              var frow = ev.target.closest('.trow.tfile');
+              if (frow && root.contains(frow)) {
+                var rel = frow.getAttribute('data-rel');
+                var label = frow.querySelector('span').textContent;
+                luaOpenFileEditor(<?= json_encode($pName) ?>, rel, label);
+                return;
+              }
               var row = ev.target.closest('.trow.tdir');
               if(!row || !root.contains(row)) return;
               var box = row.nextElementSibling;
@@ -1850,6 +2021,156 @@ $watcherAlive = watcher_alive($ROOT);
           </script>
         <?php endif; ?>
       </div>
+
+      <?php
+        $pFtp = ftp_config_get($ROOT, $pName) ?: ['host'=>'','port'=>21,'user'=>'','pass'=>'','path'=>'/','ssl'=>false,'exclude'=>'.git, node_modules, .idea'];
+        $pFtpJobs = array_values(array_filter($jobs, function($j) use ($pName){ return ($j['type']??'')==='ftp_deploy' && ($j['name']??'')===$pName; }));
+        $pFtpJob = $pFtpJobs[0] ?? null;
+      ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:10px">Desplegar por FTP</div>
+        <form method="post" class="inline">
+          <input type="hidden" name="action" value="ftp_save">
+          <input type="hidden" name="name" value="<?= e($pName) ?>">
+          <div><label>Host</label><input name="ftp_host" value="<?= e($pFtp['host']) ?>" placeholder="ftp.tuhosting.com" style="width:200px"></div>
+          <div><label>Puerto</label><input name="ftp_port" value="<?= e($pFtp['port']) ?>" style="width:70px"></div>
+          <div><label>Usuario</label><input name="ftp_user" value="<?= e($pFtp['user']) ?>" style="width:150px"></div>
+          <div><label>Contraseña</label><input type="password" name="ftp_pass" placeholder="<?= ($pFtp['pass']??'')!==''?'••••••• (sin cambios)':'contraseña' ?>" autocomplete="off" style="width:150px"></div>
+          <div><label>Ruta remota</label><input name="ftp_path" value="<?= e($pFtp['path']) ?>" style="width:150px"></div>
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400;margin-top:22px">
+            <input type="checkbox" name="ftp_ssl" value="1" <?= !empty($pFtp['ssl'])?'checked':'' ?> style="width:auto"> FTPS (TLS)
+          </label>
+          <div style="flex:1;min-width:220px"><label>Excluir (coincide con parte de la ruta)</label><input name="ftp_exclude" value="<?= e($pFtp['exclude']) ?>" style="width:100%"></div>
+          <button class="btn ghost" type="submit">Guardar</button>
+        </form>
+        <form method="post" style="margin-top:12px" onsubmit="return confirm('¿Desplegar ahora los archivos de <?= e($pName) ?> por FTP a <?= e($pFtp['host']) ?>?')">
+          <input type="hidden" name="action" value="ftp_deploy">
+          <input type="hidden" name="name" value="<?= e($pName) ?>">
+          <button class="btn" type="submit" <?= ($pFtp['host']??'')===''?'disabled':'' ?>>Desplegar ahora</button>
+        </form>
+        <div class="muted" style="margin-top:10px;font-size:12px">Sube todos los archivos del proyecto a la ruta remota indicada (crea carpetas si no existen). La contraseña se guarda en texto plano en <code>config\ftp\</code> (fuera de git), solo en esta máquina.</div>
+        <?php if ($pFtpJob):
+              $st=$pFtpJob['state']??'?'; $cls=['done'=>'ok','error'=>'err','running'=>'run','queued'=>'warn']; $c=$cls[$st]??'run';
+              $tail = in_array($st,['running','error','queued'],true) ? job_log_tail($ROOT,$pFtpJob['id']??'') : ''; ?>
+          <div class="row" style="margin-top:14px">
+            <span class="jstate <?= $c ?>"><?= e(strtoupper($st)) ?></span>
+            <span class="muted"><?= e($pFtpJob['msg']??'') ?></span>
+          </div>
+          <?php if ($tail): ?><pre class="joblog"><?= e($tail) ?></pre><?php endif; ?>
+        <?php endif; ?>
+      </div>
+      </div>
+
+      <!-- Editor de codigo (CodeMirror 5, autoalojado: sin CDN ni build step) -->
+      <link rel="stylesheet" href="assets/codemirror/lib/codemirror.css">
+      <script src="assets/codemirror/lib/codemirror.js"></script>
+      <script src="assets/codemirror/addon/edit/matchbrackets.js"></script>
+      <script src="assets/codemirror/mode/xml/xml.js"></script>
+      <script src="assets/codemirror/mode/javascript/javascript.js"></script>
+      <script src="assets/codemirror/mode/css/css.js"></script>
+      <script src="assets/codemirror/mode/htmlmixed/htmlmixed.js"></script>
+      <script src="assets/codemirror/mode/clike/clike.js"></script>
+      <script src="assets/codemirror/mode/php/php.js"></script>
+      <script src="assets/codemirror/mode/sql/sql.js"></script>
+      <script src="assets/codemirror/mode/markdown/markdown.js"></script>
+      <script src="assets/codemirror/mode/shell/shell.js"></script>
+
+      <!-- Modal: editor de codigo (clic en un archivo del arbol) -->
+      <div id="fileEditorModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseFileEditor()">
+        <div class="modal-box" role="dialog" aria-modal="true" style="max-width:1000px;width:95vw;text-align:left">
+          <div class="row" style="margin-bottom:10px">
+            <h3 id="fileEditorTitle" style="margin:0;font-size:14px;font-family:ui-monospace,Consolas,monospace;font-weight:600"></h3>
+            <div class="spacer"></div>
+            <span class="muted" id="fileEditorStatus" style="font-size:12px"></span>
+            <button type="button" class="btn ghost sm" onclick="luaCloseFileEditor()">Cerrar</button>
+            <button type="button" class="btn sm" id="fileEditorSave">Guardar</button>
+          </div>
+          <div id="fileEditorHost" style="height:60vh"><textarea id="fileEditorArea" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea></div>
+          <div class="muted" style="margin-top:8px;font-size:11px">Ctrl+S para guardar.</div>
+        </div>
+      </div>
+      <script>
+        (function(){
+          var modal=null, titleEl=null, host=null, area=null, status=null, saveBtn=null, cm=null, curName=null, curRel=null;
+
+          function modeForFile(name){
+            var ext = (name.split('.').pop() || '').toLowerCase();
+            var map = {
+              php:'application/x-httpd-php', phtml:'application/x-httpd-php',
+              html:'text/html', htm:'text/html',
+              js:'text/javascript', mjs:'text/javascript', cjs:'text/javascript',
+              json:'application/json',
+              css:'text/css',
+              xml:'application/xml', svg:'application/xml',
+              md:'text/markdown', markdown:'text/markdown',
+              sql:'text/x-mysql',
+              sh:'text/x-sh', bash:'text/x-sh'
+            };
+            return map[ext] || null;
+          }
+
+          function init(){
+            modal = document.getElementById('fileEditorModal');
+            titleEl = document.getElementById('fileEditorTitle');
+            host = document.getElementById('fileEditorHost');
+            area = document.getElementById('fileEditorArea');
+            status = document.getElementById('fileEditorStatus');
+            saveBtn = document.getElementById('fileEditorSave');
+            saveBtn.addEventListener('click', save);
+            cm = CodeMirror.fromTextArea(area, {
+              lineNumbers: true,
+              theme: 'lua',
+              matchBrackets: true,
+              indentUnit: 4,
+              tabSize: 4,
+              indentWithTabs: true,
+              lineWrapping: false,
+              extraKeys: { 'Ctrl-S': function(){ save(); return false; }, 'Cmd-S': function(){ save(); return false; } }
+            });
+            cm.setSize('100%', '100%');
+          }
+
+          function save(){
+            if (!curName || cm.getOption('readOnly')) return;
+            status.textContent = 'Guardando…';
+            fetch('?', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+              body:'action=file_write&name='+encodeURIComponent(curName)+'&rel='+encodeURIComponent(curRel)+'&content='+encodeURIComponent(cm.getValue())})
+              .then(function(r){ return r.json(); })
+              .then(function(j){ status.textContent = j.error ? j.error : 'Guardado.'; })
+              .catch(function(){ status.textContent = 'Error de red al guardar.'; });
+          }
+          window.luaOpenFileEditor = function(name, rel, label){
+            if (!modal) init();
+            curName = name; curRel = rel;
+            titleEl.textContent = label || rel;
+            cm.setOption('readOnly', 'nocursor');
+            cm.setValue('Cargando…');
+            status.textContent = '';
+            modal.hidden = false;
+            document.addEventListener('keydown', luaEscFileEditor);
+            setTimeout(function(){ cm.refresh(); }, 0);
+            fetch('?ajax=file_read&name='+encodeURIComponent(name)+'&rel='+encodeURIComponent(rel))
+              .then(function(r){ return r.json(); })
+              .then(function(j){
+                cm.setOption('readOnly', false);
+                if (j.error) { cm.setValue(''); status.textContent = j.error; }
+                else {
+                  cm.setOption('mode', modeForFile(label || rel));
+                  cm.setValue(j.content);
+                  cm.clearHistory();
+                  status.textContent = '';
+                  cm.focus();
+                }
+              })
+              .catch(function(){ cm.setOption('readOnly', false); status.textContent = 'Error de red al cargar.'; });
+          };
+          window.luaCloseFileEditor = function(){
+            if (modal) modal.hidden = true;
+            document.removeEventListener('keydown', luaEscFileEditor);
+          };
+          function luaEscFileEditor(e){ if (e.key === 'Escape') luaCloseFileEditor(); }
+        })();
+      </script>
 
     <?php endif; ?>
 
@@ -1927,7 +2248,7 @@ $watcherAlive = watcher_alive($ROOT);
       <button type="button" class="btn ghost sm" onclick="luaAskClearLog('<?= e($sel) ?>')">Vaciar</button>
       <button type="button" class="btn danger sm" onclick="luaAskDeleteLog('<?= e($sel) ?>')">Eliminar</button>
     </div>
-    <pre class="logview"><?= $content!=='' ? e($content) : '(vacío)' ?></pre>
+    <pre class="logview"><?= $content!=='' ? highlight_error_log($content) : '(vacío)' ?></pre>
 
     <!-- Modal de confirmacion de borrado de archivo de log -->
     <div id="delLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDeleteLog()">
@@ -1996,6 +2317,19 @@ $watcherAlive = watcher_alive($ROOT);
     </script>
 
   <?php elseif ($tab==='config'): /* ---------- PESTAÑA CONFIGURACIÓN DEL SERVIDOR ---------- */ ?>
+
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Dominio local</div>
+        <div class="muted">Tus proyectos se sirven en <code>&lt;nombre&gt;.<?= e($tld) ?></code>. Recomendado dejarlo en <code>test</code> (reservado oficialmente para pruebas, nunca será un dominio real). Evita <code>dev</code> (Chrome fuerza HTTPS ahí por defecto) y <code>local</code> (lo usa Bonjour/mDNS de Windows y puede dar conflictos).</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post" class="row" style="gap:8px">
+        <input type="hidden" name="action" value="set_tld">
+        <input name="tld" value="<?= e($tld) ?>" placeholder="test" style="width:160px">
+        <button class="btn ghost" type="submit">Guardar</button>
+      </form>
+    </div>
 
     <div class="card row">
       <div>
@@ -2089,7 +2423,7 @@ $watcherAlive = watcher_alive($ROOT);
     <?php if (!$mariaOn): ?>
       <div class="card">
         <div style="font-weight:600;margin-bottom:6px">MySQL (MariaDB) está desactivado</div>
-        <div class="muted">Activa el servidor MySQL desde <a href="?tab=proyectos">Proyectos</a> o <a href="?tab=config">Configuración del servidor</a> para gestionar la contraseña de <code>root</code> y crear usuarios.</div>
+        <div class="muted">Activa el servidor MySQL desde <a href="?tab=proyectos">Proyectos</a> o <a href="?tab=config">Configuración del servidor</a> para gestionar bases de datos, usuarios y la contraseña de <code>root</code>.</div>
       </div>
     <?php else: ?>
 
@@ -2101,6 +2435,37 @@ $watcherAlive = watcher_alive($ROOT);
         <div class="spacer"></div>
         <a class="btn ghost" href="http://<?= e($phpmyadminDom) ?>/" target="_blank">phpMyAdmin &#8599;</a>
         <a class="btn ghost" href="/adminer.php?server=127.0.0.1&username=root" target="_blank">Adminer &#8599;</a>
+      </div>
+
+      <?php $dbList = mysql_databases(); ?>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <h2 style="margin:0;font-size:15px">Bases de datos</h2>
+          <div class="spacer"></div>
+          <form method="post" class="row" style="gap:6px">
+            <input type="hidden" name="action" value="db_create">
+            <input name="dbname" placeholder="nombre_basedatos" pattern="[a-zA-Z0-9_]{1,64}" style="width:200px" required>
+            <button class="btn ghost sm" type="submit">+ Crear BD</button>
+          </form>
+        </div>
+        <?php if ($dbList === null): ?>
+          <div class="muted">No se pudo conectar con MySQL (¿acaba de activarse? espera unos segundos y recarga).</div>
+        <?php elseif (!$dbList): ?>
+          <div class="muted">No hay bases de datos todavía. Crea la primera arriba.</div>
+        <?php else: foreach ($dbList as $db): ?>
+          <div class="dbrow">
+            <div class="dbname"><?= e($db) ?></div>
+            <div class="spacer"></div>
+            <a class="btn ghost sm" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
+            <form method="post" enctype="multipart/form-data" class="dbimport" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
+              <input type="hidden" name="action" value="db_import">
+              <input type="hidden" name="dbname" value="<?= e($db) ?>">
+              <input type="file" name="sqlfile" accept=".sql" required>
+              <button class="btn ghost sm" type="submit">Importar</button>
+            </form>
+            <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
+          </div>
+        <?php endforeach; endif; ?>
       </div>
 
       <div class="card">
@@ -2200,6 +2565,76 @@ $watcherAlive = watcher_alive($ROOT);
           document.removeEventListener('keydown', luaEscDeleteMysqlUser);
         }
         function luaEscDeleteMysqlUser(e){ if(e.key==='Escape') luaCloseDeleteMysqlUser(); }
+      </script>
+
+      <!-- Modal de confirmacion de borrado de base de datos -->
+      <div id="delDbModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDropDb()">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delDbTitle">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+            </svg>
+          </div>
+          <h3 id="delDbTitle">¿Eliminar base de datos?</h3>
+          <p class="modal-tx">Se borrará <strong id="delDbName"></strong> y <strong>todas sus tablas</strong> de forma permanente. Esto no se puede deshacer.</p>
+          <form method="post" class="modal-actions">
+            <input type="hidden" name="action" value="db_drop">
+            <input type="hidden" name="dbname" id="delDbNameInput">
+            <button type="button" class="btn ghost" onclick="luaCloseDropDb()">Cancelar</button>
+            <button type="submit" class="btn danger">Sí, eliminar</button>
+          </form>
+        </div>
+      </div>
+      <script>
+        function luaAskDropDb(name){
+          document.getElementById('delDbName').textContent = name;
+          document.getElementById('delDbNameInput').value = name;
+          document.getElementById('delDbModal').hidden = false;
+          document.addEventListener('keydown', luaEscDropDb);
+        }
+        function luaCloseDropDb(){
+          document.getElementById('delDbModal').hidden = true;
+          document.removeEventListener('keydown', luaEscDropDb);
+        }
+        function luaEscDropDb(e){ if(e.key==='Escape') luaCloseDropDb(); }
+      </script>
+
+      <!-- Modal de confirmacion de importar backup (puede sobrescribir tablas existentes) -->
+      <div id="importDbModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseImportDb()">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="importDbTitle">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            </svg>
+          </div>
+          <h3 id="importDbTitle">¿Importar backup?</h3>
+          <p class="modal-tx">Se importará el archivo en <strong id="importDbName"></strong>. Si el <code>.sql</code> incluye tablas con el mismo nombre, <strong>se sobrescribirán</strong>.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" onclick="luaCloseImportDb()">Cancelar</button>
+            <button type="button" class="btn danger" onclick="luaConfirmImportDb()">Sí, importar</button>
+          </div>
+        </div>
+      </div>
+      <script>
+        var luaImportDbForm = null;
+        function luaAskImportDb(ev, form, dbname){
+          ev.preventDefault();
+          luaImportDbForm = form;
+          document.getElementById('importDbName').textContent = dbname;
+          document.getElementById('importDbModal').hidden = false;
+          document.addEventListener('keydown', luaEscImportDb);
+          return false;
+        }
+        function luaConfirmImportDb(){
+          luaCloseImportDb();
+          if (luaImportDbForm) luaImportDbForm.submit();
+        }
+        function luaCloseImportDb(){
+          document.getElementById('importDbModal').hidden = true;
+          document.removeEventListener('keydown', luaEscImportDb);
+        }
+        function luaEscImportDb(e){ if(e.key==='Escape') luaCloseImportDb(); }
       </script>
 
     <?php endif; ?>
