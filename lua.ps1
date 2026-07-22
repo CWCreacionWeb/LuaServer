@@ -21,6 +21,9 @@
    list-php                  Lista las versiones de PHP instaladas
    hosts                     Lineas hosts para tus companeros (con la IP del server)
    setup                     [ADMIN] Instala Apache como servicio + firewall + hosts
+   startup-enable            [ADMIN] Arranque con Windows (servicio Apache + tarea del watcher)
+   startup-disable           [ADMIN] Desactiva el arranque con Windows (vuelve a manual)
+   startup-status            Comprueba si el arranque con Windows esta activo
    logs                      Ultimas lineas del log de Apache
 ============================================================
 #>
@@ -408,11 +411,15 @@ function Cmd-Watch {
     $fApply = Join-Path $TmpDir "apply.flag"
     $fHosts = Join-Path $TmpDir "hosts.flag"
     $fHttps = Join-Path $TmpDir "https.flag"
+    $fStartupOn  = Join-Path $TmpDir "startup-on.flag"
+    $fStartupOff = Join-Path $TmpDir "startup-off.flag"
     while ($true) {
         try {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
             if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
             if (Test-Path $fHttps) { Remove-Item $fHttps -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'https-setup') }
+            if (Test-Path $fStartupOn)  { Remove-Item $fStartupOn  -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'startup-enable') }
+            if (Test-Path $fStartupOff) { Remove-Item $fStartupOff -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'startup-disable') }
             # Reconciliar Mailpit con su flag
             $mpOn = Test-Path $MailpitFlag
             if ($mpOn -and (Test-Path $Mailpit) -and -not (Mailpit-Up)) { Start-Mailpit }
@@ -606,7 +613,13 @@ function Process-Jobs {
 function Update-Hosts {
     if (-not (Test-Admin)) { return }
     $cfg = Get-Config
-    $entries = @("127.0.0.1 localhost.$Tld")
+    # 'localhost' es un nombre especial en Windows: el resolutor lo trata aparte y NO
+    # respeta del todo el hosts (sigue devolviendo tambien ::1 aunque fijemos 127.0.0.1
+    # aqui), asi que con Docker Desktop ocupando ::1:80 (Portainer u otro contenedor) el
+    # navegador puede seguir cayendo ahi. Dejamos la entrada (no hace dano) pero la
+    # alternativa que SI funciona siempre es "lua.test" a secas (no es un nombre
+    # reservado, respeta el hosts al 100%) -> tambien sirve el panel.
+    $entries = @("127.0.0.1 localhost", "127.0.0.1 localhost.$Tld", "127.0.0.1 $Tld")
     foreach ($p in $cfg.sites.PSObject.Properties.Name) { $dom = Get-SiteDomain $cfg $p; $entries += "127.0.0.1 $dom www.$dom" }
     $content = Get-Content $HostsFile -ErrorAction SilentlyContinue
     $kept = @(); $inside = $false
@@ -726,6 +739,44 @@ function Cmd-HttpsOff {
     if (Test-HttpdConfig) { Restart-Apache }
     Ok "HTTPS desactivado."
 }
+
+# ============================================================
+#  Arranque con Windows (toggle desde el panel: Configuracion del servidor)
+#  - Apache como servicio de Windows (arranque automatico)
+#  - El watcher como tarea programada (arranca sin necesidad de sesion)
+# ============================================================
+$WatcherTaskName = "lua-server-watcher"
+function Cmd-StartupEnable {
+    Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    if (-not (Service-Exists $SvcApache)) { Info "Instalando servicio $SvcApache..."; & $Httpd -k install -n $SvcApache }
+    Set-Service -Name $SvcApache -StartupType Automatic
+    & sc.exe failure $SvcApache reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+    Start-Service $SvcApache -ErrorAction SilentlyContinue
+    Ok "Apache: servicio instalado, arranque automatico."
+
+    Unregister-ScheduledTask -TaskName $WatcherTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`" watch"
+    $trigger   = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+    Register-ScheduledTask -TaskName $WatcherTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    Start-ScheduledTask -TaskName $WatcherTaskName -ErrorAction SilentlyContinue
+    Ok "Watcher: tarea programada creada (arranca con Windows, sin iniciar sesion)."
+    Ok "Arranque con Windows: ACTIVADO."
+}
+function Cmd-StartupDisable {
+    if (Service-Exists $SvcApache) { Set-Service -Name $SvcApache -StartupType Manual; Ok "Apache: arranque vuelto a manual." }
+    Unregister-ScheduledTask -TaskName $WatcherTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Ok "Watcher: tarea programada eliminada."
+    Ok "Arranque con Windows: DESACTIVADO (arranca a mano con .\lua.ps1 start)."
+}
+# Estado real (para el panel): 'on' solo si el servicio Y la tarea estan activos.
+function Cmd-StartupStatus {
+    $svc = if (Service-Exists $SvcApache) { Get-Service $SvcApache } else { $null }
+    $task = Get-ScheduledTask -TaskName $WatcherTaskName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.StartType -eq 'Automatic' -and $task -and $task.State -ne 'Disabled') { Write-Output "on" } else { Write-Output "off" }
+}
+
 function Cmd-Help { Get-Content $PSCommandPath -TotalCount 40 | ForEach-Object { $_ } }
 
 switch ($Command.ToLower()) {
@@ -748,6 +799,9 @@ switch ($Command.ToLower()) {
     "https-off"   { Cmd-HttpsOff }
     "hosts-sync"  { Require-Admin; Update-Hosts; Ok "Dominios sincronizados en el archivo hosts." }
     "setup"       { Require-Admin; & (Join-Path $Root "config\_setup.ps1") }
+    "startup-enable"  { Require-Admin; Cmd-StartupEnable }
+    "startup-disable" { Require-Admin; Cmd-StartupDisable }
+    "startup-status"  { Cmd-StartupStatus }
     "logs"        { Cmd-Logs }
     default       { Cmd-Help }
 }

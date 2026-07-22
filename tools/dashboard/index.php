@@ -163,6 +163,15 @@ function watcher_alive($root){
     foreach ($out as $line) { if (strpos($line, (string)$pid) !== false) return true; }
     return false;
 }
+// Consulta el estado real del arranque con Windows (servicio Apache + tarea del
+// watcher), no un simple archivo de flag: llama a 'lua.ps1 startup-status' (solo
+// lectura, no requiere admin).
+function startup_enabled($root){
+    $luaWin = str_replace('/', '\\', $root).'\\lua.ps1';
+    $out = [];
+    @exec('powershell -NoProfile -ExecutionPolicy Bypass -File "'.$luaWin.'" startup-status 2>NUL', $out);
+    return trim((string)end($out)) === 'on';
+}
 function parse_overrides($file, $curatedKeys){
     $vals=[]; $extra=[];
     if(is_file($file)){
@@ -593,6 +602,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         } else { @unlink($ROOT.'/config/mariadb.on'); $msg='info:MySQL (MariaDB) desactivándose.'; }
     }
+    elseif ($action === 'startup') {
+        $tab='config';
+        $enable = ($_POST['enable'] ?? '') === '1';
+        // Instalar/quitar un servicio de Windows y una tarea programada requiere admin
+        // siempre (activar Y desactivar); el watcher lo recoge y se relanza elevado (UAC).
+        if ($enable) { @file_put_contents($ROOT.'/tmp/startup-on.flag',(string)time()); $msg='info:Activando arranque con Windows: acepta el aviso de Windows (UAC). Instala el servicio de Apache y la tarea programada del watcher.'; }
+        else { @file_put_contents($ROOT.'/tmp/startup-off.flag',(string)time()); $msg='info:Desactivando arranque con Windows: acepta el aviso de Windows (UAC).'; }
+    }
     elseif ($action === 'db_create') {
         $tab = ($_POST['from_tab'] ?? '') === 'proyectos' ? 'proyectos' : 'config';
         $db = trim($_POST['dbname'] ?? '');
@@ -674,7 +691,7 @@ $watcherAlive = watcher_alive($ROOT);
 <style>
   :root{
     --bg:#0f1117; --card:#1a1d27; --line:#2a2f3d; --tx:#e6e8ee; --mut:#8b90a0;
-    --ac:#6ea8fe; --ac-hover:#5a97f0; --ok:#3fb950; --warn:#d29922; --err:#f85149; --in:#11141c;
+    --ac:#6ea8fe; --ac-hover:#5a97f0; --ok:#3fb950; --warn:#d29922; --err:#f85149; --err-dark:#b3261e; --in:#11141c;
     --brand-start:#6ea8fe; --brand-end:#9b6efe;
   }
   @media (prefers-color-scheme:light){
@@ -716,13 +733,13 @@ $watcherAlive = watcher_alive($ROOT);
   input:focus,select:focus,textarea:focus{outline:none;border-color:var(--ac)}
   textarea{width:100%;min-height:70px;font-family:ui-monospace,Consolas,monospace;font-size:13px;resize:vertical}
 
-  .btn{background:var(--ac);color:#fff;border:1px solid transparent;border-radius:5px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer;transition:filter .12s,background .12s,color .12s,border-color .12s}
+  .btn{background:var(--ac);background-image:linear-gradient(135deg,var(--brand-start),var(--brand-end));color:#fff;border:1px solid transparent;border-radius:5px;padding:8px 16px;font-size:14px;font-weight:600;cursor:pointer;transition:filter .12s,background .12s,color .12s,border-color .12s}
   .btn:hover{filter:brightness(1.08)}
   .btn.sm{padding:4px 10px;font-size:13px}
-  .btn.ghost{background:transparent;border-color:var(--line);color:var(--tx)}
-  .btn.ghost:hover{border-color:var(--ac);color:var(--ac);filter:none}
-  .btn.danger{background:transparent;border-color:var(--line);color:var(--err)}
-  .btn.danger:hover{background:var(--err);color:#fff;border-color:var(--err);filter:none}
+  .btn.ghost{background-image:linear-gradient(135deg,var(--brand-start),var(--brand-end));border-color:transparent;color:#fff}
+  .btn.ghost:hover{filter:brightness(1.08)}
+  .btn.danger{background-image:linear-gradient(135deg,var(--err),var(--err-dark));border-color:transparent;color:#fff}
+  .btn.danger:hover{filter:brightness(1.08)}
 
   .dbrow{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .dbrow:first-of-type{border-top:none}
@@ -1466,7 +1483,7 @@ $watcherAlive = watcher_alive($ROOT);
     <div class="card row">
       <div>
         <div style="font-weight:600">Dominios <code>.<?= e($tld) ?></code> en el navegador</div>
-        <div class="muted">Para que <code>&lt;nombre&gt;.<?= e($tld) ?></code> abra en el navegador hay que registrarlos en Windows (una vez).</div>
+        <div class="muted">Para que <code>&lt;nombre&gt;.<?= e($tld) ?></code> abra en el navegador hay que registrarlos en Windows (una vez). Si <code>localhost</code> te carga otra cosa (p. ej. Docker/Portainer, que ocupa el mismo puerto por IPv6), usa <code><?= e($tld) ?></code> a secas — a diferencia de <code>localhost</code>, no es un nombre especial y siempre te trae aquí.</div>
       </div>
       <div class="spacer"></div>
       <form method="post">
@@ -1530,6 +1547,20 @@ $watcherAlive = watcher_alive($ROOT);
         <input type="hidden" name="action" value="terminal">
         <input type="hidden" name="enable" value="<?= $termOn?'0':'1' ?>">
         <button class="btn <?= $termOn?'danger':'ghost' ?>" type="submit"><?= $termOn?'Desactivar':'Activar' ?> Terminal</button>
+      </form>
+    </div>
+
+    <?php $startupOn = startup_enabled($ROOT); ?>
+    <div class="card row">
+      <div>
+        <div style="font-weight:600">Arrancar con Windows <span class="jstate <?= $startupOn?'ok':'err' ?>" style="margin-left:6px"><?= $startupOn?'ACTIVO':'INACTIVO' ?></span></div>
+        <div class="muted">Instala Apache como servicio de Windows (arranque automático) y el watcher como tarea programada (arranca sin necesidad de iniciar sesión). Al activar o desactivar, Windows pedirá permiso (UAC).</div>
+      </div>
+      <div class="spacer"></div>
+      <form method="post">
+        <input type="hidden" name="action" value="startup">
+        <input type="hidden" name="enable" value="<?= $startupOn?'0':'1' ?>">
+        <button class="btn <?= $startupOn?'danger':'ghost' ?>" type="submit"><?= $startupOn?'Desactivar':'Activar' ?></button>
       </form>
     </div>
 
