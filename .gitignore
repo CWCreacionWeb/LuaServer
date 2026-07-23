@@ -13,16 +13,26 @@
 /config/https.on
 /config/mailpit.on
 /config/mariadb.on
+/config/postgres.on
+/config/postgres_root.pass
 /config/terminal.on
+/config/lanexpose.on
+/config/lan-ip.txt
 /config/mysql_root.pass
 /config/ftp/
 
 # ===== registro de proyectos: estado de cada maquina (plantilla: sites.example.json) =====
 /config/sites.json
 
+# ===== comandos personalizados guardados en el runner (Ejecutar en <proyecto>) =====
+/config/run-presets.json
+
 # ===== proyectos: NO versionar (cada proyecto es tuyo / tiene su propio repo) =====
 /www/*
 !/www/.gitkeep
+
+# ===== phpMyAdmin: app de terceros + tema propio, no se versiona (ver CLAUDE.md) =====
+/tools/phpmyadmin/
 
 # varios
 *.log

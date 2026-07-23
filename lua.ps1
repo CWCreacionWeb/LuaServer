@@ -70,6 +70,18 @@ $MyIni         = Join-Path $Root "config\mariadb\my.ini"
 $MariaDataDir  = Join-Path $Root "data\mariadb"
 $MariaLogDir   = Join-Path $Root "logs\mariadb"
 $MariaDbFlag   = Join-Path $Root "config\mariadb.on"
+# --- PostgreSQL (portable, binarios EnterpriseDB) ---
+$Postgres      = Join-Path $Bin  "postgres"
+$PgCtl         = Join-Path $Postgres "bin\pg_ctl.exe"
+$Initdb        = Join-Path $Postgres "bin\initdb.exe"
+$PgDataDir     = Join-Path $Root "data\postgres"
+$PgLogDir      = Join-Path $Root "logs\postgres"
+$PostgresFlag  = Join-Path $Root "config\postgres.on"
+$PgPort        = 5432
+# --- Exponer en la red local (abrir puerto en el Firewall de Windows) ---
+$LanExposeFlag = Join-Path $Root "config\lanexpose.on"
+$LanIpFile     = Join-Path $Root "config\lan-ip.txt"
+$FwRulePrefix  = "lua-server"
 
 $SvcApache  = "luaApache"
 $DefaultTld = "lua.test"
@@ -79,7 +91,7 @@ $HostsEnd   = "# === lua-server END ==="
 # extensiones PHP a habilitar (solo si existe su DLL). mysqli/pdo_mysql incluidas
 # por si tus proyectos conectan a un MySQL (p.ej. en Docker) via 127.0.0.1.
 # com_dotnet lo usa el panel para lanzar la recarga de Apache en segundo plano.
-$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet')
+$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_pgsql','pgsql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet')
 
 function Info($m){ Write-Host "[lua] $m" -ForegroundColor Cyan }
 function Ok($m){ Write-Host "[ok]  $m" -ForegroundColor Green }
@@ -390,6 +402,68 @@ function Stop-MariaDb {
     Get-Process mysqld -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
+# ---------------- PostgreSQL (portable, mismo patron que MariaDB) ----------------
+# "Up" se comprueba por el postmaster.pid de NUESTRO datadir (no por nombre de proceso
+# global) para no confundirse ni interferir con un PostgreSQL del sistema que el usuario
+# pueda tener instalado aparte.
+function Postgres-Up {
+    $pidFile = Join-Path $PgDataDir "postmaster.pid"
+    if (-not (Test-Path $pidFile)) { return $false }
+    $thePid = Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue
+    if (-not $thePid) { return $false }
+    $p = Get-Process -Id ([int]$thePid) -ErrorAction SilentlyContinue
+    return ($p -and $p.ProcessName -eq 'postgres')
+}
+function Postgres-Initialized { Test-Path (Join-Path $PgDataDir "PG_VERSION") }
+function Set-PostgresConf {
+    $conf = Join-Path $PgDataDir "postgresql.conf"
+    if (Test-Path $conf) {
+        $c = Get-Content $conf -Raw
+        $c = $c -replace '(?m)^\s*#?\s*listen_addresses\s*=.*', "listen_addresses = '127.0.0.1'"
+        $c = $c -replace '(?m)^\s*#?\s*port\s*=.*',             "port = $PgPort"
+        Set-Content -Path $conf -Value $c -Encoding ascii
+    }
+    # Solo loopback, autenticacion trust (entorno de desarrollo local; mismo modelo que
+    # el root sin contrasena de MariaDB). Si el usuario pone contrasena a un rol, la usa
+    # para conectar pero trust la acepta igual: es un servidor solo accesible en 127.0.0.1.
+    $hba = Join-Path $PgDataDir "pg_hba.conf"
+    Set-Content -Path $hba -Encoding ascii -Value @(
+        "# Generado por lua-server -- solo loopback, autenticacion trust (dev local)",
+        "local   all   all                   trust",
+        "host    all   all   127.0.0.1/32    trust",
+        "host    all   all   ::1/128         trust"
+    )
+}
+function Initialize-Postgres {
+    if (Postgres-Initialized) { return $true }
+    if (-not (Test-Path $Initdb)) { return $false }
+    New-Item -ItemType Directory -Force -Path $PgDataDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $PgLogDir  | Out-Null
+    $log = Join-Path $PgLogDir "initdb.log"
+    # -U postgres: superusuario. --auth=trust: sin contrasena en local.
+    & $Initdb "-D" "$PgDataDir" "-U" "postgres" "-E" "UTF8" "--locale=C" "--auth=trust" *> $log
+    if (-not (Postgres-Initialized)) { return $false }
+    Set-PostgresConf
+    return $true
+}
+function Start-Postgres {
+    if (-not (Test-Path $PgCtl)) { return }
+    if (Postgres-Up) { return }
+    if (-not (Initialize-Postgres)) { return }
+    New-Item -ItemType Directory -Force -Path $PgLogDir | Out-Null
+    # pg_ctl arranca postgres.exe con un token restringido en Windows, asi que funciona
+    # aunque el watcher corra como SYSTEM (postgres.exe se niega a correr como admin).
+    $srvLog = Join-Path $PgLogDir "postgres.log"
+    & $PgCtl "-D" "$PgDataDir" "-l" "$srvLog" "-w" "-t" "30" "start" *> (Join-Path $PgLogDir "pgctl.log")
+}
+function Stop-Postgres {
+    # Solo paramos NUESTRA instancia via pg_ctl -D (nunca un postgres del sistema).
+    if ((Test-Path $PgCtl) -and (Postgres-Up)) {
+        & $PgCtl "-D" "$PgDataDir" "-m" "fast" "-w" "-t" "20" "stop" *> (Join-Path $PgLogDir "pgctl.log")
+        for ($i=0; $i -lt 20; $i++) { if (-not (Postgres-Up)) { break }; Start-Sleep -Milliseconds 250 }
+    }
+}
+
 function Cmd-Start {
     if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
     elseif (Apache-Up) { Info "Apache ya estaba arriba" }
@@ -397,6 +471,7 @@ function Cmd-Start {
     Start-Watcher
     if (Test-Path $MailpitFlag) { Start-Mailpit }
     if (Test-Path $MariaDbFlag) { Start-MariaDb }
+    if (Test-Path $PostgresFlag) { Start-Postgres }
     Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
@@ -418,6 +493,8 @@ function Cmd-Watch {
     $fHttps = Join-Path $TmpDir "https.flag"
     $fStartupOn  = Join-Path $TmpDir "startup-on.flag"
     $fStartupOff = Join-Path $TmpDir "startup-off.flag"
+    $fLanOn      = Join-Path $TmpDir "lanexpose-on.flag"
+    $fLanOff     = Join-Path $TmpDir "lanexpose-off.flag"
     while ($true) {
         try {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
@@ -425,6 +502,8 @@ function Cmd-Watch {
             if (Test-Path $fHttps) { Remove-Item $fHttps -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'https-setup') }
             if (Test-Path $fStartupOn)  { Remove-Item $fStartupOn  -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'startup-enable') }
             if (Test-Path $fStartupOff) { Remove-Item $fStartupOff -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'startup-disable') }
+            if (Test-Path $fLanOn)  { Remove-Item $fLanOn  -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'lan-expose') }
+            if (Test-Path $fLanOff) { Remove-Item $fLanOff -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'lan-unexpose') }
             # Reconciliar Mailpit con su flag
             $mpOn = Test-Path $MailpitFlag
             if ($mpOn -and (Test-Path $Mailpit) -and -not (Mailpit-Up)) { Start-Mailpit }
@@ -433,6 +512,10 @@ function Cmd-Watch {
             $mdOn = Test-Path $MariaDbFlag
             if ($mdOn -and (Test-Path $Mysqld) -and -not (MariaDb-Up)) { Start-MariaDb }
             if (-not $mdOn -and (MariaDb-Up)) { Stop-MariaDb }
+            # Reconciliar PostgreSQL con su flag
+            $pgOn = Test-Path $PostgresFlag
+            if ($pgOn -and (Test-Path $PgCtl) -and -not (Postgres-Up)) { Start-Postgres }
+            if (-not $pgOn -and (Postgres-Up)) { Stop-Postgres }
             Process-Jobs
         } catch {}
         Start-Sleep -Seconds 1
@@ -566,6 +649,25 @@ function Run-Job($id, $job) {
                 }
                 if (-not (Test-Path $Mysqld)) { $ok=$false; $err="No se descargo MariaDB" } else { "MariaDB descargado." | Add-Content $log }
             }
+            "postgres"  {
+                $pgDir = Join-Path $Bin "postgres"; New-Item -ItemType Directory -Force -Path $pgDir | Out-Null
+                $zip = Join-Path $pgDir "postgres.zip"
+                "Descargando PostgreSQL 16 (esto puede tardar, ~350 MB)..." | Add-Content $log
+                & curl.exe -s -L -o "$zip" "https://get.enterprisedb.com/postgresql/postgresql-16.14-2-windows-x64-binaries.zip" 2>&1 | Add-Content $log
+                if (Test-Path $zip) {
+                    $work = Join-Path $TmpDir ("pg-" + [System.IO.Path]::GetRandomFileName())
+                    Expand-Archive $zip $work -Force
+                    # el zip de EDB trae una carpeta raiz "pgsql" con bin/, lib/, share/...
+                    $inner = Get-ChildItem $work -Directory | Select-Object -First 1
+                    if ($inner) {
+                        Get-ChildItem $pgDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'postgres.zip' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $inner.FullName -Force | Move-Item -Destination $pgDir -Force
+                    }
+                    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                }
+                if (-not (Test-Path $PgCtl)) { $ok=$false; $err="No se descargo PostgreSQL" } else { "PostgreSQL descargado." | Add-Content $log }
+            }
             "ftp_deploy" {
                 $ftpHost = "$($job.ftpHost)"; $ftpPort = "$($job.ftpPort)"; $ftpUser = "$($job.ftpUser)"; $ftpPass = "$($job.ftpPass)"
                 $ftpPath = "$($job.ftpPath)".Trim('/'); $ftpSsl = [bool]$job.ftpSsl
@@ -596,7 +698,7 @@ function Run-Job($id, $job) {
             }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'ftp_deploy') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'ftp_deploy') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -613,6 +715,14 @@ function Run-Job($id, $job) {
             Start-MariaDb
             if (MariaDb-Up) { Set-JobStatus $id $name $type "done" "MySQL activo en 127.0.0.1:3306 (usuario root, sin contrasena)" }
             else { Set-JobStatus $id $name $type "error" "MariaDB se descargo pero no arranco (revisa logs\mariadb\error.log)" }
+        } elseif ($type -eq 'postgres') {
+            # Habilitar pdo_pgsql en los php.ini (la DLL ya viene con PHP) y reiniciar Apache
+            # para que el panel pueda conectar; luego arrancar el servidor.
+            Set-PhpInis | Out-Null
+            if (Test-HttpdConfig) { Restart-Apache }
+            Start-Postgres
+            if (Postgres-Up) { Set-JobStatus $id $name $type "done" "PostgreSQL activo en 127.0.0.1:5432 (usuario postgres, sin contrasena)" }
+            else { Set-JobStatus $id $name $type "error" "PostgreSQL se descargo pero no arranco (revisa logs\postgres)" }
         } elseif ($type -eq 'ftp_deploy') {
             Set-JobStatus $id $name $type "done" "Desplegado por FTP a $ftpHost ($total archivo(s))"
         } else {
@@ -815,6 +925,49 @@ function Cmd-StartupStatus {
     if ($svc -and $svc.StartType -eq 'Automatic' -and $task -and $task.State -ne 'Disabled') { Write-Output "on" } else { Write-Output "off" }
 }
 
+# ============================================================
+#  Exponer en la red local (toggle desde el panel: Configuracion del servidor)
+#  Abre el/los puerto(s) de Apache en el Firewall de Windows, SOLO para la subred
+#  local (-RemoteAddress LocalSubnet) y sin tocar el perfil publico. El panel de
+#  administracion sigue restringido a 127.0.0.1 por la config de Apache, asi que
+#  esto expone los PROYECTOS a la LAN, no el panel.
+# ============================================================
+# Detecta las IPv4 de red local (descarta loopback y APIPA 169.254.x).
+function Get-LanIPv4 {
+    Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+        Sort-Object -Property @{Expression={$_.InterfaceMetric}} |
+        Select-Object -ExpandProperty IPAddress
+}
+function Remove-LuaFwRules {
+    foreach ($p in @('80','443')) {
+        Get-NetFirewallRule -DisplayName "$FwRulePrefix HTTP $p" -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    }
+}
+function Cmd-LanExpose {
+    if (-not (Test-Admin)) { Err "Necesita administrador para tocar el Firewall."; return }
+    $ports = @('80')
+    if (Test-Path $HttpsFlag) { $ports += '443' }
+    Remove-LuaFwRules   # limpiar reglas previas para no duplicar / recoger cambio de puertos
+    foreach ($p in $ports) {
+        New-NetFirewallRule -DisplayName "$FwRulePrefix HTTP $p" -Description "lua-server: acceso desde la red local" `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort $p `
+            -Profile Private,Domain -RemoteAddress LocalSubnet -ErrorAction SilentlyContinue | Out-Null
+    }
+    $ips = @(Get-LanIPv4)
+    if ($ips.Count) { Set-Content -Path $LanIpFile -Value ($ips -join ',') -Encoding ascii }
+    Set-Content -Path $LanExposeFlag -Value "1" -Encoding ascii
+    Ok "Puerto(s) $($ports -join ', ') abiertos en el Firewall (solo subred local). IP(s) LAN: $($ips -join ', ')"
+}
+function Cmd-LanUnexpose {
+    if (-not (Test-Admin)) { Err "Necesita administrador para tocar el Firewall."; return }
+    Remove-LuaFwRules
+    Remove-Item $LanExposeFlag -Force -ErrorAction SilentlyContinue
+    Remove-Item $LanIpFile     -Force -ErrorAction SilentlyContinue
+    Ok "Puertos cerrados en el Firewall. Ya no se expone a la red local."
+}
+
 function Cmd-Help { Get-Content $PSCommandPath -TotalCount 40 | ForEach-Object { $_ } }
 
 switch ($Command.ToLower()) {
@@ -840,6 +993,8 @@ switch ($Command.ToLower()) {
     "startup-enable"  { Require-Admin; Cmd-StartupEnable }
     "startup-disable" { Require-Admin; Cmd-StartupDisable }
     "startup-status"  { Cmd-StartupStatus }
+    "lan-expose"      { Require-Admin; Cmd-LanExpose }
+    "lan-unexpose"    { Require-Admin; Cmd-LanUnexpose }
     "logs"        { Cmd-Logs }
     default       { Cmd-Help }
 }

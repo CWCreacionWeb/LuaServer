@@ -24,9 +24,12 @@ admin salvo cuando hace falta (HTTPS, hosts, servicio de Windows).
   proyectos **externos** fuera de `www\`, ver más abajo).
 - **`www/`** — ignorado por completo en git (`/www/*`). Cada proyecto ahí
   dentro tiene su propio repo; lua-server no versiona código de proyectos.
-  Esto incluye `www/phpmyadmin/` (el propio phpMyAdmin y su tema `lua` no
-  están en este repo — si se reinstala phpMyAdmin desde cero hay que
-  rehacer el tema).
+  Solo debe contener proyectos del usuario: phpMyAdmin vive en
+  `tools/phpmyadmin/` (fuera de `www\`, vía el campo `path` en
+  `sites.json`, igual que un proyecto externo) para que `www\` quede
+  limpio. Tampoco está en este repo (`/tools/phpmyadmin/` en
+  `.gitignore`) — si se reinstala desde cero hay que rehacer el tema
+  `lua`.
 
 ## ⚠️ Trampa nº1: el watcher cachea el código en memoria
 
@@ -84,6 +87,47 @@ desregistran, así que fue recuperable, pero el susto fue real).
 **Regla desde ahora: usar siempre `read_page`/`find` para obtener un
 `ref` y clicar por referencia, nunca por coordenadas (x,y).**
 
+## ⚠️ Trampa nº5: el runner "Ejecutar en &lt;proyecto&gt;" (composer/npm) llevaba tres bugs a la vez
+
+El botón de play de cada proyecto (`tools/dashboard/index.php`, `luaOpenRunner`)
+fallaba con "El sistema no puede encontrar la ruta especificada" para
+absolutamente cualquier comando. Costó bastante depurar porque eran **tres
+bugs independientes apilados**, y arreglar solo uno seguía dando el mismo
+error:
+
+1. **La ruta del proyecto llegaba con las barras `\` borradas.** El botón
+   pasaba la ruta dentro de un atributo `onclick="luaOpenRunner('C:\personal\...')"`.
+   Ese atributo se compila como **código JS**, y ahí `\p`, `\L`, `\w`, `\a`
+   son secuencias de escape que el navegador consume en silencio (la barra
+   desaparece): `C:\personal\LuaServer` llegaba al backend como
+   `C:personalLuaServer`, y el `cd /d` fallaba siempre — para *cualquier*
+   proyecto, no solo con nombres de usuario raros. Arreglado pasando la ruta
+   por `data-*` (texto plano, sin parseo JS) y un listener delegado en vez
+   de `onclick` inline. **Regla: nunca metas una ruta de Windows (con `\`)
+   dentro de un atributo `onclick="...'...'"` — usa `data-*`.**
+2. **mod_fcgid + `shell_exec()`/`exec()` propio en Windows = riesgo real de
+   colgar el worker.** Para refrescar el `PATH` (ver más abajo) probé primero
+   lanzando `powershell.exe` con `shell_exec()` desde PHP — el request volvía
+   con respuesta vacía (el worker moría a mitad de petición), igual que el
+   bug ya conocido de opcache+PHP viejo. La app ya evita esto para lanzar
+   comandos (usa COM `WScript.Shell.Run`, nunca `exec`/`proc_open`); el
+   mismo cuidado aplica a *cualquier* subproceso propio que lance PHP bajo
+   Apache en Windows, no solo al comando final del usuario. Arreglado leyendo
+   el PATH vía `WScript.Shell.RegRead` (COM, sin subproceso) en vez de
+   `shell_exec`.
+3. **COM devuelve texto en el codepage ANSI del sistema (Windows-1252 aquí),
+   no UTF-8.** El wrapper `.cmd` hace `chcp 65001` (UTF-8) al principio; si
+   luego se mete una cadena ANSI sin convertir (p.ej. una ruta con
+   "Vázquez"), el byte no-UTF8 rompe el parseo del resto del `.cmd` y el
+   comando entero falla. Arreglado con
+   `mb_convert_encoding($s, 'UTF-8', 'Windows-1252')` sobre cualquier cadena
+   que venga de COM y vaya a parar a un `.cmd` ya en modo `chcp 65001`.
+
+Además, ese runner ahora manda la versión de PHP del proyecto (`bin\php\<ver>`)
+al principio del `PATH` de cada comando, para que `composer`/`php` usen
+**el PHP propio de lua-server** en vez de depender de un PHP global del
+sistema (que en esta máquina ni siquiera existe pese a estar en el PATH).
+
 ## Gotchas de PowerShell
 
 - `$cfg.sites.PSObject.Properties.Name.Contains($name)` revienta con
@@ -133,7 +177,7 @@ desregistran, así que fue recuperable, pero el susto fue real).
   degradado de marca, para no perder la señal visual de "esto borra algo".
 - Logo/favicon reales (monograma "LUA" vectorial) vienen de
   `design_handoff_dashboard/assets/` — copiados a `tools/dashboard/assets/`
-  (panel) y `www/phpmyadmin/themes/lua/` (phpMyAdmin). La carpeta
+  (panel) y `tools/phpmyadmin/themes/lua/` (phpMyAdmin). La carpeta
   `design_handoff_dashboard/` en sí queda fuera de git (material de
   referencia, no código).
 - Tipografía del tema de phpMyAdmin: Space Grotesk (UI) + JetBrains Mono

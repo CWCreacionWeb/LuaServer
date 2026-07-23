@@ -19,6 +19,39 @@ disco (mucho más rápido que las carpetas compartidas de Docker en Windows).
 - **Terminal web** para ejecutar comandos (composer, git, npm, artisan…) desde el navegador
 - Script de control `lua.ps1` para quien prefiera la terminal
 
+## Instalación
+
+**Opción recomendada — asistente gráfico, con pasos:**
+```powershell
+git clone <tu-repo> lua-server
+cd lua-server
+.\install.ps1
+```
+Si prefieres no usar la terminal, tras clonar el repo haz **doble clic en
+`install.bat`** (misma carpeta) — lanza el asistente sin abrir ninguna
+consola. `install.ps1` en sí es un script de PowerShell, no un `.exe`: al no
+estar pensado para distribuirse como binario suelto (se clona el repo con
+git), `install.bat` es el punto de entrada de doble clic, no un
+instalador compilado.
+
+Interfaz nativa de Windows (WPF) con la misma identidad visual que el panel
+(degradado de marca, tema claro/oscuro según el sistema). Bienvenida →
+elige qué instalar → progreso en vivo → listo. Apache, PHP 8.4, Composer y
+Visual C++ Redistributable se instalan siempre; el resto (más versiones de
+PHP, MariaDB, Mailpit, mkcert para HTTPS local, phpMyAdmin) es opcional y se
+marca con checkboxes. Puedes volver a ejecutarlo cuando quieras para añadir
+algo que no elegiste la primera vez. Al terminar, un botón arranca el
+servidor y abre el panel directamente.
+
+**Alternativa sin interfaz** (automatización/CI, instala absolutamente todo
+el catálogo sin preguntar):
+```powershell
+.\bootstrap.ps1
+```
+
+Ambos descargan los binarios a `downloads\` (cache local, no se versiona) y
+dejan el stack listo para `.\lua.ps1 start`.
+
 ## Panel web (http://localhost o http://lua.test)
 
 Con el servidor arrancado, abre **http://localhost** (solo accesible desde esta
@@ -94,11 +127,20 @@ ajustes de `php.ini` se guardan como *overrides* en
 
 ## phpMyAdmin
 
-Se sirve como un proyecto más del panel (con su propio PHP y dominio), con un
+Se sirve con su propio PHP y dominio (vía `path` en `sites.json`, igual que
+un proyecto externo), pero vive en `tools/phpmyadmin/` en vez de `www\` para
+que esa carpeta quede solo para tus propios proyectos — el panel lo integra
+como herramienta de la plataforma en vez de listarlo como proyecto. Tiene un
 tema propio a juego con la marca del panel (mismo mecanismo de colores
 claro/oscuro, tipografía Space Grotesk + JetBrains Mono autoalojadas). No
-viene en este repo — es contenido de `www\` (no versionado, cada máquina
-lo instala/reinstala aparte, incluyendo el tema si se reinstala desde cero).
+viene en este repo (no versionado, cada máquina lo instala/reinstala aparte).
+
+Marcando la casilla "phpMyAdmin" en `.\install.ps1` (o usando `bootstrap.ps1`,
+que lo instala siempre) se descarga, se coloca en `tools/phpmyadmin/` y se
+registra como sitio automáticamente — pero con el tema por defecto de
+phpMyAdmin, no el tema `lua`. El tema de marca sigue siendo un retoque manual
+aparte (concatenar el override sobre `theme.css`, ver más arriba) si se
+reinstala desde cero.
 
 ## Requisitos
 
@@ -143,7 +185,8 @@ Todo está autocontenido en esta carpeta y las rutas se recalculan solas.
 ```powershell
 git clone <tu-repo> lua-server
 cd lua-server
-.\bootstrap.ps1     # descarga Apache + las 7 versiones de PHP + MariaDB + Mailpit + mkcert + Composer, y ejecuta init
+.\install.ps1       # asistente grafico con pasos (ver "Instalacion" mas arriba)
+# o, sin interfaz: .\bootstrap.ps1
 .\lua.ps1 start
 ```
 
@@ -195,16 +238,20 @@ Si además quieres que el servidor sea accesible desde la red de la oficina
 ```
 lua-server\
   lua.ps1              control (start/stop/add-site/add-external/switch-php/startup-enable...)
-  bootstrap.ps1        descarga los binarios (PC nuevo)
+  install.ps1          asistente grafico (WPF) con pasos, componentes opcionales marcables
+  install.bat          lanza install.ps1 con doble clic, sin consola visible
+  bootstrap.ps1        instalacion sin interfaz (instala todo el catalogo)
   bin\                 apache, php\<version>, mariadb, mailpit, mkcert, composer  (no versionado)
-  www\                 tus proyectos, incl. phpmyadmin/                          (no versionado)
+  www\                 tus proyectos                                             (no versionado)
   data\                covers\ (carátulas), mariadb\ (datos), ssl\ (mkcert)       (no versionado)
   config\
+    install-lib.ps1     catalogo de descargas compartido por install.ps1 y bootstrap.ps1
     sites.json          registro de proyectos (no versionado; plantilla: sites.example.json)
     php\*.overrides.ini  ajustes de php.ini por version (persisten)
     terminal.on          flag: terminal activada
     mariadb.on           flag: MariaDB activo
     https.on             flag: HTTPS activo
   tools\dashboard\      panel web (index.php, assets\, adminer.php)
+  tools\phpmyadmin\     phpMyAdmin + tema lua                     (no versionado)
   logs\ tmp\            runtime (no versionado)
 ```
