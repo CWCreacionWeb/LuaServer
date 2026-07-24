@@ -212,6 +212,21 @@ sistema (que en esta máquina ni siquiera existe pese a estar en el PATH).
 - **MariaDB nativo** + Adminer como alternativa a phpMyAdmin
   (`config/mariadb.on`, root sin contraseña en `127.0.0.1:3306`).
 - **PHP 7.1.33** añadido (necesario para apps legacy tipo Laravel 5.x).
+- **MongoDB nativo** (`config/mongodb.on`, `127.0.0.1:27017`, sin
+  autenticación) + **mongo-express** como gestor visual — primer uso de
+  **Node.js portable** en el repo (`bin\node\`), instalado vía `npm` al
+  activar el motor. Mismo patrón flag+watcher que MariaDB/PostgreSQL
+  (`Start-MongoDb`/`Stop-MongoDb`/`Start-MongoExpress`/`Stop-MongoExpress`
+  en `lua.ps1`), pero con una diferencia clave: como Apache **no tiene
+  `mod_proxy` cargado** (nunca se ha usado en este repo) y mongo-express
+  habla HTTP propio (Node), no se le da dominio/vhost como a phpMyAdmin —
+  se expone directo en `http://127.0.0.1:8081/`, igual de "sin fricción"
+  que MariaDB en su puerto 3306. mongo-express sigue al mismo flag que el
+  motor (un solo botón enciende/apaga ambos). "Up" de MongoDB se comprueba
+  vía `processManagement.pidFilePath` en `mongod.cfg` (generado por
+  `Set-MongoConf`), no por `mongod.lock` (formato no documentado) ni por
+  nombre de proceso global — mismo criterio que `Postgres-Up` con
+  `postmaster.pid`.
 
 ## Convenciones de UI ya establecidas
 
