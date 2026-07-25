@@ -136,8 +136,12 @@ function Get-DocRoot($base) {
     if (Test-Path $pub) { return $pub } else { return $base }
 }
 # Carpeta raiz de un sitio: su 'path' (ruta externa) si esta definido, si no www\<name>.
+# Si 'path' esta definido se devuelve SIEMPRE, aunque Test-Path falle (disco externo/red
+# desmontado): asi el DocumentRoot apunta a la ruta real (httpd -t solo avisa, no es fatal)
+# y el 404 delata que el disco esta offline. Antes caia en silencio a www\<name>, sirviendo
+# 404 sin pista, o -peor- el contenido de OTRO proyecto que existiera en www\<name>.
 function Get-SiteBase($site, $name) {
-    if ($site -and ($site.PSObject.Properties.Name -contains 'path') -and $site.path -and (Test-Path $site.path)) { return $site.path }
+    if ($site -and ($site.PSObject.Properties.Name -contains 'path') -and $site.path) { return $site.path }
     return (Join-Path $Www $name)
 }
 function Get-LanIp {
@@ -167,6 +171,16 @@ function Test-HttpdConfig {
     return $ok
 }
 
+# Escribe UTF-8 SIN BOM. Apache 2.4 en Windows lee su config como UTF-8, y los archivos
+# de codigo (.php/.env) son fuente UTF-8: un BOM al inicio rompe <?php (headers already
+# sent) o la 1a clave del .env. Set-Content -Encoding ascii convertia acentos de la RUTA
+# absoluta embebida en '?' (rompiendo instalaciones bajo C:\Users\Vazquez\...), y -Encoding
+# utf8 mete BOM; este helper evita ambos. Acepta string o string[] (une con CRLF).
+function Write-Utf8NoBom($path, $content) {
+    $text = if ($content -is [System.Array]) { [string]::Join("`r`n", $content) + "`r`n" } else { [string]$content }
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 # ============================================================
 #  INIT: re-aplica rutas a la carpeta actual (portable)
 # ============================================================
@@ -186,7 +200,7 @@ function Set-HttpdConf {
     if ($c -notmatch 'httpd-lua\.conf') {
         $c = $c + "`r`n`r`n# ================= lua-server =================`r`nDefine LUAROOT `"$lua`"`r`nInclude `"`${LUAROOT}/config/apache/httpd-lua.conf`"`r`n"
     }
-    Set-Content -Path $HttpdConf -Value $c -Encoding ascii
+    Write-Utf8NoBom $HttpdConf $c
     Ok "httpd.conf apuntando a: $srv"
 }
 
@@ -251,7 +265,10 @@ function Set-PhpInis {
             $b.Add("smtp_port = 1025")
             $b.Add("sendmail_from = dev@$(Get-Tld)")
         }
-        Set-Content -Path $ini -Value (@($lines) + $b.ToArray()) -Encoding ascii
+        # -Encoding Default (ANSI del sistema, Windows-1252 aqui): PHP en Windows resuelve
+        # rutas del sistema (extension_dir, tmp, session) por el codepage ANSI, no por UTF-8.
+        # Preserva acentos de la ruta como bytes ANSI y no mete BOM (que romperia el parser).
+        Set-Content -Path $ini -Value (@($lines) + $b.ToArray()) -Encoding Default
     }
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
 }
@@ -260,7 +277,14 @@ function Set-PhpInis {
 function Set-Ssl {
     $on = (Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)
     if ($on) {
-        Set-Content -Path $SslConf -Encoding ascii -Value @'
+        # ssl.conf se incluye ANTES que los vhosts de proyecto (httpd-lua.conf), asi que el
+        # vhost :443 del panel de aqui es el PRIMERO -> se convierte en el default de HTTPS.
+        # Sin este bloque, el primer proyecto alfabetico era el default en :443: el panel era
+        # inalcanzable por HTTPS y cualquier Host desconocido (incl. desde LAN si se expone
+        # 443) caia en ese proyecto SIN el filtro de IP del panel. Replica la restriccion a
+        # loopback del vhost :80 del panel (httpd-lua.conf) y añade SSL. Heredoc @'...'@
+        # (literal): ${LUAROOT} se escribe tal cual para que lo expanda Apache.
+        Write-Utf8NoBom $SslConf @'
 # Generado por lua.ps1 -- HTTPS activo
 LoadModule ssl_module modules/mod_ssl.so
 LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
@@ -269,9 +293,30 @@ SSLCipherSuite HIGH:!aNULL:!MD5
 SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
 SSLSessionCache "shmcb:${LUAROOT}/tmp/ssl_scache(512000)"
 SSLSessionCacheTimeout 300
+
+# Vhost :443 por defecto: el panel (solo localhost). Debe ir el PRIMERO en :443.
+<VirtualHost *:443>
+    ServerName localhost
+    ServerAlias lua.test 127.0.0.1
+    DocumentRoot "${LUAROOT}/tools/dashboard"
+    FcgidInitialEnv PHPRC "${LUAROOT}/bin/php/8.4"
+    SSLEngine on
+    SSLCertificateFile "${LUAROOT}/data/ssl/lua.pem"
+    SSLCertificateKeyFile "${LUAROOT}/data/ssl/lua-key.pem"
+    <Directory "${LUAROOT}/tools/dashboard">
+        Options +ExecCGI +FollowSymLinks
+        AllowOverride All
+        DirectoryIndex index.php index.html
+        FcgidWrapper "${LUAROOT}/bin/php/8.4/php-cgi.exe" .php
+        <RequireAny>
+            Require ip 127.0.0.1
+            Require ip ::1
+        </RequireAny>
+    </Directory>
+</VirtualHost>
 '@
     } else {
-        Set-Content -Path $SslConf -Value "# HTTPS desactivado" -Encoding ascii
+        Write-Utf8NoBom $SslConf "# HTTPS desactivado"
     }
 }
 function New-VhostFile($name, $php, $domain, $base) {
@@ -289,7 +334,6 @@ function New-VhostFile($name, $php, $domain, $base) {
 
 <VirtualHost *:443>
     ServerName $domain
-    ServerAlias www.$domain
     DocumentRoot "$docroot"
     FcgidInitialEnv PHPRC "$phpdir"
     SSLEngine on
@@ -306,12 +350,26 @@ function New-VhostFile($name, $php, $domain, $base) {
 </VirtualHost>
 "@
     }
-    Set-Content -Path (Join-Path $VhostDir "$name.conf") -Value $out -Encoding ascii
+    # phpMyAdmin es una consola de administracion de BD (root, sin contrasena): debe quedar
+    # SIEMPRE restringida a loopback, igual que el panel, aunque se active "Exponer en LAN"
+    # (que abre el puerto 80 del Firewall para los PROYECTOS). Se aplica como post-reemplazo
+    # sobre el 'Require all granted' de la plantilla (ambos bloques :80 y :443) en vez de un
+    # token en la plantilla: asi la plantilla es valida por si sola aunque un watcher con
+    # codigo viejo la regenere (evita dejar un token sin sustituir que rompe Apache).
+    if ($name -eq 'phpmyadmin') {
+        $req = "<RequireAny>`r`n            Require ip 127.0.0.1`r`n            Require ip ::1`r`n        </RequireAny>"
+        $out = $out.Replace('Require all granted', $req)
+    }
+    Write-Utf8NoBom (Join-Path $VhostDir "$name.conf") $out
 }
 function Regenerate-Vhosts {
     if (-not (Test-Path $VhostDir)) { New-Item -ItemType Directory -Force -Path $VhostDir | Out-Null }
+    # Parsear sites.json ANTES de borrar los vhosts: si el JSON esta corrupto (edicion a
+    # mano, escritura a medias), Get-Config lanza y abortamos SIN borrar, conservando los
+    # vhosts actuales. Antes se borraban todos y luego fallaba el parseo -> cero vhosts ->
+    # todos los proyectos caian al vhost por defecto hasta arreglar el JSON.
+    try { $cfg = Get-Config } catch { Warn "sites.json invalido: se conservan los vhosts actuales ($($_.Exception.Message))"; return }
     Get-ChildItem $VhostDir -Filter *.conf -ErrorAction SilentlyContinue | Remove-Item -Force
-    $cfg = Get-Config
     foreach ($p in $cfg.sites.PSObject.Properties.Name) {
         $s = $cfg.sites.$p; $dom = $null
         if (($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { $dom = $s.domain }
@@ -323,6 +381,19 @@ function Get-SiteDomain($cfg, $name) {
     $s = $cfg.sites.$name
     if ($s -and ($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { return $s.domain }
     return "$name.$(Get-Tld)"
+}
+# ¿Algun sitio distinto de $exceptName ya usa este dominio (o su alias www.)? Devuelve su
+# nombre o $null. Dos vhosts con el mismo ServerName no dan error en Apache: sirve el que
+# carga primero por orden de fichero y el otro proyecto queda muerto en silencio.
+function Get-DomainClash($cfg, $domain, $exceptName) {
+    $domain = ([string]$domain).ToLower(); $tld = Get-Tld
+    foreach ($p in $cfg.sites.PSObject.Properties.Name) {
+        if ($p -eq $exceptName) { continue }
+        $s = $cfg.sites.$p
+        $eff = if ($s -and ($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { ([string]$s.domain).ToLower() } else { "$p.$tld".ToLower() }
+        if ($eff -eq $domain -or "www.$eff" -eq $domain -or $eff -eq "www.$domain") { return $p }
+    }
+    return $null
 }
 
 function Cmd-Init {
@@ -350,14 +421,26 @@ function Start-Watcher {
     if (Watcher-Alive) { return }
     Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
 }
-function Mailpit-Up { [bool](Get-Process mailpit -ErrorAction SilentlyContinue) }
+# Procesos cuyo ejecutable cuelga de $dir: identifica NUESTRAS instancias por ruta del
+# binario, no por nombre de proceso global. Asi el watcher nunca toca un mysqld/mailpit
+# ajeno del sistema (XAMPP, servicio propio del usuario, etc.). Mismo espiritu que
+# Postgres-Up (que usa postmaster.pid). Nota: $_.Path puede ser inaccesible para procesos
+# de otra cuenta; en ese caso quedan excluidos, que es justo lo deseado (no son nuestros).
+function Get-LuaProcess($name, $dir) {
+    $dirN = ([string]$dir).TrimEnd('\','/')
+    Get-Process $name -ErrorAction SilentlyContinue | Where-Object {
+        $exe = $null; try { $exe = $_.Path } catch {}
+        $exe -and $exe.StartsWith($dirN, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+}
+function Mailpit-Up { [bool](Get-LuaProcess 'mailpit' (Join-Path $Bin 'mailpit')) }
 function Start-Mailpit {
     if (-not (Test-Path $Mailpit)) { return }
     if (Mailpit-Up) { return }
     $db = Join-Path $Root "data\mailpit.db"
     Start-Process -FilePath $Mailpit -WindowStyle Hidden -ArgumentList @('--smtp','127.0.0.1:1025','--listen','127.0.0.1:8025','--db-file',"`"$db`"")
 }
-function Stop-Mailpit { Get-Process mailpit -ErrorAction SilentlyContinue | Stop-Process -Force }
+function Stop-Mailpit { Get-LuaProcess 'mailpit' (Join-Path $Bin 'mailpit') | Stop-Process -Force -ErrorAction SilentlyContinue }
 
 # Reescribe config\mariadb\my.ini con las rutas absolutas de ESTA instalacion
 # (portable: se recalculan en cada init/start, igual que httpd.conf).
@@ -372,9 +455,9 @@ function Set-MariaDbIni {
     $c = $c -replace '(?m)^(\s*socket\s*=).*',        "`$1 $sock"
     $c = $c -replace '(?m)^(\s*log-error\s*=).*',     "`$1 $log"
     $c = $c -replace '(?m)^(\s*bind-address\s*=).*',  '${1} 127.0.0.1'
-    Set-Content -Path $MyIni -Value $c -Encoding ascii
+    Set-Content -Path $MyIni -Value $c -Encoding Default
 }
-function MariaDb-Up { [bool](Get-Process mysqld -ErrorAction SilentlyContinue) }
+function MariaDb-Up { [bool](Get-LuaProcess 'mysqld' $MariaDb) }
 function MariaDb-Initialized { Test-Path (Join-Path $MariaDataDir "mysql") }
 function Initialize-MariaDb {
     if (MariaDb-Initialized) { return $true }
@@ -399,7 +482,7 @@ function Stop-MariaDb {
         $ErrorActionPreference = $prev
         for ($i=0; $i -lt 20; $i++) { if (-not (MariaDb-Up)) { break }; Start-Sleep -Milliseconds 250 }
     }
-    Get-Process mysqld -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-LuaProcess 'mysqld' $MariaDb | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------- PostgreSQL (portable, mismo patron que MariaDB) ----------------
@@ -495,6 +578,11 @@ function Cmd-Watch {
     $fStartupOff = Join-Path $TmpDir "startup-off.flag"
     $fLanOn      = Join-Path $TmpDir "lanexpose-on.flag"
     $fLanOff     = Join-Path $TmpDir "lanexpose-off.flag"
+    # Backoff de arranque de BD: si MariaDB/Postgres no logran mantenerse arriba (puerto
+    # ocupado, datadir corrupto), no reintentar cada 1s (spawn de procesos condenados +
+    # reescritura de my.ini en bucle). Se reintenta como mucho cada 30s.
+    $nextMariaTry = [datetime]::MinValue
+    $nextPgTry    = [datetime]::MinValue
     while ($true) {
         try {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
@@ -508,16 +596,28 @@ function Cmd-Watch {
             $mpOn = Test-Path $MailpitFlag
             if ($mpOn -and (Test-Path $Mailpit) -and -not (Mailpit-Up)) { Start-Mailpit }
             if (-not $mpOn -and (Mailpit-Up)) { Stop-Mailpit }
-            # Reconciliar MariaDB con su flag
+            # Reconciliar MariaDB con su flag (con backoff si no arranca)
             $mdOn = Test-Path $MariaDbFlag
-            if ($mdOn -and (Test-Path $Mysqld) -and -not (MariaDb-Up)) { Start-MariaDb }
+            if ($mdOn -and (Test-Path $Mysqld) -and -not (MariaDb-Up)) {
+                if ([datetime]::Now -ge $nextMariaTry) { Start-MariaDb; $nextMariaTry = [datetime]::Now.AddSeconds(30) }
+            } elseif ($mdOn -and (MariaDb-Up)) { $nextMariaTry = [datetime]::MinValue }
             if (-not $mdOn -and (MariaDb-Up)) { Stop-MariaDb }
-            # Reconciliar PostgreSQL con su flag
+            # Reconciliar PostgreSQL con su flag (con backoff si no arranca)
             $pgOn = Test-Path $PostgresFlag
-            if ($pgOn -and (Test-Path $PgCtl) -and -not (Postgres-Up)) { Start-Postgres }
+            if ($pgOn -and (Test-Path $PgCtl) -and -not (Postgres-Up)) {
+                if ([datetime]::Now -ge $nextPgTry) { Start-Postgres; $nextPgTry = [datetime]::Now.AddSeconds(30) }
+            } elseif ($pgOn -and (Postgres-Up)) { $nextPgTry = [datetime]::MinValue }
             if (-not $pgOn -and (Postgres-Up)) { Stop-Postgres }
             Process-Jobs
-        } catch {}
+        } catch {
+            # Antes esto se tragaba en silencio: un fallo aqui (p.ej. Restart-Service
+            # denegado porque Apache es servicio y este watcher no esta elevado) no
+            # dejaba ningun rastro. Se registra para poder diagnosticarlo.
+            try {
+                New-Item -ItemType Directory -Force -Path (Join-Path $Root "logs") | Out-Null
+                "$(Get-Date -Format o)  watch-loop error: $($_.Exception.Message)" | Add-Content (Join-Path $Root "logs\watcher-error.log")
+            } catch {}
+        }
         Start-Sleep -Seconds 1
     }
 }
@@ -540,9 +640,29 @@ function Cmd-Apply {
     $log = Join-Path $ApacheLog "apply.log"
     "$(Get-Date -Format o)  apply: start" | Add-Content $log
     Set-PhpInis | Out-Null
+    # Respaldar la config de Apache que vamos a regenerar. Si la nueva no valida, se restaura:
+    # asi el disco nunca queda con config rota que tumbe Apache en el proximo reinicio/reboot
+    # (Apache sigue sirviendo con la vieja en memoria y el usuario no se entera hasta que,
+    # horas despues, un reinicio relee el disco roto y NO arranca — sin causa aparente).
+    $bak = Join-Path $TmpDir "apply-bak"
+    if (Test-Path $bak) { Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -ItemType Directory -Force -Path $bak | Out-Null
+    if (Test-Path $VhostDir) { Copy-Item $VhostDir (Join-Path $bak "vhosts") -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $SslConf)  { Copy-Item $SslConf  (Join-Path $bak "ssl.conf") -Force -ErrorAction SilentlyContinue }
     Set-Ssl
     Regenerate-Vhosts
-    if (-not (Test-HttpdConfig)) { "$(Get-Date -Format o)  apply: CONFIG INVALIDA, abortado" | Add-Content $log; return }
+    if (-not (Test-HttpdConfig)) {
+        "$(Get-Date -Format o)  apply: CONFIG INVALIDA, restaurando backup" | Add-Content $log
+        if (Test-Path (Join-Path $bak "vhosts")) {
+            Get-ChildItem $VhostDir -Filter *.conf -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Copy-Item (Join-Path $bak "vhosts\*") $VhostDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path (Join-Path $bak "ssl.conf")) { Copy-Item (Join-Path $bak "ssl.conf") $SslConf -Force -ErrorAction SilentlyContinue }
+        Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue
+        Err "Config invalida: se revirtieron los cambios de Apache (el disco queda en el ultimo estado valido)."
+        return
+    }
+    Remove-Item $bak -Recurse -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 800   # deja que el navegador reciba la respuesta antes de reiniciar
     Restart-Apache
     "$(Get-Date -Format o)  apply: done" | Add-Content $log
@@ -574,17 +694,29 @@ function Set-EnvVar($envFile, $key, $value) {
         if ($l -match "^\s*#?\s*$key\s*=") { $found = $true; "$key=$value" } else { $l }
     }
     if (-not $found) { $out += "$key=$value" }
-    Set-Content -Path $envFile -Value $out -Encoding utf8
+    # UTF-8 SIN BOM: Set-Content -Encoding utf8 metia BOM y corrompia la 1a clave del .env
+    # (env('APP_NAME')=null; phpdotenv antiguo de Laravel 5.x reventaba al parsear).
+    Write-Utf8NoBom $envFile $out
 }
 # Crea (si no existe) una base de datos MySQL a juego con el proyecto. Silencioso si MariaDB no esta arriba.
 function New-ProjectDb($dbname, $projectDir, $projectType) {
     if (-not (MariaDb-Up)) { return $null }
     $mariadbExe = Join-Path $MariaDb "bin\mariadb.exe"
     if (-not (Test-Path $mariadbExe)) { return $null }
+    # Leer la contrasena de root si el usuario la fijo desde el panel (config\mysql_root.pass).
+    # Antes se conectaba SIEMPRE sin contrasena: con root protegido, mariadb devolvia
+    # "Access denied", pero como no se comprobaba el exit code, la funcion devolvia exito y
+    # el panel mostraba "[BD: x]" aunque la BD no existiera (y ademas .env quedaba sin clave).
+    $rootPassFile = Join-Path $Root "config\mysql_root.pass"
+    $rootPass = if (Test-Path $rootPassFile) { (Get-Content $rootPassFile -Raw).Trim() } else { "" }
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
         $sql = 'CREATE DATABASE IF NOT EXISTS `' + $dbname + '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci'
-        $null = & $mariadbExe --host=127.0.0.1 --port=3306 --user=root -e $sql 2>&1
+        $args = @('--host=127.0.0.1','--port=3306','--user=root')
+        if ($rootPass -ne '') { $args += "--password=$rootPass" }
+        $args += @('-e', $sql)
+        $null = & $mariadbExe @args 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }   # BD no creada: el llamador avisara en vez de exito falso
         if ($projectType -eq 'laravel') {
             $envFile = Join-Path $projectDir ".env"
             Set-EnvVar $envFile "DB_CONNECTION" "mysql"
@@ -592,7 +724,7 @@ function New-ProjectDb($dbname, $projectDir, $projectType) {
             Set-EnvVar $envFile "DB_PORT" "3306"
             Set-EnvVar $envFile "DB_DATABASE" $dbname
             Set-EnvVar $envFile "DB_USERNAME" "root"
-            Set-EnvVar $envFile "DB_PASSWORD" ""
+            Set-EnvVar $envFile "DB_PASSWORD" $rootPass
         }
         return $dbname
     } catch { return $null }
@@ -623,7 +755,7 @@ function Run-Job($id, $job) {
     $ok = $true; $err = ""
     try {
         switch ($type) {
-            "blank"     { New-Item -ItemType Directory -Force -Path $dir | Out-Null; Set-Content (Join-Path $dir "index.php") "<?php`r`nphpinfo();" -Encoding utf8 }
+            "blank"     { New-Item -ItemType Directory -Force -Path $dir | Out-Null; Write-Utf8NoBom (Join-Path $dir "index.php") "<?php`r`nphpinfo();`r`n" }
             "laravel"   { & $phpExe $composer create-project laravel/laravel "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
             "symfony"   { & $phpExe $composer create-project symfony/skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
             "slim"      { & $phpExe $composer create-project slim/slim-skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
@@ -730,6 +862,11 @@ function Run-Job($id, $job) {
             Set-PhpInis | Out-Null
             Regenerate-Vhosts
             if (Test-HttpdConfig) { Restart-Apache }
+            # Proyecto nuevo = dominio nuevo: sin esto el hosts de Windows se queda
+            # desactualizado hasta que alguien pulse "Sincronizar dominios" a mano
+            # (el mismo mecanismo que usa el panel via lua_hosts(), un archivo-senal
+            # que este mismo bucle de watch recoge en su siguiente vuelta).
+            Set-Content -Path (Join-Path $TmpDir "hosts.flag") -Value ([string](Get-Date).Ticks) -Encoding ascii
             $dbNote = ""
             if ($withdb -and $type -ne 'git') {
                 $dbname = ($name -replace '[^a-zA-Z0-9_]','_')
@@ -768,13 +905,21 @@ function Update-Hosts {
     $entries = @("127.0.0.1 localhost", "127.0.0.1 localhost.$tld", "127.0.0.1 $tld")
     foreach ($p in $cfg.sites.PSObject.Properties.Name) { $dom = Get-SiteDomain $cfg $p; $entries += "127.0.0.1 $dom www.$dom" }
     $content = Get-Content $HostsFile -ErrorAction SilentlyContinue
-    $kept = @(); $inside = $false
+    # Recolectar las lineas del usuario (fuera de nuestro bloque) SIN perder ninguna si el
+    # marcador END falta (crash a mitad de escritura, o borrado a mano dejando solo BEGIN):
+    # bufferizamos lo que hay dentro del bloque y, si nunca vemos END, lo devolvemos a $kept.
+    # Antes, un bloque sin cerrar marcaba "dentro" el resto del archivo y descartaba todas
+    # las entradas manuales del usuario a partir de ahi.
+    $kept = @(); $block = @(); $inside = $false; $sawEnd = $false
     foreach ($l in $content) {
         if ($l -eq $HostsBegin) { $inside = $true; continue }
-        if ($l -eq $HostsEnd)   { $inside = $false; continue }
-        if (-not $inside) { $kept += $l }
+        if ($l -eq $HostsEnd)   { $inside = $false; $sawEnd = $true; continue }
+        if ($inside) { $block += $l } else { $kept += $l }
     }
-    Set-Content -Path $HostsFile -Value (@($kept) + $HostsBegin + $entries + $HostsEnd) -Encoding ascii
+    if ($inside -and -not $sawEnd) { $kept += $block }   # bloque sin cerrar: no perder al usuario
+    # UTF-8 SIN BOM: no corromper lineas no-ASCII ajenas (IDN, comentarios con acentos) que
+    # -Encoding ascii convertia en '?'; y sin BOM para no confundir al parser de hosts.
+    Write-Utf8NoBom $HostsFile (@($kept) + $HostsBegin + $entries + $HostsEnd)
     ipconfig /flushdns | Out-Null
 }
 
@@ -787,10 +932,12 @@ function Cmd-AddSite($name, $php) {
     if (-not $php) { $php = $cfg.defaultPhp }
     $av = Get-PhpVersions
     if ($av -and ($av -notcontains $php)) { Err "PHP $php no instalado. Disponibles: $($av -join ', ')"; return }
+    $clash = Get-DomainClash $cfg "$name.$(Get-Tld)" $name
+    if ($clash) { Err "El dominio $name.$(Get-Tld) ya lo usa el proyecto '$clash'."; return }
     $dir = Join-Path $Www $name
     if (-not (Test-Path $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        Set-Content -Path (Join-Path $dir "index.php") -Value "<?php`r`nphpinfo();`r`n" -Encoding utf8
+        Write-Utf8NoBom (Join-Path $dir "index.php") "<?php`r`nphpinfo();`r`n"
         Ok "Carpeta creada: www\$name (con index.php)"
     }
     if (-not ($cfg.sites.PSObject.Properties.Name -contains $name)) { $cfg.sites | Add-Member -NotePropertyName $name -NotePropertyValue ([pscustomobject]@{ php = $php }) -Force }
@@ -805,12 +952,19 @@ function Cmd-AddSite($name, $php) {
 function Cmd-AddExternal($name, $path, $domain, $php) {
     if (-not $name -or -not $path) { Err "Uso: .\lua.ps1 add-external <nombre> <ruta> [dominio] [version-php]"; return }
     if ($name -notmatch '^[a-z0-9][a-z0-9_-]{0,40}$') { Err "Nombre no valido (minusculas, numeros, - o _)."; return }
-    if (-not (Test-Path $path)) { Err "La ruta no existe: $path"; return }
+    # Validar el dominio con la misma regla que el panel (valid_domain): el CLI no lo hacia
+    # y un dominio con espacios/acentos generaba un vhost invalido que tumbaba TODO Apache.
+    if ($domain -and $domain -notmatch '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$') { Err "Dominio no valido (ej.: portal.ersm.test)."; return }
+    # -LiteralPath: sin el, una ruta con corchetes (app[dev]) se interpreta como comodin.
+    if (-not (Test-Path -LiteralPath $path)) { Err "La ruta no existe: $path"; return }
     $cfg = Get-Config
     if (-not $php) { $php = $cfg.defaultPhp }
     $av = Get-PhpVersions
     if ($av -and ($av -notcontains $php)) { Err "PHP $php no instalado. Disponibles: $($av -join ', ')"; return }
-    $full = (Resolve-Path $path).Path
+    $clashDom = if ($domain) { $domain } else { "$name.$(Get-Tld)" }
+    $clash = Get-DomainClash $cfg $clashDom $name
+    if ($clash) { Err "El dominio $clashDom ya lo usa el proyecto '$clash'."; return }
+    $full = (Resolve-Path -LiteralPath $path).Path
     $obj = [pscustomobject]@{ php = $php; path = (Fwd $full) }
     if ($domain) { $obj | Add-Member -NotePropertyName domain -NotePropertyValue $domain -Force }
     if ($cfg.sites.PSObject.Properties.Name -contains $name) { $cfg.sites.PSObject.Properties.Remove($name) }
@@ -872,7 +1026,13 @@ function Cmd-HttpsSetup {
     Info "Instalando CA local de confianza (mkcert -install)..."
     & $Mkcert -install
     Info "Generando certificado para *.$tld ..."
+    # Borrar el cert anterior ANTES de regenerar: si mkcert falla, no debe quedar en disco
+    # un cert viejo (p.ej. del TLD anterior tras cambiar de dominio) que el guard Test-Path
+    # daria por bueno, dejando HTTPS "activo" con un certificado que no casa -> aviso de
+    # certificado en el navegador mientras el panel dice "activado".
+    Remove-Item $SslCert,$SslKey -Force -ErrorAction SilentlyContinue
     & $Mkcert -cert-file "$SslCert" -key-file "$SslKey" "*.$tld" "$tld" "localhost" "127.0.0.1" "::1"
+    if ($LASTEXITCODE -ne 0) { Err "mkcert fallo (codigo $LASTEXITCODE); HTTPS no activado."; $ErrorActionPreference=$prev; return }
     $ErrorActionPreference = $prev
     if ((Test-Path $SslCert) -and (Test-Path $SslKey)) {
         Set-Content -Path $HttpsFlag -Value "1" -Encoding ascii

@@ -6,6 +6,11 @@
 // ============================================================
 error_reporting(E_ALL & ~E_DEPRECATED & ~E_NOTICE);
 
+// Sonda de salud: si esta pagina responde, Apache esta arriba. La usan las recargas tras
+// una accion que reinicia Apache, para no navegar mientras Apache aun esta caido (lo que
+// mostraba "connection refused"). Debe ir lo primero, sin dependencias.
+if (isset($_GET['ping'])) { header('Content-Type: text/plain; charset=utf-8'); echo 'ok'; exit; }
+
 $ROOT     = dirname(__DIR__, 2);
 $CFG_FILE = $ROOT . '/config/sites.json';
 $PHP_BASE = $ROOT . '/bin/php';
@@ -43,8 +48,73 @@ function run_presets_load($root){
     return is_array($d) ? array_values(array_filter($d, 'is_string')) : [];
 }
 function valid_name($n){ return (bool)preg_match('/^[a-z0-9][a-z0-9_-]{0,40}$/', $n); }
+// Nombre de carpeta real (puede tener mayusculas/espacios/unicode, a diferencia de
+// valid_name) que existe literalmente como hijo directo de www\. Se usa para validar
+// $_POST['name'] en acciones sobre carpetas sin registrar sin exigir que el nombre de
+// carpeta sea ademas un slug valido (evita path traversal comprobando contra scandir,
+// no con regex: cualquier entrada de scandir($www) es por definicion un hijo directo).
+function is_www_child_dir($www, $name){
+    // Rechazar traversal ANTES de tocar disco: scandir($www) SIEMPRE incluye '.' y '..',
+    // asi que comprobar contra scandir NO basta (name='..' pasaria y $www/.. es la raiz
+    // del stack). Rechazamos '.'/'..' y cualquier separador de ruta explicitamente.
+    if ($name === '' || $name === '.' || $name === '..' || strpbrk($name, "/\\") !== false) return false;
+    if (!is_dir("$www/$name")) return false;
+    $entries = @scandir($www);
+    return $entries !== false && in_array($name, $entries, true);
+}
+// Convierte un nombre de carpeta cualquiera en una clave valida para sites.json
+// (minusculas, solo [a-z0-9_-]), sin colisionar con claves ya existentes.
+function slug_from_name($name, $sites){
+    $s = strtolower($name);
+    $s = preg_replace('/[^a-z0-9_-]+/', '-', $s);
+    $s = trim(preg_replace('/-+/', '-', $s), '-_');
+    if ($s === '' || !preg_match('/^[a-z0-9]/', $s)) { $s = 'p-'.$s; }
+    $s = substr($s, 0, 41);
+    $key = $s; $i = 2;
+    while (isset($sites[$key])) { $suffix = '-'.$i; $key = substr($s, 0, 41-strlen($suffix)).$suffix; $i++; }
+    return $key;
+}
+// Carpetas www\<x> que ya estan en uso por algun sitio registrado (por clave directa
+// o por 'path'), indexadas por ruta real. Evita que una carpeta adoptada con una clave
+// distinta a su nombre real (ver slug_from_name) siga apareciendo como "sin registrar".
+function registered_dirs($www, $sites){
+    $used = [];
+    foreach ($sites as $sName=>$sInfo) {
+        $r = realpath(project_dir($www, $sInfo, $sName));
+        if ($r !== false) $used[$r] = true;
+    }
+    return $used;
+}
 function valid_domain($d){ return (bool)preg_match('/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i', $d); }
 function e($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+// Dominio efectivo de un sitio: su 'domain' explicito o '<clave>.<tld>' por defecto.
+function effective_domain($info, $key, $tld){
+    if (is_array($info) && !empty($info['domain'])) return strtolower($info['domain']);
+    return strtolower($key.'.'.$tld);
+}
+// ¿Algun OTRO sitio (distinto de $exceptKey) ya usa este dominio, o el alias www.?
+// Devuelve la clave del sitio en conflicto, o null. Evita dos vhosts con el mismo
+// ServerName (Apache no da error: sirve el que carga primero por orden de fichero, y el
+// otro proyecto queda muerto en silencio).
+function domain_in_use($sites, $domain, $exceptKey, $tld){
+    $domain = strtolower($domain);
+    foreach ($sites as $k=>$info){
+        if ($k === $exceptKey) continue;
+        $eff = effective_domain($info, $k, $tld);
+        if ($eff === $domain || ('www.'.$eff) === $domain || $eff === ('www.'.$domain)) return $k;
+    }
+    return null;
+}
+// ¿Hay algo escuchando en 127.0.0.1:$port? Sondeo de socket corto (200 ms), SIN lanzar
+// subproceso (mod_fcgid + shell_exec bajo Apache en Windows puede colgar el worker, ver
+// CLAUDE.md). Para derivar el estado REAL de MySQL/PostgreSQL/Mailpit, no solo el flag.
+function svc_alive($port){ $c=@fsockopen('127.0.0.1',(int)$port,$errno,$errstr,0.2); if($c){ fclose($c); return true; } return false; }
+// Estado de un servicio a partir del flag (deseado) + proceso real: tri-estado. Un flag
+// huerfano (activado pero el proceso caido/watcher parado) ya NO miente diciendo ACTIVO.
+function svc_status($on, $port){
+    if (!$on) return ['err','INACTIVO'];
+    return svc_alive($port) ? ['ok','ACTIVO'] : ['warn','ACTIVÁNDOSE…'];
+}
 // Carpeta raiz de un proyecto: su 'path' (ruta externa) si esta definido, si no www\<name>.
 function project_dir($WWW, $info, $name){
     if (is_array($info) && !empty($info['path']) && is_dir($info['path'])) return $info['path'];
@@ -94,6 +164,21 @@ function git_exec($dir, $args){
     fclose($pipes[2]);
     $code = proc_close($proc);
     return $code===0 ? $out : null;
+}
+// Como git_exec pero conserva stderr y el exito/fallo por separado, para poder explicar
+// POR QUE ha fallado un paso (usado por "Conectar repositorio Git": init/commit/remote
+// necesitan feedback, no solo null-si-algo-fue-mal).
+function git_exec_verbose($dir, $args){
+    $bin = git_binary();
+    if ($bin === false) return [false, '', 'git no está disponible en esta máquina.'];
+    $descriptors = [1=>['pipe','w'], 2=>['pipe','w']];
+    $safe = '-c '.escapeshellarg('safe.directory='.$dir);
+    $proc = @proc_open($bin.' '.$safe.' '.$args, $descriptors, $pipes, $dir);
+    if (!is_resource($proc)) return [false, '', 'No se pudo ejecutar git.'];
+    $out = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $code = proc_close($proc);
+    return [$code === 0, $out, trim($err)];
 }
 // null = no es un repo git (o no se encontro git.exe); array = branch/dirty/commits/remote
 function git_info($dir){
@@ -157,17 +242,63 @@ function tree_node_html($abs, $rel, $lazyMode, &$count, $cap){
 // copiadas de otra maquina, etc.). No se publican solas: hay que integrarlas.
 function unregistered_projects($www, $sites){
     $out=[];
+    $used = registered_dirs($www, $sites);
     if (is_dir($www)) {
         foreach (scandir($www) as $d) {
             if ($d==='.'||$d==='..') continue;
-            if (!is_dir("$www/$d")) continue;
+            $full = "$www/$d";
+            if (!is_dir($full)) continue;
             if (isset($sites[$d])) continue;
-            if (!valid_name($d)) continue;
+            $r = realpath($full);
+            if ($r !== false && isset($used[$r])) continue;
             $out[]=$d;
         }
     }
     sort($out);
     return $out;
+}
+// Proyectos registrados en sites.json cuya carpeta ya no existe (borrada a mano
+// desde fuera del panel, p.ej. el Explorador de Windows). El panel nunca borra
+// solo un sitio de sites.json: hace falta "Sincronizar proyectos".
+function missing_projects($www, $sites){
+    $out = [];
+    // 'path' fuera de www\ = proyecto EXTERNO de verdad (disco USB/red que puede estar
+    // desmontado): no auto-desregistrar por carpeta ausente, se gestiona a mano. 'path'
+    // DENTRO de www\ (caso de un proyecto adoptado con clave normalizada en minusculas,
+    // p.ej. "arquitecturaTgin" -> clave "arquitecturatgin" + path a la carpeta real) no es
+    // "externo": vive en el mismo disco que todo lo demas, asi que SI se comprueba si su
+    // carpeta desaparecio. Comparacion por texto (no realpath): si la carpeta ya no existe,
+    // realpath() devolveria false para ambos casos y no podriamos distinguirlos.
+    $wwwNorm = rtrim(str_replace('\\','/',$www),'/').'/';
+    foreach ($sites as $name=>$info) {
+        $path = (is_array($info) && !empty($info['path'])) ? $info['path'] : null;
+        if ($path !== null) {
+            $pathNorm = str_replace('\\','/',$path);
+            if (stripos($pathNorm, $wwwNorm) !== 0) continue; // externo de verdad: se salta
+            if (!is_dir($path)) $out[] = $name;
+            continue;
+        }
+        if (!is_dir($www.'/'.$name)) $out[] = $name;
+    }
+    sort($out);
+    return $out;
+}
+// Busca la clave real de sites.json para un nombre de proyecto que puede venir de
+// un formulario/URL con mayusculas distintas (p.ej. "arquitecturaTgin", el nombre
+// real de la carpeta en Windows, cuando la clave registrada es "arquitecturatgin"
+// tras normalizar via slug_from_name). isset($sites[$name]) es sensible a mayusculas
+// y falla en silencio con "Proyecto no valido" ante el minimo desajuste de casing o
+// espacios; esto lo resuelve intentando primero la coincidencia exacta y si no,
+// una comparacion insensible a mayusculas/minusculas y a espacios sueltos.
+function resolve_site_key($sites, $name){
+    $name = trim((string)$name);
+    if ($name === '') return null;
+    if (isset($sites[$name])) return $name;
+    $lower = strtolower($name);
+    foreach ($sites as $key=>$info) {
+        if (strtolower($key) === $lower) return $key;
+    }
+    return null;
 }
 // Detecta el framework de un proyecto por sus archivos caracteristicos. Se llama solo
 // al integrar (no en cada carga): el resultado se guarda en sites.json como 'type'.
@@ -176,6 +307,47 @@ function unregistered_projects($www, $sites){
 // tambien front-ends JS o apps Python en sus carpetas y viene bien identificarlos.
 // Orden: PHP -> Python -> JS/Node. En JS se comprueba primero lo mas especifico
 // (Angular/Next/Nuxt) antes que su base (React/Vue), y Vite/Node como ultimo recurso.
+// Parser pragmatico de constraints de Composer para PHP (^8.1, >=7.4, >=7.4 <8.0, 8.1.*,
+// ~8.1, 8.1.0, "8.1.0 || 8.2.0"...). No es un resolver semver completo: si no reconoce la
+// constraint, devuelve null (se usa la version por defecto del panel, sin romper nada).
+// Elige, de entre las versiones instaladas, la MAS ALTA que cumple la constraint.
+function pick_php_for_constraint($constraint, $installedVers){
+    $min = null; $max = null;
+    foreach (preg_split('/[|,\s]+/', trim((string)$constraint)) as $part) {
+        if ($part === '' || $part === '||') continue;
+        if (!preg_match('/^(\^|~|>=|>|<=|<)?\s*(\d+)(?:\.(\d+))?/', $part, $m)) continue;
+        $op = $m[1] ?? ''; $ver = $m[2].'.'.($m[3] ?? '0');
+        if ($op === '<' || $op === '<=') { $max = $ver; } else { $min = $ver; }
+    }
+    if ($min === null) return null;
+    $candidates = array_values(array_filter($installedVers, function($v) use ($min, $max) {
+        if (version_compare($v, $min, '<')) return false;
+        if ($max !== null && version_compare($v, $max, '>=')) return false;
+        return true;
+    }));
+    if (!$candidates) return null;
+    usort($candidates, fn($a,$b)=>version_compare($b,$a));
+    return $candidates[0];
+}
+// Adivina la version de PHP de un proyecto (para preseleccionarla al integrarlo) a partir
+// de .php-version (version exacta) o de composer.json: config.platform.php (exacta, la que
+// Composer forzaria) o require.php (rango, ver pick_php_for_constraint). Devuelve una de las
+// versiones REALMENTE INSTALADAS en $installedVers, o null si no hay pista o ninguna sirve.
+function detect_project_php($dir, $installedVers){
+    $pvFile = "$dir/.php-version";
+    if (is_file($pvFile)) {
+        $v = trim((string)@file_get_contents($pvFile));
+        if (preg_match('/^(\d+\.\d+)/', $v, $m) && in_array($m[1], $installedVers, true)) return $m[1];
+    }
+    if (!is_file("$dir/composer.json")) return null;
+    $data = json_decode((string)@file_get_contents("$dir/composer.json"), true);
+    if (!is_array($data)) return null;
+    $platform = $data['config']['platform']['php'] ?? null;
+    if (is_string($platform) && preg_match('/^(\d+\.\d+)/', $platform, $m) && in_array($m[1], $installedVers, true)) return $m[1];
+    $constraint = $data['require']['php'] ?? null;
+    if (!is_string($constraint) || $constraint === '') return null;
+    return pick_php_for_constraint($constraint, $installedVers);
+}
 function detect_project_type($dir){
     // --- PHP ---
     if (is_file("$dir/wp-load.php") || is_file("$dir/wp-config.php") || is_file("$dir/wp-config-sample.php")) return 'wordpress';
@@ -233,6 +405,124 @@ function project_type_label($type){
     ];
     return $map[$type] ?? null;
 }
+// Icono SVG monolinea (stroke, sin marcas/logos exactos) para el badge de tipo de
+// proyecto: usa currentColor para heredar el color ya definido en .typetag-<tipo>.
+// Metafora reconocible por ecosistema en vez de un logo pixel-perfect (evita depender de
+// reproducir marcas registradas de memoria).
+function project_type_icon($type){
+    $svg = [
+        'wordpress' => '<circle cx="12" cy="12" r="9"/><path d="M5 9.5l2.3 6.5 2-5 2 5 2.3-6.5"/>',
+        'laravel'   => '<path d="M4 19V8l8-5 8 5v11"/><path d="M4 8l8 5 8-5"/><path d="M12 13v6"/>',
+        'symfony'   => '<path d="M12 3l7 3.5v5.5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6.5z"/>',
+        'slim'      => '<path d="M20 4c-6.5 0-15 4-17 13 3-2 6.5-2 9-.7C11 14 12 11 12 11c-3 1-5.5 0-6.8-1.7C8 8 13 5 20 4z"/>',
+        'angular'   => '<path d="M12 3l8 3-1.2 10L12 21l-6.8-5L4 6z"/><path d="M12 6.5L8 16m4-9.5L16 16M9.3 13h5.4"/>',
+        'nextjs'    => '<circle cx="12" cy="12" r="9"/><path d="M9 8.5v7M9 8.5l6.5 7.5M15.5 8.5v5"/>',
+        'nuxt'      => '<path d="M4 19h5.5L14 8.5 18.5 19H21"/><path d="M9.5 19L14 10l1.7 3.8"/>',
+        'svelte'    => '<path d="M17 6.5c-2-2-5-2-7 0l-4 4c-1.7 1.7-1.7 4.5 0 6.2M7 17.5c2 2 5 2 7 0l4-4c1.7-1.7 1.7-4.5 0-6.2"/><path d="M8.3 15.7l7.4-7.4"/>',
+        'astro'     => '<path d="M12 3c2.5 4 4 9.5 4 13.5a4 4 0 0 1-8 0C8 12.5 9.5 7 12 3z"/><path d="M9.5 15.5h5"/><circle cx="12" cy="19.5" r="1"/>',
+        'vue'       => '<path d="M3 5h4l5 9 5-9h4L12 20z"/><path d="M8.5 5h3L12 8l.5-3h3L12 12z"/>',
+        'react'     => '<circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><ellipse cx="12" cy="12" rx="9" ry="4"/><ellipse cx="12" cy="12" rx="9" ry="4" transform="rotate(60 12 12)"/><ellipse cx="12" cy="12" rx="9" ry="4" transform="rotate(120 12 12)"/>',
+        'vite'      => '<path d="M13 3L5 13h5.5L10 21l8.5-11H13z"/>',
+        'node'      => '<path d="M12 3l7.5 4.3v9.4L12 21l-7.5-4.3V7.3z"/><path d="M9 12h6M12 9v6"/>',
+        'django'    => '<path d="M6 4h6a5 5 0 0 1 5 5v11H11a5 5 0 0 1-5-5z"/><path d="M6 9h5"/>',
+        'flask'     => '<path d="M10 3h4M10.5 3v6L5.5 18a2 2 0 0 0 1.8 3h9.4a2 2 0 0 0 1.8-3L13.5 9V3"/><path d="M8 15h8"/>',
+        'fastapi'   => '<path d="M6 5l6 7-6 7"/><path d="M13 5l6 7-6 7"/>',
+        'python'    => '<path d="M12 3c-3 0-4 1-4 3v2h4"/><path d="M9 8H6a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h2"/><path d="M12 21c3 0 4-1 4-3v-2h-4"/><path d="M15 16h3a2 2 0 0 0 2-2V11a2 2 0 0 0-2-2h-2"/><circle cx="9.5" cy="6" r=".6" fill="currentColor" stroke="none"/><circle cx="14.5" cy="18" r=".6" fill="currentColor" stroke="none"/>',
+    ];
+    if (!isset($svg[$type])) return '';
+    return '<svg class="typeicon" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'.$svg[$type].'</svg>';
+}
+// Tarjeta de un proyecto (usada tanto en "Destacados" como en "Proyectos", para no
+// duplicar el HTML entre las dos secciones). Usa globales ya establecidas en la seccion
+// GET (render): $WWW, $ROOT, $tld, $vers, $termOn.
+function render_site_card($name, $info){
+    global $WWW, $ROOT, $tld, $vers, $termOn;
+    $ver = is_array($info)?($info['php']??'?'):$info;
+    $dom = (is_array($info) && !empty($info['domain'])) ? $info['domain'] : $name.'.'.$tld;
+    $pdir = project_dir($WWW, $info, $name);
+    $extPath = (is_array($info) && !empty($info['path'])) ? $info['path'] : null;
+    $locked = project_locked($pdir);
+    $pinned = is_array($info) && !empty($info['pinned']);
+    $hasCover = (bool)cover_path($ROOT,$name);
+    $hasComposer = is_file($pdir.'/composer.json');
+    $hasNpm = is_file($pdir.'/package.json');
+    $pType = is_array($info) ? ($info['type'] ?? null) : null;
+    $pTypeLabel = project_type_label($pType);
+    ?>
+          <div class="sitecard<?= $locked?' is-locked':'' ?><?= $pinned?' is-pinned':'' ?>">
+            <form method="post" enctype="multipart/form-data" class="coverform" id="cover-<?= e($name) ?>">
+              <input type="hidden" name="action" value="cover">
+              <input type="hidden" name="name" value="<?= e($name) ?>">
+              <input type="file" name="img" accept="image/*" hidden onchange="this.form.requestSubmit()">
+              <button type="button" class="cover<?= $hasCover?' has':' empty' ?><?= (!$hasCover && $pType) ? ' type-'.e($pType) : '' ?>" title="<?= $hasCover?'Cambiar carátula':'Subir carátula' ?>"
+                      onclick="this.parentNode.querySelector('input[type=file]').click()"
+                      <?= $hasCover?'style="background-image:url(\'?cover='.e(rawurlencode($name)).'&t='.(cover_path($ROOT,$name)?filemtime(cover_path($ROOT,$name)):0).'\')"':'' ?>>
+                <span class="cover-hint">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
+                  <?= $hasCover?'Cambiar':'Carátula' ?>
+                </span>
+              </button>
+            </form>
+            <?php if ($hasCover): ?>
+              <form method="post" class="coverdel"><input type="hidden" name="action" value="cover_remove"><input type="hidden" name="name" value="<?= e($name) ?>"><button type="submit" class="coverdelbtn" title="Quitar carátula">&times;</button></form>
+            <?php endif; ?>
+            <form method="post" class="pinform">
+              <input type="hidden" name="action" value="<?= $pinned?'unpin':'pin' ?>">
+              <input type="hidden" name="name" value="<?= e($name) ?>">
+              <button type="submit" class="pinbtn<?= $pinned?' is-pinned':'' ?>" title="<?= $pinned?'Quitar de Destacados':'Añadir a Destacados' ?>" aria-label="<?= $pinned?'Quitar de Destacados':'Añadir a Destacados' ?>">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="<?= $pinned?'currentColor':'none' ?>" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>
+              </button>
+            </form>
+            <div class="cardbody">
+              <div class="name" title="<?= e($name) ?>"><?= e($name) ?></div>
+              <?php if ($pTypeLabel || $extPath): ?>
+              <div class="tagrow">
+                <?php if($pTypeLabel): ?><span class="typetag typetag-<?= e($pType) ?>"><?= project_type_icon($pType) ?><?= e($pTypeLabel) ?></span><?php endif; ?>
+                <?php if($extPath): ?><span class="exttag" title="Proyecto externo: <?= e($extPath) ?>">&#8599; externo</span><?php endif; ?>
+              </div>
+              <?php endif; ?>
+              <a class="url" href="http://<?= e($dom) ?>" target="_blank"><?= e($dom) ?> &#8599;</a>
+            </div>
+            <div class="cardfooter">
+              <form method="post" class="phpselform">
+                <input type="hidden" name="action" value="switch">
+                <input type="hidden" name="name" value="<?= e($name) ?>">
+                <select name="php" class="phpsel" onchange="this.form.dataset.loadingText='Cambiando a PHP '+this.value+'…';this.form.requestSubmit()">
+                  <?php foreach ($vers as $v): ?>
+                    <option value="<?= e($v) ?>" <?= $v===$ver?'selected':'' ?>>PHP <?= e($v) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </form>
+              <div class="cardactions">
+                <a class="lockbtn" href="?tab=proyecto&name=<?= e(rawurlencode($name)) ?>" title="Ver detalles del proyecto" aria-label="Ver detalles del proyecto">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 1.3-.7 1.9-1.4 2.4-.6.5-1.1.9-1.1 1.6"/><line x1="12" y1="17" x2="12" y2="17.01"/></svg>
+                </a>
+                <?php if ($termOn && ($hasComposer || $hasNpm)): ?>
+                  <button type="button" class="runbtn lua-runbtn" title="Ejecutar Composer/NPM" aria-label="Ejecutar Composer/NPM" data-name="<?= e($name) ?>" data-path="<?= e(term_win($pdir)) ?>" data-composer="<?= $hasComposer?'1':'0' ?>" data-npm="<?= $hasNpm?'1':'0' ?>" data-php="<?= e($ver) ?>">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  </button>
+                <?php endif; ?>
+                <form method="post" class="lockform">
+                  <input type="hidden" name="action" value="<?= $locked?'unlock':'lock' ?>">
+                  <input type="hidden" name="name" value="<?= e($name) ?>">
+                  <button type="submit" class="lockbtn" title="<?= $locked?'Desbloquear (permitirá eliminar el proyecto)':'Bloquear (impide eliminar el proyecto)' ?>" aria-label="<?= $locked?'Desbloquear':'Bloquear' ?>">
+                    <?php if ($locked): ?>
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+                    <?php else: ?>
+                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>
+                    <?php endif; ?>
+                  </button>
+                </form>
+                <?php if (!$locked): ?>
+                  <button type="button" class="trashbtn" title="Eliminar" aria-label="Eliminar" onclick="luaAskDelete('<?= e($name) ?>')">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                  </button>
+                <?php endif; ?>
+              </div>
+            </div>
+          </div>
+    <?php
+}
 // Borrado recursivo de una carpeta sin registrar (no hay sites.json que "desregistrar": es on/off).
 function rrmdir($dir){
     if (!is_dir($dir)) return true;
@@ -257,6 +547,24 @@ function valid_mysql_host($h){ return in_array($h, ['127.0.0.1','localhost','%']
 function mysql_root_pass($root){
     $f = $root.'/config/mysql_root.pass';
     return is_file($f) ? trim((string)@file_get_contents($f)) : '';
+}
+// Sincroniza el config.inc.php de phpMyAdmin (auth_type=config) con la contraseña de root.
+// Parchea IN SITU las dos líneas (no regenera: perdería el blowfish_secret aleatorio). Sin
+// esto, tras fijar contraseña phpMyAdmin seguía enviando '' y MariaDB lo rechazaba. No-op
+// si phpMyAdmin no está instalado.
+function pma_sync_root_pass($root, $pass){
+    $f = $root.'/tools/phpmyadmin/config.inc.php';
+    if (!is_file($f)) return;
+    $c = @file_get_contents($f);
+    if ($c === false) return;
+    $lit   = "'".addcslashes($pass, "\\'")."'";
+    $allow = $pass === '' ? 'true' : 'false';
+    // preg_replace_callback: el reemplazo se devuelve literal (no se parsean $1/\ del valor).
+    $c = preg_replace_callback("/(\\\$cfg\\['Servers'\\]\\[\\\$i\\]\\['password'\\]\\s*=\\s*)[^\\r\\n]*;/",
+            function($m) use ($lit){ return $m[1].$lit.';'; }, $c, 1);
+    $c = preg_replace_callback("/(\\\$cfg\\['Servers'\\]\\[\\\$i\\]\\['AllowNoPassword'\\]\\s*=\\s*)[^\\r\\n]*;/",
+            function($m) use ($allow){ return $m[1].$allow.';'; }, $c, 1);
+    @file_put_contents($f, $c);
 }
 function mysql_pdo(){
     global $ROOT;
@@ -612,6 +920,11 @@ if (isset($_GET['cover'])) {
     if ($f) {
         header('Content-Type: '.cover_mime($f));
         header('Cache-Control: no-cache');
+        // Una caratula puede ser un SVG con <script>/on*: sin esto, navegar directo a
+        // ?cover=... ejecutaria ese JS en el origen del panel (XSS almacenado). 'sandbox'
+        // (sin allow-scripts) bloquea la ejecucion pero preserva el render como <img>.
+        header('X-Content-Type-Options: nosniff');
+        header("Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:");
         readfile($f); exit;
     }
     http_response_code(404); exit;
@@ -626,6 +939,8 @@ if (isset($_GET['brandlogo'])) {
     if ($f) {
         header('Content-Type: '.cover_mime($f));
         header('Cache-Control: no-cache');
+        header('X-Content-Type-Options: nosniff');
+        header("Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:");
         readfile($f); exit;
     }
     http_response_code(404); exit;
@@ -668,7 +983,9 @@ if (($_GET['ajax'] ?? '') === 'tree') {
     $tRel  = (string)($_GET['rel'] ?? '');
     $tCfg   = read_json($CFG_FILE) ?: ['sites'=>[]];
     $tSites = $tCfg['sites'] ?? [];
-    if (!valid_name($tName) || !isset($tSites[$tName])) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $tKey = resolve_site_key($tSites, $tName);
+    if ($tKey === null) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $tName = $tKey;
     $tBase = realpath(project_dir($WWW, $tSites[$tName], $tName));
     if ($tBase === false) { echo json_encode(['error'=>'No se encontró el proyecto.']); exit; }
     $tTarget = realpath($tBase.'/'.$tRel);
@@ -688,7 +1005,9 @@ if (($_GET['ajax'] ?? '') === 'file_read') {
     $fRel  = (string)($_GET['rel'] ?? '');
     $fCfg   = read_json($CFG_FILE) ?: ['sites'=>[]];
     $fSites = $fCfg['sites'] ?? [];
-    if (!valid_name($fName) || !isset($fSites[$fName])) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $fKey = resolve_site_key($fSites, $fName);
+    if ($fKey === null) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $fName = $fKey;
     $fBase = realpath(project_dir($WWW, $fSites[$fName], $fName));
     if ($fBase === false) { echo json_encode(['error'=>'No se encontró el proyecto.']); exit; }
     $fTarget = realpath($fBase.'/'.$fRel);
@@ -700,7 +1019,19 @@ if (($_GET['ajax'] ?? '') === 'file_read') {
     $fData = @file_get_contents($fTarget);
     if ($fData === false) { echo json_encode(['error'=>'No se pudo leer el archivo.']); exit; }
     if (strpos($fData, "\0") !== false) { echo json_encode(['error'=>'Parece un archivo binario: no se puede editar como texto.']); exit; }
-    echo json_encode(['content'=>$fData]);
+    // El editor trabaja en UTF-8. Si el archivo no es UTF-8 valido (proyectos PHP legacy en
+    // Windows-1252/ISO-8859-1, tipicos en apps españolas antiguas), lo convertimos a UTF-8
+    // para editar y recordamos la codificacion original en 'enc' para reescribirlo igual al
+    // guardar (round-trip). Antes json_encode devolvia false ante bytes no-UTF8 -> cuerpo
+    // vacio -> el editor mostraba un falso "error de red" y NINGUN archivo legacy se abria.
+    $enc = 'UTF-8';
+    if (!mb_check_encoding($fData, 'UTF-8')) {
+        $fData = mb_convert_encoding($fData, 'UTF-8', 'Windows-1252');
+        $enc = 'Windows-1252';
+    }
+    $payload = json_encode(['content'=>$fData, 'enc'=>$enc], JSON_INVALID_UTF8_SUBSTITUTE);
+    if ($payload === false) { echo json_encode(['error'=>'No se pudo codificar el contenido del archivo.']); exit; }
+    echo $payload;
     exit;
 }
 
@@ -710,9 +1041,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_
     $fName = (string)($_POST['name'] ?? '');
     $fRel  = (string)($_POST['rel'] ?? '');
     $fContent = (string)($_POST['content'] ?? '');
+    $fEnc  = (string)($_POST['enc'] ?? 'UTF-8');
     $fCfg   = read_json($CFG_FILE) ?: ['sites'=>[]];
     $fSites = $fCfg['sites'] ?? [];
-    if (!valid_name($fName) || !isset($fSites[$fName])) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $fKey = resolve_site_key($fSites, $fName);
+    if ($fKey === null) { echo json_encode(['error'=>'Proyecto no válido.']); exit; }
+    $fName = $fKey;
     $fBase = realpath(project_dir($WWW, $fSites[$fName], $fName));
     if ($fBase === false) { echo json_encode(['error'=>'No se encontró el proyecto.']); exit; }
     $fTarget = realpath($fBase.'/'.$fRel);
@@ -721,7 +1055,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_
     $fInside = $fTarget!==false && is_file($fTarget) && ($fTargetN===$fBaseN || strpos($fTargetN, $fBaseN.'/')===0);
     if (!$fInside) { echo json_encode(['error'=>'Ruta no válida.']); exit; }
     if (strlen($fContent) > 2*1024*1024) { echo json_encode(['error'=>'Contenido demasiado grande (>2 MB).']); exit; }
-    if (@file_put_contents($fTarget, $fContent) === false) { echo json_encode(['error'=>'No se pudo guardar el archivo (¿permisos?).']); exit; }
+    // Round-trip: si el archivo era Windows-1252 al abrirlo, se reescribe en Windows-1252
+    // (no convertimos su codificacion en silencio, que podria romper una app legacy que
+    // asume latin1). El editor devuelve el 'enc' que le dio file_read.
+    $toWrite = (strtoupper($fEnc) === 'WINDOWS-1252') ? mb_convert_encoding($fContent, 'Windows-1252', 'UTF-8') : $fContent;
+    if (@file_put_contents($fTarget, $toWrite) === false) { echo json_encode(['error'=>'No se pudo guardar el archivo (¿permisos?).']); exit; }
     echo json_encode(['ok'=>true]);
     exit;
 }
@@ -730,7 +1068,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_
 $__ta = $_REQUEST['action'] ?? '';
 if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
     header('Content-Type: application/json; charset=utf-8');
-    $reply = function($o){ echo json_encode($o); exit; };
+    // JSON_INVALID_UTF8_SUBSTITUTE: la salida de comandos puede traer bytes no-UTF8 (muchas
+    // herramientas de Windows escriben en OEM/ANSI pese al chcp 65001) o un carácter UTF-8
+    // multibyte cortado en el límite de lectura. Sin el flag, json_encode devuelve false ->
+    // cuerpo vacío -> el poll JS lo toma por "[error de red]" y abandona un comando que sigue vivo.
+    $reply = function($o){ echo json_encode($o, JSON_INVALID_UTF8_SUBSTITUTE); exit; };
 
     if (!term_enabled($ROOT)) { $reply(['error'=>'La terminal está desactivada. Actívala en Configuración del servidor.']); }
     $sid = $_REQUEST['sid'] ?? '';
@@ -811,6 +1153,22 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
             $fh = @fopen($outf,'rb');
             if ($fh) { if ($off>0) fseek($fh,$off); $data=stream_get_contents($fh); fclose($fh); }
         }
+        // Recortar del final una secuencia UTF-8 multibyte cortada en el límite de lectura:
+        // sus bytes se leerán completos en el próximo poll (no avanzamos $newoff sobre ellos),
+        // evitando un carácter de reemplazo basura en la costura. Los bytes ASCII (incl. la
+        // marca __LUA_DONE__) son de 1 byte, así que esto nunca toca la detección de fin.
+        $len = strlen($data); $hold = 0;
+        for ($i = $len - 1; $i >= 0 && $i >= $len - 3; $i--) {
+            $b = ord($data[$i]);
+            if (($b & 0xC0) === 0x80) { continue; } // 10xxxxxx: byte de continuación
+            if     (($b & 0xE0) === 0xC0) $need = 2;
+            elseif (($b & 0xF0) === 0xE0) $need = 3;
+            elseif (($b & 0xF8) === 0xF0) $need = 4;
+            else   $need = 1;                       // ASCII o líder inválido: nada que retener
+            if ($need > 1 && ($len - $i) < $need) { $hold = $len - $i; }
+            break;
+        }
+        if ($hold > 0) { $data = substr($data, 0, $len - $hold); }
         $newoff = $off + strlen($data);
         // ¿terminó? detectar la marca de fin
         $done=false; $code=null;
@@ -980,14 +1338,44 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         elseif ($path==='' || !is_dir($pathN)) { $msg='error:La ruta no existe o no es una carpeta: '.$path; }
         elseif ($domain!=='' && !valid_domain($domain)) { $msg='error:Dominio no válido (ej.: portal.ersm.test).'; }
         elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
+        elseif (($clash = domain_in_use($cfg['sites'], ($domain!==''?$domain:$name.'.'.($cfg['tld']??'lua.test')), null, $cfg['tld']??'lua.test')) !== null) { $msg='error:Ese dominio ya lo usa el proyecto "'.$clash.'".'; }
         else {
             $entry = ['php'=>$php, 'path'=>$pathN];
             if ($domain!=='') $entry['domain']=$domain;
-            $cfg['sites'][$name]=$entry; write_json($CFG_FILE,$cfg); lua_apply();
+            $cfg['sites'][$name]=$entry; write_json($CFG_FILE,$cfg); lua_apply(); lua_hosts();
             lock_project_dir($pathN); // proyecto externo ya existente: bloqueado por defecto
             $dom = $domain!=='' ? $domain : $name.'.'.($cfg['tld']??'lua.test');
             $hasPublic = is_dir($pathN.'/public');
-            $msg='applied:Proyecto externo "'.$name.'" registrado y bloqueado -> http://'.$dom.' [PHP '.$php.']'.($hasPublic?' (docroot: public/)':'').'. Si el dominio no abre, pulsa "Sincronizar dominios".';
+            $msg='applied:Proyecto externo "'.$name.'" registrado y bloqueado -> http://'.$dom.' [PHP '.$php.']'.($hasPublic?' (docroot: public/)':'').'. Sincronizando hosts (acepta el aviso de Windows/UAC).';
+        }
+    }
+    elseif ($action === 'set_domain') {
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $domain = strtolower(trim($_POST['domain'] ?? ''));
+        $tld = $cfg['tld'] ?? 'lua.test';
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
+        elseif ($domain !== '' && !valid_domain($domain)) { $msg = 'error:Dominio no válido (ej.: portal.'.$tld.').'; }
+        elseif ($domain !== '' && ($clash = domain_in_use($cfg['sites'], $domain, $siteKey, $tld)) !== null) { $msg = 'error:Ese dominio ya lo usa el proyecto "'.$clash.'".'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            if (!is_array($cfg['sites'][$name])) { $cfg['sites'][$name] = ['php'=>$cfg['sites'][$name]]; }
+            if ($domain === '') { unset($cfg['sites'][$name]['domain']); }
+            else { $cfg['sites'][$name]['domain'] = $domain; }
+            write_json($CFG_FILE, $cfg); lua_apply(); lua_hosts();
+            $shownDomain = $domain !== '' ? $domain : $name.'.'.$tld;
+            // El certificado HTTPS es un unico wildcard *.$tld, y un comodin cubre UNA sola
+            // etiqueta: cubre x.$tld pero NO x.y.$tld. Solo marcamos "cubierto" un dominio
+            // que sea exactamente una etiqueta bajo $tld (o vacio/= $tld). Antes bastaba con
+            // que terminara en .$tld, marcando por error subdominios de 2+ etiquetas.
+            $httpsOn = is_file($ROOT.'/config/https.on');
+            $suffix = '.'.$tld;
+            $endsTld = (strlen($domain) > strlen($suffix)) && (substr($domain, -strlen($suffix)) === $suffix);
+            $label = $endsTld ? substr($domain, 0, -strlen($suffix)) : '';
+            $coveredByWildcard = ($domain === '') || ($domain === $tld) || ($endsTld && $label !== '' && strpos($label, '.') === false);
+            $warn = ($httpsOn && !$coveredByWildcard) ? ' Aviso: con HTTPS activo, este dominio no cuelga de ".'.$tld.'" así que el certificado no lo cubrirá (saldrá aviso de certificado no válido en el navegador).' : '';
+            $msg = 'applied:Dominio de "'.$name.'" -> '.$shownDomain.'. Sincronizando hosts (acepta el aviso de Windows/UAC).'.$warn;
         }
     }
     elseif ($action === 'clearjobs') {
@@ -1029,16 +1417,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     elseif ($action === 'switch') {
         $name=$_POST['name']??''; $php=$_POST['php']??'';
-        if (isset($cfg['sites'][$name]) && (!$vers || in_array($php,$vers,true))) {
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey !== null && (!$vers || in_array($php,$vers,true))) {
+            $name = $siteKey;
+            // Normalizar formato escalar legacy ("miweb":"8.4") antes de indexar ['php'],
+            // igual que set_domain/detect_types: sin esto era un TypeError 500.
+            if (!is_array($cfg['sites'][$name])) { $cfg['sites'][$name] = ['php'=>$cfg['sites'][$name]]; }
             $cfg['sites'][$name]['php']=$php; write_json($CFG_FILE,$cfg); lua_apply();
             $msg='applied:"'.$name.'" ahora usa PHP '.$php.'.';
         } else { $msg='error:No se pudo cambiar la versión.'; }
     }
     elseif ($action === 'delete') {
         $name=$_POST['name']??'';
-        if (!isset($cfg['sites'][$name])) { $msg='error:No existe ese proyecto.'; }
-        elseif (project_locked(project_dir($WWW, $cfg['sites'][$name], $name))) { $msg='error:"'.$name.'" está bloqueado (tiene un archivo .lua). Desbloquéalo antes de eliminarlo.'; }
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg='error:No existe ese proyecto.'; }
+        elseif (project_locked(project_dir($WWW, $cfg['sites'][$siteKey], $siteKey))) { $msg='error:"'.$siteKey.'" está bloqueado (tiene un archivo .lua). Desbloquéalo antes de eliminarlo.'; }
         else {
+            $name = $siteKey;
             unset($cfg['sites'][$name]); write_json($CFG_FILE,$cfg); lua_apply();
             $msg='applied:Proyecto "'.$name.'" eliminado (la carpeta del proyecto se conserva).';
         }
@@ -1046,35 +1441,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     elseif ($action === 'integrate') {
         $name=$_POST['name']??'';
         $php=$_POST['php']??($cfg['defaultPhp']??'8.4');
-        if (!valid_name($name)) { $msg='error:Nombre de carpeta no válido.'; }
-        elseif (isset($cfg['sites'][$name])) { $msg='error:"'.$name.'" ya está registrado.'; }
-        elseif (!is_dir("$WWW/$name")) { $msg='error:No existe la carpeta www\\'.$name.'.'; }
+        if (!is_www_child_dir($WWW, $name)) { $msg='error:No existe la carpeta www\\'.$name.'.'; }
         elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
         else {
-            $site = ['php'=>$php];
-            $type = detect_project_type("$WWW/$name");
-            if ($type) { $site['type'] = $type; }
-            $cfg['sites'][$name] = $site; write_json($CFG_FILE,$cfg); lua_apply();
-            lock_project_dir("$WWW/$name"); // proyecto ya existente: bloqueado por defecto
-            $typeLabel = ['wordpress'=>'WordPress','laravel'=>'Laravel','symfony'=>'Symfony'][$type] ?? null;
-            $msg='applied:"'.$name.'" integrado y bloqueado'.($typeLabel?' ('.$typeLabel.' detectado)':'').'. Sincroniza dominios si no abre.';
+            // El nombre de carpeta puede no ser un slug valido (mayusculas, espacios...):
+            // se usa como clave si ya lo es, si no se genera una y se guarda 'path' para
+            // que apunte a la carpeta real (igual que un proyecto externo).
+            $key = valid_name($name) ? $name : slug_from_name($name, $cfg['sites']);
+            if (isset($cfg['sites'][$key])) { $msg='error:"'.$key.'" ya está registrado.'; }
+            else {
+                $realDir = "$WWW/$name";
+                $site = ($key === $name) ? ['php'=>$php] : ['php'=>$php, 'path'=>$realDir];
+                $type = detect_project_type($realDir);
+                if ($type) { $site['type'] = $type; }
+                $cfg['sites'][$key] = $site; write_json($CFG_FILE,$cfg); lua_apply(); lua_hosts();
+                lock_project_dir($realDir); // proyecto ya existente: bloqueado por defecto
+                $typeLabel = ['wordpress'=>'WordPress','laravel'=>'Laravel','symfony'=>'Symfony'][$type] ?? null;
+                $msg='applied:"'.$name.'" integrado'.($key!==$name?' como "'.$key.'"':'').' y bloqueado'.($typeLabel?' ('.$typeLabel.' detectado)':'').'. Sincronizando hosts (acepta el aviso de Windows/UAC).';
+            }
         }
     }
     elseif ($action === 'integrate_all') {
-        $php = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
+        $fallbackPhp = $_POST['php'] ?? ($cfg['defaultPhp'] ?? '8.4');
         $todo = unregistered_projects($WWW, $cfg['sites']);
+        $renamed = 0; $detected = 0;
         foreach ($todo as $name) {
-            $site = ['php'=>$php];
-            $type = detect_project_type("$WWW/$name");
+            $key = valid_name($name) ? $name : slug_from_name($name, $cfg['sites']);
+            if ($key !== $name) { $renamed++; }
+            $realDir = "$WWW/$name";
+            // Version por proyecto: si composer.json/.php-version da una pista y esta
+            // instalada, se usa esa; si no, la que se eligio para "Integrar todo".
+            $dPhp = detect_project_php($realDir, $vers);
+            if ($dPhp) { $php = $dPhp; $detected++; } else { $php = $fallbackPhp; }
+            $site = ($key === $name) ? ['php'=>$php] : ['php'=>$php, 'path'=>$realDir];
+            $type = detect_project_type($realDir);
             if ($type) { $site['type'] = $type; }
-            $cfg['sites'][$name] = $site;
+            $cfg['sites'][$key] = $site;
         }
         if ($todo) {
-            write_json($CFG_FILE,$cfg); lua_apply();
+            write_json($CFG_FILE,$cfg); lua_apply(); lua_hosts();
             foreach ($todo as $name) { lock_project_dir("$WWW/$name"); } // bloqueados por defecto
-            $msg='applied:'.count($todo).' proyecto(s) integrado(s) y bloqueado(s). Sincroniza dominios si no abren.';
+            $msg='applied:'.count($todo).' proyecto(s) integrado(s) y bloqueado(s)'.($detected?' ('.$detected.' con versión de PHP detectada de composer.json)':'').($renamed?' ('.$renamed.' con clave ajustada, nombre de carpeta no valido)':'').'. Sincronizando hosts (acepta el aviso de Windows/UAC).';
         }
         else { $msg='error:No había nada que integrar.'; }
+    }
+    elseif ($action === 'sync_projects') {
+        // Inverso de "Integrar todo": quita de sites.json los proyectos cuya carpeta
+        // ya no existe (borrada a mano fuera del panel). No toca proyectos bloqueados
+        // porque project_locked() ya devuelve false si la carpeta no existe: no hay
+        // nada que desbloquear a mano, se puede quitar sin más.
+        $gone = missing_projects($WWW, $cfg['sites']);
+        if ($gone) {
+            foreach ($gone as $name) { unset($cfg['sites'][$name]); }
+            write_json($CFG_FILE,$cfg); lua_apply();
+            $msg='applied:'.count($gone).' proyecto(s) quitado(s) de la lista (su carpeta ya no existe en disco).';
+        } else {
+            $msg='info:Todos los proyectos registrados tienen su carpeta en disco. Nada que sincronizar.';
+        }
     }
     elseif ($action === 'detect_types') {
         $tab = 'proyectos';
@@ -1098,19 +1521,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     elseif ($action === 'delete_unregistered') {
         $name=$_POST['name']??'';
         $dir = "$WWW/$name";
-        if (!valid_name($name) || isset($cfg['sites'][$name])) { $msg='error:Nombre no válido.'; }
-        elseif (!is_dir($dir)) { clearstatcache(); $msg='info:Esa carpeta ya no existe en www\\.'; }
+        $isChild = is_www_child_dir($WWW, $name);
+        $realDir = $isChild ? realpath($dir) : false;
+        // Defensa en profundidad ante rrmdir: exigir que la ruta resuelta sea hijo ESTRICTO
+        // de www\ (nunca la propia www ni un ancestro). Si is_www_child_dir fallara, esto
+        // impide igualmente borrar la raiz del stack.
+        $wwwReal = realpath($WWW);
+        $insideWww = $realDir !== false && $wwwReal !== false && $realDir !== $wwwReal
+                     && strpos($realDir, $wwwReal.DIRECTORY_SEPARATOR) === 0;
+        $isRegisteredDir = isset($cfg['sites'][$name]) || ($realDir !== false && isset(registered_dirs($WWW, $cfg['sites'])[$realDir]));
+        if (!$isChild && !is_dir($dir)) { clearstatcache(); $msg='info:Esa carpeta ya no existe en www\\.'; }
+        elseif (!$isChild || !$insideWww || $isRegisteredDir) { $msg='error:Nombre no válido.'; }
         elseif (project_locked($dir)) { $msg='error:"'.$name.'" tiene un archivo .lua que la protege. Quítalo a mano para poder borrarla.'; }
         else {
             rrmdir($dir); clearstatcache();
             $msg='applied:Carpeta "'.$name.'" eliminada de www\\.';
         }
     }
+    elseif ($action === 'git_connect') {
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $url = trim($_POST['url'] ?? '');
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
+        elseif (!preg_match('#^(https?://|git@)#', $url)) { $msg = 'error:Introduce una URL de Git válida.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            $dir = project_dir($WWW, $cfg['sites'][$name], $name);
+            if (!is_dir($dir)) { $msg = 'error:No se encontró la carpeta del proyecto.'; }
+            else {
+                $ok = true; $steps = [];
+                if (!is_dir($dir.'/.git')) {
+                    [$s,,$e] = git_exec_verbose($dir, 'init');
+                    if (!$s) { $ok=false; $steps[]='git init: '.($e?:'fallo'); }
+                }
+                // Sin al menos un commit no hay HEAD, y la ficha lo seguiria mostrando como
+                // "no es un repositorio Git": se hace un commit inicial con identidad propia
+                // por-llamada (-c), sin depender de que la cuenta SYSTEM tenga configurado
+                // user.name/user.email (git commit fallaria con "Please tell me who you are").
+                if ($ok && trim((string)git_exec($dir, 'rev-parse HEAD')) === '') {
+                    git_exec_verbose($dir, 'add -A');
+                    [$s,,$e] = git_exec_verbose($dir, '-c user.name=lua-server -c user.email=dev@localhost commit -m "Commit inicial"');
+                    if (!$s && stripos($e,'nothing to commit')===false) { $ok=false; $steps[]='commit inicial: '.($e?:'fallo'); }
+                }
+                if ($ok) {
+                    [$s,,$eAdd] = git_exec_verbose($dir, 'remote add origin '.escapeshellarg($url));
+                    if (!$s) {
+                        [$s,,$eSet] = git_exec_verbose($dir, 'remote set-url origin '.escapeshellarg($url));
+                        if (!$s) { $ok=false; $steps[]='remote: '.($eSet?:$eAdd?:'fallo'); }
+                    }
+                }
+                $msg = $ok
+                    ? 'applied:Repositorio Git conectado a '.$url.'.'
+                    : 'error:No se pudo conectar el repositorio: '.implode(' / ', $steps);
+            }
+        }
+    }
     elseif ($action === 'ftp_save') {
         $name = $_POST['name'] ?? '';
         $tab = 'proyecto'; $redirName = $name;
-        if (!valid_name($name) || !isset($cfg['sites'][$name])) { $msg = 'error:Proyecto no válido.'; }
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
         else {
+            $name = $siteKey; $redirName = $name;
             $existing = ftp_config_get($ROOT, $name) ?: [];
             $newPass = (string)($_POST['ftp_pass'] ?? '');
             $port = (int)($_POST['ftp_port'] ?? 21); if ($port <= 0) { $port = 21; }
@@ -1131,10 +1604,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     elseif ($action === 'ftp_deploy') {
         $name = $_POST['name'] ?? '';
         $tab = 'proyecto'; $redirName = $name;
-        $conf = ftp_config_get($ROOT, $name);
-        if (!valid_name($name) || !isset($cfg['sites'][$name])) { $msg = 'error:Proyecto no válido.'; }
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        $conf = $siteKey !== null ? ftp_config_get($ROOT, $siteKey) : null;
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
         elseif (!$conf || $conf['host'] === '') { $msg = 'error:Configura primero el host/usuario FTP.'; }
         else {
+            $name = $siteKey; $redirName = $name;
             $id = 'ftp-'.$name.'-'.time();
             $job = [
                 'id'=>$id, 'name'=>$name, 'php'=>($cfg['defaultPhp']??'8.4'), 'type'=>'ftp_deploy', 'url'=>'',
@@ -1149,10 +1624,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     elseif ($action === 'cover') {
         $name=$_POST['name']??'';
-        if (!isset($cfg['sites'][$name])) { $msg='error:No existe ese proyecto.'; }
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg='error:No existe ese proyecto.'; }
         elseif (empty($_FILES['img']) || ($_FILES['img']['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_OK) {
             $msg='error:No se recibió la imagen (¿demasiado grande? máx. según php.ini).';
         } else {
+            $name = $siteKey;
             $tmp=$_FILES['img']['tmp_name']; $size=$_FILES['img']['size'];
             $orig=strtolower($_FILES['img']['name']);
             $ext=pathinfo($orig, PATHINFO_EXTENSION); if($ext==='jpeg')$ext='jpg';
@@ -1171,7 +1648,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     elseif ($action === 'cover_remove') {
         $name=$_POST['name']??'';
-        if (isset($cfg['sites'][$name])) {
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey !== null) {
+            $name = $siteKey;
             foreach (cover_exts() as $e) @unlink($ROOT.'/data/covers/'.$name.'.'.$e);
             $msg='applied:Carátula de "'.$name.'" eliminada.';
         } else { $msg='error:No existe ese proyecto.'; }
@@ -1221,7 +1700,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     elseif ($action === 'lock') {
         $name=$_POST['name']??'';
-        $pDir = isset($cfg['sites'][$name]) ? project_dir($WWW, $cfg['sites'][$name], $name) : null;
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey !== null) { $name = $siteKey; }
+        $pDir = $siteKey !== null ? project_dir($WWW, $cfg['sites'][$name], $name) : null;
         if ($pDir && is_dir($pDir)) {
             $marker = $pDir.'/'.LUA_LOCK_MARKER;
             @file_put_contents($marker, "; lua-server :: proyecto bloqueado\r\n; Mientras exista un archivo .lua en la raiz de este proyecto,\r\n; no se puede eliminar desde el panel (http://localhost).\r\n");
@@ -1231,13 +1712,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     elseif ($action === 'unlock') {
         $name=$_POST['name']??'';
-        $pDir = isset($cfg['sites'][$name]) ? project_dir($WWW, $cfg['sites'][$name], $name) : null;
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey !== null) { $name = $siteKey; }
+        $pDir = $siteKey !== null ? project_dir($WWW, $cfg['sites'][$name], $name) : null;
         if ($pDir && is_dir($pDir)) {
             $marker = $pDir.'/'.LUA_LOCK_MARKER;
             if (is_file($marker)) @unlink($marker);
             if (project_locked($pDir)) { $msg='info:Quité el marcador, pero "'.$name.'" sigue bloqueado: hay otro archivo .lua en su carpeta.'; }
             else { $msg='applied:Proyecto "'.$name.'" desbloqueado. Ya se puede eliminar.'; }
         } else { $msg='error:No existe ese proyecto.'; }
+    }
+    elseif ($action === 'pin' || $action === 'unpin') {
+        // Destacar/quitar de destacados: solo cambia sites.json (orden/visual), no toca
+        // Apache/vhosts -> no hace falta lua_apply().
+        $name = $_POST['name'] ?? '';
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:No existe ese proyecto.'; }
+        else {
+            $name = $siteKey;
+            if (!is_array($cfg['sites'][$name])) { $cfg['sites'][$name] = ['php'=>$cfg['sites'][$name]]; }
+            if ($action === 'pin') { $cfg['sites'][$name]['pinned'] = true; }
+            else { unset($cfg['sites'][$name]['pinned']); }
+            write_json($CFG_FILE, $cfg);
+            $msg = 'applied:"'.$name.'" '.($action==='pin'?'añadido a':'quitado de').' Destacados.';
+        }
     }
     elseif ($action === 'phpini') {
         $tab='php';
@@ -1269,9 +1767,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $cfg['tld'] = $new;
             write_json($CFG_FILE, $cfg);
             lua_apply();
+            lua_hosts(); // cambia el dominio de TODOS los proyectos: hay que resincronizar hosts si o si
             $httpsOn = is_file($ROOT.'/config/https.on');
             if ($httpsOn) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); }
-            $msg = 'applied:Dominio cambiado a "'.$new.'". Pulsa "Sincronizar dominios" para que Windows lo reconozca.'.($httpsOn?' El certificado HTTPS se está regenerando.':'');
+            $msg = 'applied:Dominio cambiado a "'.$new.'". Sincronizando hosts (acepta el aviso de Windows/UAC que va a aparecer).'.($httpsOn?' El certificado HTTPS se está regenerando.':'');
         }
     }
     elseif ($action === 'https') {
@@ -1385,6 +1884,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             mysql_pdo()->exec("ALTER USER CURRENT_USER() IDENTIFIED BY ".mysql_pdo()->quote($new));
             if ($new === '') { @unlink($ROOT.'/config/mysql_root.pass'); }
             else { @file_put_contents($ROOT.'/config/mysql_root.pass', $new); }
+            pma_sync_root_pass($ROOT, $new); // que phpMyAdmin siga entrando tras el cambio
             $msg = $new===''? 'applied:Contraseña de root eliminada.' : 'applied:Contraseña de root actualizada.';
         } catch (Throwable $e) { $msg='error:No se pudo cambiar la contraseña: '.$e->getMessage(); }
     }
@@ -1543,7 +2043,16 @@ $watcherAlive = watcher_alive($ROOT);
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <?php if ($brandLogo): ?><link rel="icon" href="?brandlogo&t=<?= filemtime($brandLogo) ?>"><?php else: ?><link rel="icon" type="image/svg+xml" href="assets/favicon.svg"><?php endif; ?>
 <title><?= e($brandName) ?></title>
-<?php if ($mtype==='applied'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},4200);</script><?php endif; ?>
+<?php if ($mtype==='applied'): ?><script>
+// Recarga resiliente: en vez de un temporizador fijo (que caia sobre Apache mientras se
+// reiniciaba -> connection refused), sondeamos ?ping=1 hasta que responda y solo entonces
+// navegamos. Tope ~31s por si algo se atasca (recarga igualmente).
+(function(){var t='?tab=<?= e($tab) ?>',n=0;
+function go(){location.href=t;}
+function ping(){fetch('?ping=1',{cache:'no-store'}).then(function(r){if(r.ok){go();}else{retry();}}).catch(retry);}
+function retry(){if(++n>60){go();return;}setTimeout(ping,500);}
+setTimeout(ping,1500);})();
+</script><?php endif; ?>
 <?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},7000);</script><?php endif; ?>
 <?php if (($tab==='proyectos' || $tab==='config' || $tab==='proyecto') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
@@ -1599,12 +2108,19 @@ $watcherAlive = watcher_alive($ROOT);
   .btn.ghost:hover{filter:brightness(1.08)}
   .btn.danger{background-image:linear-gradient(135deg,var(--err),var(--err-dark));border-color:transparent;color:#fff}
   .btn.danger:hover{filter:brightness(1.08)}
+  .btn-git{display:inline-flex;align-items:center;gap:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:5px;padding:8px 16px;font-size:14px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:background-color .12s}
+  .btn-git:hover{background:#22272e}
 
   .dbrow{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .dbrow:first-of-type{border-top:none}
   .dbrow .dbname{font-weight:600;font-family:ui-monospace,Consolas,monospace;font-size:13px}
   .dbimport{display:flex;align-items:center;gap:6px}
-  .dbimport input[type=file]{max-width:150px;font-size:12px;color:var(--mut)}
+  .filepick{position:relative;display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px dashed var(--line);border-radius:5px;color:var(--mut);font-size:12px;cursor:pointer;max-width:170px;min-width:0;transition:color .12s,border-color .12s,background-color .12s}
+  .filepick:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.06)}
+  .filepick.has-file{color:var(--tx);border-style:solid}
+  .filepick svg{flex:0 0 auto}
+  .filepick-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  .filepick input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%}
 
   .topgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;align-items:start}
   .topgrid .card{margin-bottom:0}
@@ -1641,13 +2157,19 @@ $watcherAlive = watcher_alive($ROOT);
   .trashbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:1px solid transparent;border-radius:5px;color:#fff;cursor:pointer;background:linear-gradient(135deg,#ff8a80,var(--err));transition:filter .12s,transform .12s}
   .trashbtn:hover{filter:brightness(1.12)}
   .trashbtn:active{transform:scale(.94)}
+  .pwrbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:1px solid transparent;border-radius:5px;color:#fff;cursor:pointer;background:linear-gradient(135deg,#ff8a80,var(--err));transition:filter .12s,transform .12s}
+  .pwrbtn:hover{filter:brightness(1.12)}
+  .pwrbtn:active{transform:scale(.94)}
+  .toollink{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:6px 10px;border:1px solid var(--line);border-radius:5px;color:var(--mut);font-size:12px;font-weight:600;text-decoration:none;transition:color .12s,border-color .12s,background-color .12s}
+  .toollink:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.08)}
   .runbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0 0 0 1px;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s}
   .runbtn:hover{color:var(--ac);border-color:var(--ac)}
   .sitecard.is-locked .lockbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.12)}
   .sitecard.unregistered{background:var(--line);border-style:dashed;border-color:var(--line);opacity:.55}
   .sitecard.unregistered .name{color:var(--mut);font-weight:600}
   .exttag{font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--ac);background:rgba(110,168,254,.14);padding:1px 5px;border-radius:999px;vertical-align:middle}
-  .typetag{font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:1px 5px;border-radius:999px;vertical-align:middle;color:var(--mut);background:rgba(139,144,160,.16)}
+  .typetag{display:inline-flex;align-items:center;gap:3px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;padding:1px 6px 1px 5px;border-radius:999px;vertical-align:middle;color:var(--mut);background:rgba(139,144,160,.16)}
+  .typetag .typeicon{flex:0 0 auto}
   .typetag-wordpress{color:var(--ac);background:rgba(110,168,254,.14)}
   .typetag-laravel{color:var(--err);background:rgba(248,81,73,.14)}
   .typetag-symfony{color:var(--ok);background:rgba(63,185,80,.14)}
@@ -1699,6 +2221,12 @@ $watcherAlive = watcher_alive($ROOT);
   .cover.has .cover-hint{color:#fff;background:rgba(10,12,18,.5);opacity:0;transition:opacity .12s}
   .cover.has:hover .cover-hint{opacity:1}
   .coverdel{position:absolute;top:8px;left:8px;margin:0;z-index:3}
+  .pinform{position:absolute;top:8px;right:8px;margin:0;z-index:3}
+  .pinbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:1px solid transparent;border-radius:5px;color:#fff;background:rgba(10,12,18,.55);cursor:pointer;transition:color .12s,background-color .12s,transform .12s}
+  .pinbtn:hover{background:rgba(10,12,18,.75)}
+  .pinbtn:active{transform:scale(.9)}
+  .pinbtn.is-pinned{background:linear-gradient(135deg,#6ea8fe,#9b6efe)}
+  .sitecard.is-pinned{border-color:#9b6efe}
   .coverdelbtn{display:flex;align-items:center;justify-content:center;width:22px;height:22px;padding:0;border:0;border-radius:5px;background:rgba(10,12,18,.55);color:#fff;font-size:15px;line-height:1;cursor:pointer}
   .coverdelbtn:hover{background:var(--err)}
 
@@ -1712,6 +2240,7 @@ $watcherAlive = watcher_alive($ROOT);
   .sitegrid.list .sitecard{flex-direction:row;align-items:center;gap:14px;padding:10px 16px}
   .sitegrid.list .sitecard .coverform,
   .sitegrid.list .sitecard .coverdel{display:none}
+  .sitegrid.list .sitecard .pinform{position:static}
   .sitegrid.list .sitecard .cardbody{flex-direction:row;align-items:center;gap:10px;flex:1;min-width:0}
   .sitegrid.list .sitecard .name{flex:0 0 220px}
   .sitegrid.list .sitecard .tagrow{flex:0 0 auto}
@@ -1921,13 +2450,13 @@ $watcherAlive = watcher_alive($ROOT);
   <?php if ($mtext): ?>
     <div class="banner <?= e($mtype) ?>">
       <?= e($mtext) ?>
-      <?php if ($mtype==='applied'): ?> <span class="muted">— Apache se está recargando, la página se actualizará sola.</span><?php endif; ?>
+      <?php if ($mtype==='applied'): ?> <span class="muted">— la página se actualizará sola en cuanto el servidor responda.</span><?php endif; ?>
     </div>
   <?php endif; ?>
 
   <?php if ($tab==='proyectos'): ?>
 
-    <?php $mariaOn = is_file($ROOT.'/config/mariadb.on'); $termOn = is_file($ROOT.'/config/terminal.on'); $runPresets = run_presets_load($ROOT); ?>
+    <?php $mariaOn = is_file($ROOT.'/config/mariadb.on'); [$mariaCls,$mariaLbl] = svc_status($mariaOn, 3306); $termOn = is_file($ROOT.'/config/terminal.on'); $runPresets = run_presets_load($ROOT); ?>
     <div class="topgrid">
       <div class="card" style="grid-column:span 2">
         <form method="post">
@@ -1974,27 +2503,28 @@ $watcherAlive = watcher_alive($ROOT);
 
       <div class="card" style="display:flex;flex-direction:column">
         <div class="row" style="gap:6px">
-          <div style="font-weight:600">Servidor MySQL (MariaDB) <span class="jstate <?= $mariaOn?'ok':'err' ?>" style="margin-left:6px"><?= $mariaOn?'ACTIVO':'INACTIVO' ?></span></div>
+          <div style="font-weight:600">Servidor MySQL (MariaDB) <span class="jstate <?= $mariaCls ?>" style="margin-left:6px"><?= $mariaLbl ?></span></div>
           <div class="spacer"></div>
           <a class="lockbtn" href="?tab=bd" title="Configuración de bases de datos" aria-label="Configuración de bases de datos">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           </a>
+          <form method="post" style="margin:0">
+            <input type="hidden" name="action" value="mariadb">
+            <input type="hidden" name="enable" value="<?= $mariaOn?'0':'1' ?>">
+            <input type="hidden" name="from_tab" value="proyectos">
+            <button type="submit" class="pwrbtn" title="<?= $mariaOn?'Desactivar servidor MySQL':'Crear / activar servidor MySQL' ?>" aria-label="<?= $mariaOn?'Desactivar servidor MySQL':'Crear / activar servidor MySQL' ?>">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+            </button>
+          </form>
         </div>
         <div class="muted" style="margin-top:6px">Nativo en <code>127.0.0.1:3306</code>, usuario <code>root</code> <?= mysql_root_pass($ROOT)!==''?'con contraseña':'sin contraseña' ?>.</div>
         <div class="spacer"></div>
         <?php if ($mariaOn): ?>
           <div class="row" style="gap:8px;margin-top:10px">
-            <a class="btn ghost sm" href="http://<?= e($phpmyadminDom) ?>/" target="_blank" style="flex:1;text-align:center">phpMyAdmin &#8599;</a>
-            <a class="btn ghost sm" href="/adminer.php?server=127.0.0.1&username=root" target="_blank" style="flex:1;text-align:center">Adminer &#8599;</a>
+            <a class="toollink" href="http://<?= e($phpmyadminDom) ?>/" target="_blank" style="flex:1">phpMyAdmin &#8599;</a>
+            <a class="toollink" href="/adminer.php?server=127.0.0.1&username=root" target="_blank" style="flex:1" title="Adminer pide contraseña: crea un usuario con clave para tu proyecto, o usa bin\mariadb\bin\mariadb.exe.">Adminer &#8599;</a>
           </div>
-          <div class="muted" style="font-size:11px;margin-top:6px">Adminer pide contraseña: crea un usuario con clave para tu proyecto, o usa <code>bin\mariadb\bin\mariadb.exe</code>.</div>
         <?php endif; ?>
-        <form method="post" style="margin-top:8px">
-          <input type="hidden" name="action" value="mariadb">
-          <input type="hidden" name="enable" value="<?= $mariaOn?'0':'1' ?>">
-          <input type="hidden" name="from_tab" value="proyectos">
-          <button class="btn <?= $mariaOn?'danger':'ghost' ?>" type="submit" style="width:100%"><?= $mariaOn?'Desactivar':'Crear / activar' ?> servidor MySQL</button>
-        </form>
       </div>
     </div>
 
@@ -2065,7 +2595,7 @@ $watcherAlive = watcher_alive($ROOT);
         function filter(){
           var q = norm(input.value.trim());
           var totalShown = 0;
-          ['secProyectos','secUnreg'].forEach(function(secId){
+          ['secDestacados','secProyectos','secUnreg'].forEach(function(secId){
             var sec = document.getElementById(secId);
             if (!sec) return;
             var shown = 0;
@@ -2085,7 +2615,20 @@ $watcherAlive = watcher_alive($ROOT);
       })();
     </script>
 
+    <?php $sitesPinned = array_filter($sitesView, function($i){ return is_array($i) && !empty($i['pinned']); }); ?>
+    <?php if ($sitesPinned): ?>
+    <details class="sectioncollapse" id="secDestacados" open>
+      <summary>Destacados <span class="op">(<?= count($sitesPinned) ?>)</span><span class="arrow"></span></summary>
+      <div class="pane">
+        <div class="sitegrid">
+          <?php foreach ($sitesPinned as $name => $info): render_site_card($name, $info); endforeach; ?>
+        </div>
+      </div>
+    </details>
+    <?php endif; ?>
+
     <?php $sitesSinTipo = 0; foreach ($sitesView as $sInfo) { if (is_array($sInfo) && empty($sInfo['type']) && empty($sInfo['typeChecked'])) $sitesSinTipo++; } ?>
+    <?php $sitesFaltantes = missing_projects($WWW, $sitesView); ?>
     <details class="sectioncollapse" id="secProyectos" open>
       <summary>Proyectos <span class="op">(<?= count($sitesView) ?>)</span>
         <?php if ($sitesSinTipo > 0): ?>
@@ -2094,6 +2637,12 @@ $watcherAlive = watcher_alive($ROOT);
           <!-- Un <button type=submit> dentro de <summary> no envia en Chrome (el summary
                se queda el clic para abrir/cerrar el <details>): forzamos el submit por JS. -->
           <button type="button" class="btn ghost sm" onclick="event.stopPropagation();event.preventDefault();this.closest('form').requestSubmit()">Detectar tipos (<?= $sitesSinTipo ?>)</button>
+        </form>
+        <?php endif; ?>
+        <?php if ($sitesFaltantes): ?>
+        <form method="post" title="Quita de la lista los proyectos cuya carpeta ya no existe en www\ (borrada fuera del panel)" onsubmit="event.stopPropagation()">
+          <input type="hidden" name="action" value="sync_projects">
+          <button type="button" class="btn ghost sm" onclick="event.stopPropagation();event.preventDefault();if(confirm('Se quitarán '+<?= count($sitesFaltantes) ?>+' proyecto(s) cuya carpeta ya no existe: '+<?= json_encode(implode(', ', $sitesFaltantes)) ?>+'. La carpeta ya no está, así que no hay nada que borrar en disco. ¿Continuar?'))this.closest('form').requestSubmit()">Sincronizar proyectos (<?= count($sitesFaltantes) ?>)</button>
         </form>
         <?php endif; ?>
         <div class="viewtoggle" onclick="event.stopPropagation()">
@@ -2111,83 +2660,7 @@ $watcherAlive = watcher_alive($ROOT);
       <div class="card muted">Aún no hay proyectos. Crea el primero arriba.</div>
     <?php else: ?>
       <div class="sitegrid">
-        <?php foreach ($sitesView as $name => $info):
-              $ver = is_array($info)?($info['php']??'?'):$info;
-              $dom = (is_array($info) && !empty($info['domain'])) ? $info['domain'] : $name.'.'.$tld;
-              $pdir = project_dir($WWW, $info, $name);
-              $extPath = (is_array($info) && !empty($info['path'])) ? $info['path'] : null;
-              $locked = project_locked($pdir);
-              $hasCover = (bool)cover_path($ROOT,$name);
-              $hasComposer = is_file($pdir.'/composer.json');
-              $hasNpm = is_file($pdir.'/package.json');
-              $pType = is_array($info) ? ($info['type'] ?? null) : null;
-              $pTypeLabel = project_type_label($pType); ?>
-          <div class="sitecard<?= $locked?' is-locked':'' ?>">
-            <form method="post" enctype="multipart/form-data" class="coverform" id="cover-<?= e($name) ?>">
-              <input type="hidden" name="action" value="cover">
-              <input type="hidden" name="name" value="<?= e($name) ?>">
-              <input type="file" name="img" accept="image/*" hidden onchange="this.form.requestSubmit()">
-              <button type="button" class="cover<?= $hasCover?' has':' empty' ?><?= (!$hasCover && $pType) ? ' type-'.e($pType) : '' ?>" title="<?= $hasCover?'Cambiar carátula':'Subir carátula' ?>"
-                      onclick="this.parentNode.querySelector('input[type=file]').click()"
-                      <?= $hasCover?'style="background-image:url(\'?cover='.e(rawurlencode($name)).'&t='.(cover_path($ROOT,$name)?filemtime(cover_path($ROOT,$name)):0).'\')"':'' ?>>
-                <span class="cover-hint">
-                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
-                  <?= $hasCover?'Cambiar':'Carátula' ?>
-                </span>
-              </button>
-            </form>
-            <?php if ($hasCover): ?>
-              <form method="post" class="coverdel"><input type="hidden" name="action" value="cover_remove"><input type="hidden" name="name" value="<?= e($name) ?>"><button type="submit" class="coverdelbtn" title="Quitar carátula">&times;</button></form>
-            <?php endif; ?>
-            <div class="cardbody">
-              <div class="name" title="<?= e($name) ?>"><?= e($name) ?></div>
-              <?php if ($pTypeLabel || $extPath): ?>
-              <div class="tagrow">
-                <?php if($pTypeLabel): ?><span class="typetag typetag-<?= e($pType) ?>"><?= e($pTypeLabel) ?></span><?php endif; ?>
-                <?php if($extPath): ?><span class="exttag" title="Proyecto externo: <?= e($extPath) ?>">&#8599; externo</span><?php endif; ?>
-              </div>
-              <?php endif; ?>
-              <a class="url" href="http://<?= e($dom) ?>" target="_blank"><?= e($dom) ?> &#8599;</a>
-            </div>
-            <div class="cardfooter">
-              <form method="post" class="phpselform">
-                <input type="hidden" name="action" value="switch">
-                <input type="hidden" name="name" value="<?= e($name) ?>">
-                <select name="php" class="phpsel" onchange="this.form.dataset.loadingText='Cambiando a PHP '+this.value+'…';this.form.requestSubmit()">
-                  <?php foreach ($vers as $v): ?>
-                    <option value="<?= e($v) ?>" <?= $v===$ver?'selected':'' ?>>PHP <?= e($v) ?></option>
-                  <?php endforeach; ?>
-                </select>
-              </form>
-              <div class="cardactions">
-                <a class="lockbtn" href="?tab=proyecto&name=<?= e(rawurlencode($name)) ?>" title="Ver detalles del proyecto" aria-label="Ver detalles del proyecto">
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 1.3-.7 1.9-1.4 2.4-.6.5-1.1.9-1.1 1.6"/><line x1="12" y1="17" x2="12" y2="17.01"/></svg>
-                </a>
-                <?php if ($termOn && ($hasComposer || $hasNpm)): ?>
-                  <button type="button" class="runbtn lua-runbtn" title="Ejecutar Composer/NPM" aria-label="Ejecutar Composer/NPM" data-name="<?= e($name) ?>" data-path="<?= e(term_win($pdir)) ?>" data-composer="<?= $hasComposer?'1':'0' ?>" data-npm="<?= $hasNpm?'1':'0' ?>" data-php="<?= e($ver) ?>">
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                  </button>
-                <?php endif; ?>
-                <form method="post" class="lockform">
-                  <input type="hidden" name="action" value="<?= $locked?'unlock':'lock' ?>">
-                  <input type="hidden" name="name" value="<?= e($name) ?>">
-                  <button type="submit" class="lockbtn" title="<?= $locked?'Desbloquear (permitirá eliminar el proyecto)':'Bloquear (impide eliminar el proyecto)' ?>" aria-label="<?= $locked?'Desbloquear':'Bloquear' ?>">
-                    <?php if ($locked): ?>
-                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
-                    <?php else: ?>
-                      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-2"/></svg>
-                    <?php endif; ?>
-                  </button>
-                </form>
-                <?php if (!$locked): ?>
-                  <button type="button" class="trashbtn" title="Eliminar" aria-label="Eliminar" onclick="luaAskDelete('<?= e($name) ?>')">
-                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
-                  </button>
-                <?php endif; ?>
-              </div>
-            </div>
-          </div>
-        <?php endforeach; ?>
+        <?php foreach ($sitesView as $name => $info): render_site_card($name, $info); endforeach; ?>
       </div>
     <?php endif; ?>
       </div>
@@ -2195,8 +2668,8 @@ $watcherAlive = watcher_alive($ROOT);
 
     <?php if ($unreg): ?>
     <details class="sectioncollapse" id="secUnreg">
-      <summary>Sin registrar <span class="op">(<?= count($unreg) ?>) — carpetas en <code>www\</code> que no aparecen arriba</span>
-        <form method="post" onclick="event.stopPropagation()" onsubmit="return confirm('Integrar las <?= count($unreg) ?> carpetas sin registrar con PHP <?= e($defaultPhp) ?>?')">
+      <summary>Sin registrar <span class="op">(<?= count($unreg) ?>) — carpetas detectadas en <code>www\</code> pendientes de integrar</span>
+        <form method="post" onclick="event.stopPropagation()" onsubmit="return confirm('Integrar las <?= count($unreg) ?> carpetas sin registrar (PHP <?= e($defaultPhp) ?> por defecto; se usa la versión de composer.json cuando se pueda detectar)?')">
           <input type="hidden" name="action" value="integrate_all">
           <input type="hidden" name="php" value="<?= e($defaultPhp) ?>">
           <button class="btn ghost sm" type="submit">Integrar todo</button>
@@ -2205,7 +2678,9 @@ $watcherAlive = watcher_alive($ROOT);
       </summary>
       <div class="pane">
       <div class="sitegrid">
-        <?php foreach ($unreg as $name): ?>
+        <?php foreach ($unreg as $name):
+              $dPhp = detect_project_php("$WWW/$name", $vers);
+              $selPhp = $dPhp ?: $defaultPhp; ?>
           <div class="sitecard unregistered">
             <div class="cardactions">
               <button type="button" class="trashbtn" title="Eliminar carpeta" aria-label="Eliminar carpeta" onclick="luaAskDeleteUnreg('<?= e($name) ?>')">
@@ -2217,9 +2692,9 @@ $watcherAlive = watcher_alive($ROOT);
               <form method="post" class="phpselform">
                 <input type="hidden" name="action" value="integrate">
                 <input type="hidden" name="name" value="<?= e($name) ?>">
-                <select name="php" class="phpsel">
+                <select name="php" class="phpsel" title="<?= $dPhp?'Detectada de composer.json':'Versión por defecto (sin pista en el proyecto)' ?>">
                   <?php foreach ($vers as $v): ?>
-                    <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+                    <option value="<?= e($v) ?>" <?= $v===$selPhp?'selected':'' ?>>PHP <?= e($v) ?><?= ($v===$dPhp)?' (detectada)':'' ?></option>
                   <?php endforeach; ?>
                 </select>
                 <button class="btn sm" type="submit" title="Integrar como proyecto">Integrar</button>
@@ -2485,7 +2960,13 @@ $watcherAlive = watcher_alive($ROOT);
 
   <?php elseif ($tab==='proyecto'): /* ---------- FICHA DE PROYECTO ---------- */
       $pName = (string)($_GET['name'] ?? '');
-      $pInfo = (valid_name($pName) && isset($sites[$pName])) ? $sites[$pName] : null; ?>
+      // Acepta un name= con distinto casing/espacios que la clave real de sites.json
+      // (p.ej. "arquitecturaTgin", el nombre tal cual en el Explorador de Windows, cuando
+      // la clave registrada quedo en minusculas via slug_from_name): sin esto, la ficha
+      // y cualquier accion que se dispare desde ella fallaban en silencio.
+      $pKey = resolve_site_key($sites, $pName);
+      if ($pKey !== null) { $pName = $pKey; }
+      $pInfo = $pKey !== null ? $sites[$pKey] : null; ?>
 
     <a href="?tab=proyectos" class="muted" style="display:inline-block;margin-bottom:14px">&larr; Volver a proyectos</a>
 
@@ -2512,12 +2993,18 @@ $watcherAlive = watcher_alive($ROOT);
         <div style="min-width:240px;flex:1">
           <div class="row" style="gap:8px">
             <span style="font-size:20px;font-weight:700"><?= e($pName) ?></span>
-            <?php if ($pTypeLabel): ?><span class="typetag typetag-<?= e($pType) ?>"><?= e($pTypeLabel) ?></span><?php endif; ?>
+            <?php if ($pTypeLabel): ?><span class="typetag typetag-<?= e($pType) ?>"><?= project_type_icon($pType) ?><?= e($pTypeLabel) ?></span><?php endif; ?>
             <?php if ($pExtPath): ?><span class="exttag" title="Proyecto externo: <?= e($pExtPath) ?>">ext</span><?php endif; ?>
             <span class="jstate <?= $pLocked?'warn':'ok' ?>"><?= $pLocked?'Bloqueado':'Desbloqueado' ?></span>
             <span class="jstate run">PHP <?= e($pVer) ?></span>
           </div>
           <a class="url" href="http://<?= e($pDom) ?>" target="_blank" style="display:inline-block;margin-top:6px">http://<?= e($pDom) ?> &#8599;</a>
+          <form method="post" class="inline" style="margin-top:6px;gap:6px">
+            <input type="hidden" name="action" value="set_domain">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+            <input name="domain" value="<?= e($pInfo['domain'] ?? '') ?>" placeholder="<?= e($pName.'.'.$tld) ?> (por defecto)" style="width:230px;font-size:12px">
+            <button class="btn ghost sm" type="submit" title="Deja el campo vacío para volver al dominio por defecto">Guardar dominio</button>
+          </form>
           <div class="muted" style="margin-top:8px;font-size:12px;font-family:ui-monospace,Consolas,monospace" title="<?= e($pDir) ?>"><?= e($pDir) ?></div>
           <div class="row" style="margin-top:10px;gap:6px">
             <?php if ($pHasComposer): ?><span class="tag">composer.json</span><?php endif; ?>
@@ -2552,7 +3039,18 @@ $watcherAlive = watcher_alive($ROOT);
             <?php endif; ?>
           </div>
         <?php else: ?>
-          <div class="card muted">Este proyecto no es un repositorio Git (o <code>git</code> no está disponible en esta máquina).</div>
+          <div class="card">
+            <div class="muted">Este proyecto no es un repositorio Git (o <code>git</code> no está disponible en esta máquina).</div>
+            <form method="post" class="inline" style="margin-top:12px">
+              <input type="hidden" name="action" value="git_connect">
+              <input type="hidden" name="name" value="<?= e($pName) ?>">
+              <input name="url" placeholder="https://github.com/usuario/repo.git" style="flex:1;min-width:240px" required>
+              <button class="btn-git" type="submit" title="Inicializa el repo si hace falta, con un commit inicial, y añade este remoto">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+                Conectar repositorio
+              </button>
+            </form>
+          </div>
         <?php endif; ?>
 
         <div class="card">
@@ -2691,7 +3189,7 @@ $watcherAlive = watcher_alive($ROOT);
       </div>
       <script>
         (function(){
-          var modal=null, titleEl=null, host=null, area=null, status=null, saveBtn=null, cm=null, curName=null, curRel=null;
+          var modal=null, titleEl=null, host=null, area=null, status=null, saveBtn=null, cm=null, curName=null, curRel=null, curEnc='UTF-8';
 
           function modeForFile(name){
             var ext = (name.split('.').pop() || '').toLowerCase();
@@ -2734,14 +3232,14 @@ $watcherAlive = watcher_alive($ROOT);
             if (!curName || cm.getOption('readOnly')) return;
             status.textContent = 'Guardando…';
             fetch('?', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
-              body:'action=file_write&name='+encodeURIComponent(curName)+'&rel='+encodeURIComponent(curRel)+'&content='+encodeURIComponent(cm.getValue())})
+              body:'action=file_write&name='+encodeURIComponent(curName)+'&rel='+encodeURIComponent(curRel)+'&enc='+encodeURIComponent(curEnc)+'&content='+encodeURIComponent(cm.getValue())})
               .then(function(r){ return r.json(); })
               .then(function(j){ status.textContent = j.error ? j.error : 'Guardado.'; })
               .catch(function(){ status.textContent = 'Error de red al guardar.'; });
           }
           window.luaOpenFileEditor = function(name, rel, label){
             if (!modal) init();
-            curName = name; curRel = rel;
+            curName = name; curRel = rel; curEnc = 'UTF-8';
             titleEl.textContent = label || rel;
             cm.setOption('readOnly', 'nocursor');
             cm.setValue('Cargando…');
@@ -2755,6 +3253,7 @@ $watcherAlive = watcher_alive($ROOT);
                 cm.setOption('readOnly', false);
                 if (j.error) { cm.setValue(''); status.textContent = j.error; }
                 else {
+                  curEnc = j.enc || 'UTF-8';
                   cm.setOption('mode', modeForFile(label || rel));
                   cm.setValue(j.content);
                   cm.clearHistory();
@@ -2991,6 +3490,10 @@ $watcherAlive = watcher_alive($ROOT);
       $mailOn   = is_file($ROOT.'/config/mailpit.on');
       $mariaOn  = is_file($ROOT.'/config/mariadb.on');
       $pgOn     = is_file($ROOT.'/config/postgres.on');
+      // Badges derivados del proceso real (no solo del flag): un flag huerfano no miente.
+      [$mailCls,$mailLbl]   = svc_status($mailOn, 1025);
+      [$mariaCls,$mariaLbl] = svc_status($mariaOn, 3306);
+      [$pgCls,$pgLbl]       = svc_status($pgOn, 5432);
       $termOn   = is_file($ROOT.'/config/terminal.on');
       $startupOn= startup_enabled($ROOT);
       $lanIps = array_values(array_filter(array_map('trim', explode(',', (string)@file_get_contents($ROOT.'/config/lan-ip.txt'))),
@@ -3038,7 +3541,7 @@ $watcherAlive = watcher_alive($ROOT);
 
       <div class="card">
         <div class="cfg3-body">
-          <div style="font-weight:600;margin-bottom:4px">Mailpit <span class="jstate <?= $mailOn?'ok':'err' ?>"><?= $mailOn?'ACTIVO':'INACTIVO' ?></span></div>
+          <div style="font-weight:600;margin-bottom:4px">Mailpit <span class="jstate <?= $mailCls ?>"><?= $mailLbl ?></span></div>
           <div class="muted">Atrapa los emails que envían tus proyectos PHP (SMTP <code>127.0.0.1:1025</code>) y los muestra en un buzón web. No salen a internet.</div>
         </div>
         <div class="cfg3-actions">
@@ -3053,7 +3556,7 @@ $watcherAlive = watcher_alive($ROOT);
 
       <div class="card">
         <div class="cfg3-body">
-          <div style="font-weight:600;margin-bottom:4px">Servidor MySQL (MariaDB) <span class="jstate <?= $mariaOn?'ok':'err' ?>"><?= $mariaOn?'ACTIVO':'INACTIVO' ?></span></div>
+          <div style="font-weight:600;margin-bottom:4px">Servidor MySQL (MariaDB) <span class="jstate <?= $mariaCls ?>"><?= $mariaLbl ?></span></div>
           <div class="muted">Nativo (MariaDB 11.8 LTS) en <code>127.0.0.1:3306</code>, usuario <code>root</code> <?= mysql_root_pass($ROOT)!==''?'con contraseña':'sin contraseña' ?>. Solo accesible desde esta máquina. Gestiona <code>root</code> y crea usuarios en <a href="?tab=bd">Bases de datos</a>.</div>
         </div>
         <div class="cfg3-actions">
@@ -3068,7 +3571,7 @@ $watcherAlive = watcher_alive($ROOT);
 
       <div class="card">
         <div class="cfg3-body">
-          <div style="font-weight:600;margin-bottom:4px">Servidor PostgreSQL <span class="jstate <?= $pgOn?'ok':'err' ?>"><?= $pgOn?'ACTIVO':'INACTIVO' ?></span></div>
+          <div style="font-weight:600;margin-bottom:4px">Servidor PostgreSQL <span class="jstate <?= $pgCls ?>"><?= $pgLbl ?></span></div>
           <div class="muted">Nativo (PostgreSQL 16) en <code>127.0.0.1:5432</code>, usuario <code>postgres</code> sin contraseña. Solo accesible desde esta máquina. Crea bases de datos y roles en <a href="?tab=bd&engine=pg">Bases de datos</a>.</div>
         </div>
         <div class="cfg3-actions">
@@ -3172,7 +3675,11 @@ $watcherAlive = watcher_alive($ROOT);
               <form method="post" enctype="multipart/form-data" class="dbimport" onsubmit="return luaAskImportPg(event, this, '<?= e($db) ?>')">
                 <input type="hidden" name="action" value="pg_db_import">
                 <input type="hidden" name="dbname" value="<?= e($db) ?>">
-                <input type="file" name="sqlfile" accept=".sql" required>
+                <label class="filepick">
+                  <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  <span class="filepick-name">Elegir .sql&hellip;</span>
+                </label>
                 <button class="btn ghost sm" type="submit">Importar</button>
               </form>
               <button type="button" class="btn danger sm" onclick="luaAskDropPg('<?= e($db) ?>')">Eliminar</button>
@@ -3271,7 +3778,7 @@ $watcherAlive = watcher_alive($ROOT);
           function luaEscDeletePgRole(e){ if(e.key==='Escape') luaCloseDeletePgRole(); }
           var luaImportPgForm=null;
           function luaAskImportPg(ev, form, db){ ev.preventDefault(); luaImportPgForm=form; document.getElementById('importPgName').textContent=db; document.getElementById('importPgModal').hidden=false; document.addEventListener('keydown',luaEscImportPg); return false; }
-          function luaConfirmImportPg(){ luaCloseImportPg(); if(luaImportPgForm) luaImportPgForm.submit(); }
+          function luaConfirmImportPg(){ luaCloseImportPg(); if(luaImportPgForm) luaImportPgForm.requestSubmit(); }
           function luaCloseImportPg(){ document.getElementById('importPgModal').hidden=true; document.removeEventListener('keydown',luaEscImportPg); }
           function luaEscImportPg(e){ if(e.key==='Escape') luaCloseImportPg(); }
         </script>
@@ -3318,7 +3825,11 @@ $watcherAlive = watcher_alive($ROOT);
             <form method="post" enctype="multipart/form-data" class="dbimport" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
               <input type="hidden" name="action" value="db_import">
               <input type="hidden" name="dbname" value="<?= e($db) ?>">
-              <input type="file" name="sqlfile" accept=".sql" required>
+              <label class="filepick">
+                <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                <span class="filepick-name">Elegir .sql&hellip;</span>
+              </label>
               <button class="btn ghost sm" type="submit">Importar</button>
             </form>
             <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
@@ -3486,7 +3997,10 @@ $watcherAlive = watcher_alive($ROOT);
         }
         function luaConfirmImportDb(){
           luaCloseImportDb();
-          if (luaImportDbForm) luaImportDbForm.submit();
+          // requestSubmit() (no submit()): dispara el evento 'submit' de verdad, para que
+          // el loader global aparezca durante la importacion real (que puede tardar si el
+          // .sql es grande) en vez de no mostrarse nunca.
+          if (luaImportDbForm) luaImportDbForm.requestSubmit();
         }
         function luaCloseImportDb(){
           document.getElementById('importDbModal').hidden = true;
@@ -3847,6 +4361,18 @@ $watcherAlive = watcher_alive($ROOT);
 
   </div>
 
+  <script>
+    // Control de "elegir archivo" a medida (import de backups .sql): actualiza el nombre
+    // mostrado y marca el control como "con archivo" para el estilo solido del borde.
+    function luaFilePickName(input){
+      var label = input.closest('.filepick');
+      var nameEl = label.querySelector('.filepick-name');
+      var f = input.files && input.files[0];
+      nameEl.textContent = f ? f.name : 'Elegir .sql…';
+      label.classList.toggle('has-file', !!f);
+    }
+  </script>
+
   <footer><?= e($brandName) ?> &middot; Apache + mod_fcgid &middot; panel solo accesible desde esta máquina</footer>
 
   <!-- Loader global: se muestra al pulsar cualquier boton/enlace que dispare una accion real
@@ -3882,9 +4408,14 @@ $watcherAlive = watcher_alive($ROOT);
       document.addEventListener('submit', function(e){
         var form = e.target;
         if (!(form instanceof HTMLFormElement) || form.matches('.no-loader')) return;
+        // Fase de burbuja + defaultPrevented: si el onsubmit del formulario cancelo el envio
+        // (p.ej. porque abre un modal de confirmacion, o envia por AJAX), NO mostramos el
+        // loader — antes saltaba en captura, antes de la cancelacion, y la pastilla se
+        // quedaba flotando sobre el modal de confirmar.
+        if (e.defaultPrevented) return;
         var submitter = e.submitter || form.querySelector('button[type=submit], button:not([type])');
         show(submitter || form);
-      }, true);
+      }, false);
       document.addEventListener('click', function(e){
         var a = e.target.closest('a[href]');
         if (!a || a.matches('.no-loader')) return;
