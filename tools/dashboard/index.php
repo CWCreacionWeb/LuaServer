@@ -786,6 +786,21 @@ function render_terminal_widget($prefix, $initialCwd, $autofocus=true){
     return ob_get_clean();
 }
 
+// ---------------- Extensiones PHP de terceros (registro) ----------------
+// Nombres registrados desde el panel (p.ej. "pdo_sqlsrv"); lua.ps1 los fusiona
+// con $WantExts en Set-PhpInis. Solo el nombre: la presencia real del .dll
+// (bin\php\<ver>\ext\php_<nombre>.dll) es lo que decide si se activa o no
+// para cada version instalada.
+function extra_ext_file($root){ return $root.'/config/php/extra-extensions.json'; }
+function extra_extensions($root){
+    $j = json_decode((string)@file_get_contents(extra_ext_file($root)), true);
+    return is_array($j) ? $j : [];
+}
+function save_extra_extensions($root, $list){
+    @mkdir($root.'/config/php', 0777, true);
+    file_put_contents(extra_ext_file($root), json_encode(array_values(array_unique($list))));
+}
+
 // ---------------- Caratula (cover) por proyecto ----------------
 // Se guarda en data\covers\<name>.<ext> (runtime, fuera del docroot y de git).
 // Se sirve via ?cover=<name>. Un solo archivo por proyecto.
@@ -1402,6 +1417,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else { $msg='error:Versión no válida.'; }
         header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
     }
+    elseif ($action === 'phpext_add') {
+        $ver = $_POST['ver'] ?? '';
+        $name = trim($_POST['name'] ?? '');
+        $url = trim($_POST['url'] ?? '');
+        if (!$vers || !in_array($ver,$vers,true)) { $msg='error:Versión no válida.'; }
+        elseif (!preg_match('/^[a-z][a-z0-9_]*$/', $name)) { $msg='error:Nombre de extensión no válido (minúsculas, números y guion bajo, empezando por letra).'; }
+        else {
+            $dest = $PHP_BASE.'/'.$ver.'/ext/php_'.$name.'.dll';
+            $hasFile = !empty($_FILES['dll']) && ($_FILES['dll']['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK;
+            if ($hasFile) {
+                $tmp = $_FILES['dll']['tmp_name']; $size = $_FILES['dll']['size'];
+                $head = @file_get_contents($tmp, false, null, 0, 2);
+                if ($size < 1024 || $size > 50*1024*1024) { $msg='error:Tamaño de archivo no válido (esperado un .dll).'; }
+                elseif ($head !== 'MZ') { $msg='error:El archivo no parece un .dll de Windows (cabecera no válida).'; }
+                else {
+                    @mkdir(dirname($dest), 0777, true);
+                    if (@move_uploaded_file($tmp, $dest)) {
+                        $list = extra_extensions($ROOT); $list[] = $name; save_extra_extensions($ROOT, $list);
+                        lua_apply();
+                        $msg='applied:Extensión "'.$name.'" instalada para PHP '.$ver.'.';
+                    } else { $msg='error:No se pudo guardar el .dll.'; }
+                }
+            } elseif ($url !== '') {
+                $list = extra_extensions($ROOT); $list[] = $name; save_extra_extensions($ROOT, $list);
+                $id='phpext-'.$name.'-'.$ver.'-'.time();
+                $job=['id'=>$id,'name'=>'phpext-'.$name.'-'.$ver,'php'=>$ver,'type'=>'phpext','url'=>$url,'extName'=>$name];
+                @mkdir($ROOT.'/tmp/jobs',0777,true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $msg='job:Descargando extensión "'.$name.'"…';
+            } else {
+                $msg='error:Sube un .dll o pega una URL directa.';
+            }
+        }
+        header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
+    }
+    elseif ($action === 'phpext_remove') {
+        $ver = $_POST['ver'] ?? '';
+        $name = $_POST['name'] ?? '';
+        if (!$vers || !in_array($ver,$vers,true)) { $msg='error:Versión no válida.'; }
+        else {
+            @unlink($PHP_BASE.'/'.$ver.'/ext/php_'.$name.'.dll');
+            $stillUsed = false;
+            foreach ($vers as $v2) { if (is_file($PHP_BASE.'/'.$v2.'/ext/php_'.$name.'.dll')) { $stillUsed = true; break; } }
+            if (!$stillUsed) {
+                $list = array_values(array_diff(extra_extensions($ROOT), [$name]));
+                save_extra_extensions($ROOT, $list);
+            }
+            lua_apply();
+            $msg='applied:Extensión "'.$name.'" quitada de PHP '.$ver.'.';
+        }
+        header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
+    }
     elseif ($action === 'clearlog') {
         $lf = safe_logname($_POST['log'] ?? '');
         if ($lf && is_file($ROOT.'/logs/apache/'.$lf)) { @file_put_contents($ROOT.'/logs/apache/'.$lf, ''); $msg='info:Log '.$lf.' vaciado.'; }
@@ -1825,6 +1892,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $msg='job:Descargando e instalando PostgreSQL 16 (~350 MB)… puede tardar unos minutos.';
             }
         } else { @unlink($ROOT.'/config/postgres.on'); $msg='info:PostgreSQL desactivándose.'; }
+    }
+    elseif ($action === 'mongodb') {
+        $tab = ($_POST['from_tab'] ?? '') === 'proyectos' ? 'proyectos' : 'config';
+        $enable = ($_POST['enable'] ?? '') === '1';
+        if ($enable) {
+            @file_put_contents($ROOT.'/config/mongodb.on','1');
+            if (is_file($ROOT.'/bin/mongodb/bin/mongod.exe')) {
+                $msg='info:MongoDB activándose. Conecta en 127.0.0.1:27017, sin autenticación.';
+            } else {
+                $id='mongodb-'.time();
+                $job=['id'=>$id,'name'=>'mongodb','php'=>($cfg['defaultPhp']??'8.4'),'type'=>'mongodb','url'=>''];
+                @mkdir($ROOT.'/tmp/jobs',0777,true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $msg='job:Descargando e instalando MongoDB + Node.js + mongo-express (~400-500 MB en total)… puede tardar varios minutos.';
+            }
+        } else { @unlink($ROOT.'/config/mongodb.on'); $msg='info:MongoDB desactivándose.'; }
     }
     elseif ($action === 'startup') {
         $tab='config';
@@ -3299,6 +3382,45 @@ setTimeout(ping,1500);})();
             </form>
           </div>
           <div class="muted" style="margin-bottom:16px;font-size:12px">Depuración paso a paso en el puerto <b>9003</b> (VS Code / PhpStorm)<?= $xnourl?' · <em>sin DLL disponible para esta versión</em>':'' ?>.</div>
+
+          <?php $extraList = extra_extensions($ROOT); sort($extraList); ?>
+          <div class="row" style="margin-bottom:4px">
+            <span style="font-weight:600">Extensiones adicionales</span>
+          </div>
+          <?php if ($extraList): ?>
+            <div style="margin-bottom:10px">
+              <?php foreach ($extraList as $en): $edll = is_file($PHP_BASE.'/'.$v.'/ext/php_'.$en.'.dll'); ?>
+                <div class="row" style="gap:8px;margin-bottom:4px">
+                  <code><?= e($en) ?></code>
+                  <span class="jstate <?= $edll?'ok':'err' ?>"><?= $edll?'INSTALADA':'NO INSTALADA' ?></span>
+                  <div class="spacer"></div>
+                  <?php if ($edll): ?><button type="button" class="btn danger sm" onclick="luaAskDelExt('<?= e($v) ?>','<?= e($en) ?>')">Quitar</button><?php endif; ?>
+                </div>
+              <?php endforeach; ?>
+            </div>
+          <?php endif; ?>
+          <form method="post" enctype="multipart/form-data" class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px">
+            <input type="hidden" name="action" value="phpext_add">
+            <input type="hidden" name="ver" value="<?= e($v) ?>">
+            <div>
+              <label>Nombre <span class="muted">(p.ej. pdo_sqlsrv)</span></label>
+              <input name="name" placeholder="pdo_sqlsrv" pattern="[a-z][a-z0-9_]*" required>
+            </div>
+            <div>
+              <label>URL directa al .dll <span class="muted">(opcional si subes archivo)</span></label>
+              <input name="url" type="url" placeholder="https://…/php_xxx.dll" style="min-width:260px">
+            </div>
+            <div>
+              <label>o sube el .dll</label>
+              <div class="row" style="gap:6px">
+                <input type="file" name="dll" id="dllInput-<?= e($v) ?>" accept=".dll" hidden onchange="document.getElementById('dllName-<?= e($v) ?>').textContent = this.files[0] ? this.files[0].name : 'Ningún archivo'">
+                <button type="button" class="btn ghost sm" onclick="document.getElementById('dllInput-<?= e($v) ?>').click()">Elegir archivo</button>
+                <span id="dllName-<?= e($v) ?>" class="muted" style="font-size:12px">Ningún archivo</span>
+              </div>
+            </div>
+            <button class="btn sm" type="submit">Añadir extensión</button>
+          </form>
+
           <form method="post">
             <input type="hidden" name="action" value="phpini">
             <input type="hidden" name="ver" value="<?= e($v) ?>">
@@ -3326,6 +3448,42 @@ setTimeout(ping,1500);})();
         </div>
       </details>
     <?php endforeach; endif; ?>
+
+    <!-- Modal de confirmacion para quitar una extension PHP de terceros -->
+    <div id="delExtModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDelExt()">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delExtTitle">
+        <div class="modal-ic">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+        </div>
+        <h3 id="delExtTitle">¿Quitar extensión?</h3>
+        <p class="modal-tx">Se borrará <strong id="delExtName"></strong> de PHP <strong id="delExtVer"></strong> y se aplicarán los cambios.</p>
+        <form method="post" class="modal-actions">
+          <input type="hidden" name="action" value="phpext_remove">
+          <input type="hidden" name="ver" id="delExtVerInput">
+          <input type="hidden" name="name" id="delExtNameInput">
+          <button type="button" class="btn ghost" onclick="luaCloseDelExt()">Cancelar</button>
+          <button type="submit" class="btn danger">Sí, quitar</button>
+        </form>
+      </div>
+    </div>
+    <script>
+      function luaAskDelExt(ver, name){
+        document.getElementById('delExtName').textContent = name;
+        document.getElementById('delExtVer').textContent = ver;
+        document.getElementById('delExtVerInput').value = ver;
+        document.getElementById('delExtNameInput').value = name;
+        document.getElementById('delExtModal').hidden = false;
+        document.addEventListener('keydown', luaEscDelExt);
+      }
+      function luaCloseDelExt(){
+        document.getElementById('delExtModal').hidden = true;
+        document.removeEventListener('keydown', luaEscDelExt);
+      }
+      function luaEscDelExt(e){ if(e.key==='Escape') luaCloseDelExt(); }
+    </script>
 
   <?php elseif ($tab==='logs'): /* ---------- PESTAÑA LOGS ---------- */
       $logDir = $ROOT.'/logs/apache';
@@ -3494,6 +3652,7 @@ setTimeout(ping,1500);})();
       [$mailCls,$mailLbl]   = svc_status($mailOn, 1025);
       [$mariaCls,$mariaLbl] = svc_status($mariaOn, 3306);
       [$pgCls,$pgLbl]       = svc_status($pgOn, 5432);
+      $mongoOn  = is_file($ROOT.'/config/mongodb.on');
       $termOn   = is_file($ROOT.'/config/terminal.on');
       $startupOn= startup_enabled($ROOT);
       $lanIps = array_values(array_filter(array_map('trim', explode(',', (string)@file_get_contents($ROOT.'/config/lan-ip.txt'))),
@@ -3586,6 +3745,21 @@ setTimeout(ping,1500);})();
 
       <div class="card">
         <div class="cfg3-body">
+          <div style="font-weight:600;margin-bottom:4px">Servidor MongoDB <span class="jstate <?= $mongoOn?'ok':'err' ?>"><?= $mongoOn?'ACTIVO':'INACTIVO' ?></span></div>
+          <div class="muted">Nativo (MongoDB Community) en <code>127.0.0.1:27017</code>, sin autenticación. Solo accesible desde esta máquina. Gestión visual vía <code>mongo-express</code> (Node.js, se instala junto al motor).</div>
+        </div>
+        <div class="cfg3-actions">
+          <?php if ($mongoOn): ?><a class="btn ghost" href="http://127.0.0.1:8081/" target="_blank">mongo-express &#8599;</a><?php endif; ?>
+          <form method="post">
+            <input type="hidden" name="action" value="mongodb">
+            <input type="hidden" name="enable" value="<?= $mongoOn?'0':'1' ?>">
+            <button class="btn <?= $mongoOn?'danger':'ghost' ?>" type="submit"><?= $mongoOn?'Desactivar':'Activar' ?> MongoDB</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="cfg3-body">
           <div style="font-weight:600;margin-bottom:4px">Terminal <span class="jstate <?= $termOn?'ok':'err' ?>"><?= $termOn?'ACTIVA':'INACTIVA' ?></span></div>
           <div class="muted">Ejecuta comandos (composer, git, npm, artisan…) desde el navegador con la misma cuenta que Apache. Desactivada por defecto por seguridad: solo actívala si confías en quién tiene acceso a esta máquina.</div>
         </div>
@@ -3672,7 +3846,7 @@ setTimeout(ping,1500);})();
               <div class="dbname"><?= e($db) ?></div>
               <div class="spacer"></div>
               <a class="btn ghost sm no-loader" href="?export_pg=<?= e(rawurlencode($db)) ?>">Exportar</a>
-              <form method="post" enctype="multipart/form-data" class="dbimport" onsubmit="return luaAskImportPg(event, this, '<?= e($db) ?>')">
+              <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportPg(event, this, '<?= e($db) ?>')">
                 <input type="hidden" name="action" value="pg_db_import">
                 <input type="hidden" name="dbname" value="<?= e($db) ?>">
                 <label class="filepick">
@@ -3822,7 +3996,7 @@ setTimeout(ping,1500);})();
             <div class="dbname"><?= e($db) ?></div>
             <div class="spacer"></div>
             <a class="btn ghost sm no-loader" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
-            <form method="post" enctype="multipart/form-data" class="dbimport" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
+            <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
               <input type="hidden" name="action" value="db_import">
               <input type="hidden" name="dbname" value="<?= e($db) ?>">
               <label class="filepick">
@@ -4112,7 +4286,7 @@ setTimeout(ping,1500);})();
         <ul>
           <li><strong>Apache + mod_fcgid</strong> sirviendo cada proyecto en su propio dominio local.</li>
           <li><strong>Varias versiones de PHP a la vez</strong> (7.1 a 8.5): cada proyecto elige la suya.</li>
-          <li><strong>MariaDB</strong> y <strong>PostgreSQL</strong> nativos opcionales, con phpMyAdmin y Adminer integrados.</li>
+          <li><strong>MariaDB</strong>, <strong>PostgreSQL</strong> y <strong>MongoDB</strong> nativos opcionales, con phpMyAdmin/Adminer/mongo-express integrados.</li>
           <li>Este <strong>panel web</strong> para gestionarlo todo sin tocar archivos de configuración a mano.</li>
         </ul>
         <p>El panel solo es accesible desde esta misma máquina (<code>http://127.0.0.1</code> o <code>http://<?= e($tld) ?></code>).</p>
@@ -4156,12 +4330,13 @@ setTimeout(ping,1500);})();
           <li>Ajustes rápidos: zona horaria, límite de memoria, tamaño de subida, tiempo de ejecución, mostrar errores…</li>
           <li>Directivas libres adicionales (una por línea, formato <code>clave = valor</code>).</li>
           <li><strong>Xdebug:</strong> se activa/desactiva por versión con un botón (depuración paso a paso en el puerto <code>9003</code> para VS Code o PhpStorm).</li>
+          <li><strong>Extensiones adicionales:</strong> instala cualquier extensión de terceros (p.ej. <code>pdo_sqlsrv</code> de Microsoft para SQL Server) subiendo el <code>.dll</code> ya extraído o pegando una URL directa. Se activa sola en cuanto el archivo existe para esa versión.</li>
         </ul>
       </section>
 
       <section id="bd">
         <h3><span class="n">4</span> Bases de datos</h3>
-        <p>La plataforma trae dos motores de base de datos, ambos opcionales y nativos (portables, se descargan al activarlos). En la pestaña <strong>Bases de datos</strong> hay un selector arriba para cambiar entre <strong>MySQL / MariaDB</strong> y <strong>PostgreSQL</strong>.</p>
+        <p>La plataforma trae varios motores de base de datos, todos opcionales y nativos (portables, se descargan al activarlos). En la pestaña <strong>Bases de datos</strong> hay un selector arriba para cambiar entre <strong>MySQL / MariaDB</strong> y <strong>PostgreSQL</strong> (MongoDB se gestiona aparte, ver más abajo).</p>
         <h4>MySQL (MariaDB)</h4>
         <p>MariaDB nativo en <code>127.0.0.1:3306</code>, usuario <code>root</code> (sin contraseña por defecto). Solo accesible desde esta máquina.</p>
         <ul>
@@ -4178,8 +4353,14 @@ setTimeout(ping,1500);})();
           <li><strong>Exportar</strong> (<code>pg_dump</code>) e <strong>importar</strong> (<code>psql</code>) una base de datos.</li>
           <li><strong>Adminer</strong> integrado (habla PostgreSQL de forma nativa) para gestionar tablas y datos.</li>
         </ul>
-        <p class="tip">Nota: <em>phpMyAdmin</em> solo sirve para MySQL; para PostgreSQL el gestor visual es Adminer, ya incluido.</p>
-        <p>Desde tus proyectos PHP conéctate con host <code>127.0.0.1</code>, puerto <code>3306</code> (MySQL, usuario <code>root</code>) o <code>5432</code> (PostgreSQL, usuario <code>postgres</code>).</p>
+        <h4>MongoDB</h4>
+        <p>MongoDB Community nativo en <code>127.0.0.1:27017</code>, sin autenticación (solo accesible desde esta máquina). Se activa desde <strong>Configuración del servidor</strong> con un botón: en la misma descarga se instala también un runtime de Node.js portable y <strong>mongo-express</strong>, su gestor visual.</p>
+        <ul>
+          <li>No pasa por Apache ni tiene dominio propio: <strong>mongo-express</strong> se abre directo en <code>http://127.0.0.1:8081/</code>, sin login.</li>
+          <li>mongo-express arranca y se detiene junto con el motor (un único botón para ambos).</li>
+        </ul>
+        <p class="tip">Nota: <em>phpMyAdmin</em> solo sirve para MySQL; para PostgreSQL el gestor visual es Adminer, ya incluido; para MongoDB es <em>mongo-express</em>.</p>
+        <p>Desde tus proyectos conéctate con host <code>127.0.0.1</code>, puerto <code>3306</code> (MySQL, usuario <code>root</code>), <code>5432</code> (PostgreSQL, usuario <code>postgres</code>) o <code>27017</code> (MongoDB, sin autenticación).</p>
       </section>
 
       <section id="https">

@@ -78,6 +78,23 @@ $PgDataDir     = Join-Path $Root "data\postgres"
 $PgLogDir      = Join-Path $Root "logs\postgres"
 $PostgresFlag  = Join-Path $Root "config\postgres.on"
 $PgPort        = 5432
+# --- MongoDB (Community Server, portable) ---
+$MongoDb        = Join-Path $Bin  "mongodb"
+$Mongod         = Join-Path $MongoDb "bin\mongod.exe"
+$MongoDataDir   = Join-Path $Root "data\mongodb"
+$MongoLogDir    = Join-Path $Root "logs\mongodb"
+$MongoConf      = Join-Path $Root "config\mongodb\mongod.cfg"
+$MongoDbFlag    = Join-Path $Root "config\mongodb.on"
+$MongoPort      = 27017
+# --- Node.js portable (runtime unicamente para mongo-express) ---
+$NodeDir        = Join-Path $Bin  "node"
+$NodeExe        = Join-Path $NodeDir "node.exe"
+$NpmCmd         = Join-Path $NodeDir "npm.cmd"
+# --- mongo-express (GUI web de MongoDB, corre sobre Node) ---
+$MongoExpress        = Join-Path $Root "bin\mongo-express"
+$MongoExpressApp     = Join-Path $MongoExpress "node_modules\mongo-express\app.js"
+$MongoExpressPidFile = Join-Path $TmpDir "mongo-express.pid"
+$MongoExpressPort    = 8081
 # --- Exponer en la red local (abrir puerto en el Firewall de Windows) ---
 $LanExposeFlag = Join-Path $Root "config\lanexpose.on"
 $LanIpFile     = Join-Path $Root "config\lan-ip.txt"
@@ -204,6 +221,17 @@ function Set-HttpdConf {
     Ok "httpd.conf apuntando a: $srv"
 }
 
+$ExtraExtFile = Join-Path $Root "config\php\extra-extensions.json"
+# Extensiones de terceros registradas desde el panel (nombre -> .dll esperado
+# php_<nombre>.dll por version, ver bin\php\<ver>\ext\). Complementa $WantExts
+# sin tocar codigo cada vez que se instala una nueva.
+function Get-ExtraExtensions {
+    if (-not (Test-Path $ExtraExtFile)) { return @() }
+    try {
+        $j = Get-Content $ExtraExtFile -Raw | ConvertFrom-Json
+        if ($j -is [array]) { return @($j) } else { return @() }
+    } catch { return @() }
+}
 function Set-PhpInis {
     foreach ($pd in (Get-ChildItem $PhpBase -Directory | Where-Object { Test-Path "$($_.FullName)\php-cgi.exe" })) {
         $ver = $pd.Name; $dir = $pd.FullName
@@ -216,7 +244,7 @@ function Set-PhpInis {
         if (Test-Path $dev) { Copy-Item $dev $ini -Force } elseif (Test-Path $prod) { Copy-Item $prod $ini -Force } else { Set-Content $ini "" -Encoding ascii }
         $lines = Get-Content $ini | ForEach-Object { if ($_ -match '^\s*(zend_)?extension\s*=') { ';' + $_ } else { $_ } }
         $enable = New-Object System.Collections.Generic.List[string]
-        foreach ($e in $WantExts) { if (Test-Path (Join-Path $ext "php_$e.dll")) { $enable.Add("extension=$(& $extName $e)") } }
+        foreach ($e in (@($WantExts) + @(Get-ExtraExtensions) | Select-Object -Unique)) { if (Test-Path (Join-Path $ext "php_$e.dll")) { $enable.Add("extension=$(& $extName $e)") } }
         if     (Test-Path (Join-Path $ext "php_gd.dll"))  { $enable.Add("extension=$(& $extName 'gd')") }
         elseif (Test-Path (Join-Path $ext "php_gd2.dll")) { $enable.Add("extension=$(& $extName 'gd2')") }
         $hasOp = Test-Path (Join-Path $ext "php_opcache.dll")
@@ -398,12 +426,13 @@ function Get-DomainClash($cfg, $domain, $exceptName) {
 
 function Cmd-Init {
     Info "Ajustando el stack a: $Root"
-    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$SslDir,(Join-Path $Root 'logs\php'),$MariaLogDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    foreach ($d in @($VhostDir,$ApacheLog,$TmpDir,$SslDir,(Join-Path $Root 'logs\php'),$MariaLogDir,$MongoLogDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
     if (-not (Test-Path $SitesJson)) { Save-Config (Get-Config) }
     Set-HttpdConf
     Set-PhpInis
     Set-Ssl
     Set-MariaDbIni
+    Set-MongoConf
     Regenerate-Vhosts
     if (Test-Path $Httpd) { Info "Validando Apache..."; if (Test-HttpdConfig) { Ok "Config de Apache: OK" } else { Err "Revisa la config de Apache (.\lua.ps1 logs)" } }
     Ok "Init completo. Arranca con:  .\lua.ps1 start"
@@ -547,6 +576,95 @@ function Stop-Postgres {
     }
 }
 
+# ---------------- MongoDB (portable, mismo patron que PostgreSQL) ----------------
+# "Up" se comprueba por el .pid que NOSOTROS le pedimos escribir via
+# processManagement.pidFilePath en mongod.cfg (no por nombre de proceso global ni por
+# el mongod.lock del datadir, cuyo formato no esta documentado) para no confundirnos
+# con otro proceso mongod.exe que el usuario pueda tener corriendo aparte.
+function Set-MongoConf {
+    New-Item -ItemType Directory -Force -Path (Split-Path $MongoConf) | Out-Null
+    New-Item -ItemType Directory -Force -Path $MongoDataDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $MongoLogDir  | Out-Null
+    $dd      = Fwd $MongoDataDir
+    $log     = Fwd (Join-Path $MongoLogDir "mongod.log")
+    $pidPath = Fwd (Join-Path $MongoDataDir "mongod.pid")
+    Set-Content -Path $MongoConf -Encoding ascii -Value @(
+        "# Generado por lua-server -- no editar a mano (se sobrescribe en cada init/start)",
+        "storage:",
+        "  dbPath: $dd",
+        "systemLog:",
+        "  destination: file",
+        "  path: $log",
+        "  logAppend: true",
+        "net:",
+        "  bindIp: 127.0.0.1",
+        "  port: $MongoPort",
+        "processManagement:",
+        "  pidFilePath: $pidPath"
+    )
+}
+function MongoDb-Up {
+    $pidFile = Join-Path $MongoDataDir "mongod.pid"
+    if (-not (Test-Path $pidFile)) { return $false }
+    $thePid = Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue
+    if (-not $thePid) { return $false }
+    $p = Get-Process -Id ([int]$thePid) -ErrorAction SilentlyContinue
+    return ($p -and $p.ProcessName -eq 'mongod')
+}
+function Start-MongoDb {
+    if (-not (Test-Path $Mongod)) { return }
+    if (MongoDb-Up) { return }
+    Set-MongoConf
+    Start-Process -FilePath $Mongod -WindowStyle Hidden -ArgumentList @("--config", "`"$MongoConf`"")
+}
+function Stop-MongoDb {
+    # No hay mongosh/cliente bundleado para pedir un shutdown limpio (mongo-express no
+    # lo trae). Matamos por PID propio -- WiredTiger con journaling (activo por defecto)
+    # hace esto seguro para un almacen de desarrollo de un solo nodo, mismo nivel de
+    # rigor que el fallback final de Stop-MariaDb.
+    $pidFile = Join-Path $MongoDataDir "mongod.pid"
+    if ((Test-Path $pidFile) -and (MongoDb-Up)) {
+        $thePid = Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($thePid) { Stop-Process -Id ([int]$thePid) -Force -ErrorAction SilentlyContinue }
+        for ($i=0; $i -lt 20; $i++) { if (-not (MongoDb-Up)) { break }; Start-Sleep -Milliseconds 250 }
+    }
+    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------- mongo-express (GUI web de MongoDB, sobre Node) ----------------
+# "Up" se comprueba por un .pid propio que escribimos nosotros al arrancarlo (igual
+# de robusto que el enfoque de Postgres/Mongo) para no confundirnos con cualquier
+# otro proceso node.exe que el usuario tenga corriendo por su cuenta.
+function MongoExpress-Up {
+    if (-not (Test-Path $MongoExpressPidFile)) { return $false }
+    $thePid = Get-Content $MongoExpressPidFile -TotalCount 1 -ErrorAction SilentlyContinue
+    if (-not $thePid) { return $false }
+    $p = Get-Process -Id ([int]$thePid) -ErrorAction SilentlyContinue
+    return ($p -and $p.ProcessName -eq 'node')
+}
+function Start-MongoExpress {
+    if (-not (Test-Path $NodeExe)) { return }
+    if (-not (Test-Path $MongoExpressApp)) { return }
+    if (-not (MongoDb-Up)) { return }
+    if (MongoExpress-Up) { return }
+    # Sin autenticacion (ME_CONFIG_BASICAUTH_ENABLED=false): mismo modelo que el root
+    # sin contrasena de MariaDB y el trust de PostgreSQL -- solo accesible en 127.0.0.1.
+    $env:ME_CONFIG_MONGODB_SERVER      = "127.0.0.1"
+    $env:ME_CONFIG_MONGODB_PORT        = "$MongoPort"
+    $env:ME_CONFIG_SITE_PORT           = "$MongoExpressPort"
+    $env:ME_CONFIG_BASICAUTH_ENABLED   = "false"
+    $env:ME_CONFIG_MONGODB_ENABLE_ADMIN= "true"
+    $proc = Start-Process -FilePath $NodeExe -ArgumentList @("`"$MongoExpressApp`"") -WindowStyle Hidden -PassThru
+    Set-Content -Path $MongoExpressPidFile -Value $proc.Id -Encoding ascii
+}
+function Stop-MongoExpress {
+    if (Test-Path $MongoExpressPidFile) {
+        $thePid = Get-Content $MongoExpressPidFile -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($thePid) { Stop-Process -Id ([int]$thePid) -Force -ErrorAction SilentlyContinue }
+    }
+    Remove-Item $MongoExpressPidFile -Force -ErrorAction SilentlyContinue
+}
+
 function Cmd-Start {
     if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
     elseif (Apache-Up) { Info "Apache ya estaba arriba" }
@@ -555,6 +673,7 @@ function Cmd-Start {
     if (Test-Path $MailpitFlag) { Start-Mailpit }
     if (Test-Path $MariaDbFlag) { Start-MariaDb }
     if (Test-Path $PostgresFlag) { Start-Postgres }
+    if (Test-Path $MongoDbFlag) { Start-MongoDb; if (MongoDb-Up) { Start-MongoExpress } }
     Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
@@ -564,6 +683,8 @@ function Cmd-Stop {
     if (Test-Path $pf) { $wp = Get-Content $pf -ErrorAction SilentlyContinue; if ($wp) { Stop-Process -Id ([int]$wp) -Force -ErrorAction SilentlyContinue }; Remove-Item $pf -Force -ErrorAction SilentlyContinue }
     Stop-Mailpit
     Stop-MariaDb
+    Stop-MongoExpress
+    Stop-MongoDb
     Ok "Apache detenido."
 }
 
@@ -608,6 +729,12 @@ function Cmd-Watch {
                 if ([datetime]::Now -ge $nextPgTry) { Start-Postgres; $nextPgTry = [datetime]::Now.AddSeconds(30) }
             } elseif ($pgOn -and (Postgres-Up)) { $nextPgTry = [datetime]::MinValue }
             if (-not $pgOn -and (Postgres-Up)) { Stop-Postgres }
+            # Reconciliar MongoDB (+ mongo-express) con su flag
+            $mongoOn = Test-Path $MongoDbFlag
+            if ($mongoOn -and (Test-Path $Mongod) -and -not (MongoDb-Up)) { Start-MongoDb }
+            if (-not $mongoOn -and (MongoDb-Up)) { Stop-MongoDb }
+            if ($mongoOn -and (MongoDb-Up) -and -not (MongoExpress-Up)) { Start-MongoExpress }
+            if ((-not $mongoOn -or -not (MongoDb-Up)) -and (MongoExpress-Up)) { Stop-MongoExpress }
             Process-Jobs
         } catch {
             # Antes esto se tragaba en silencio: un fallo aqui (p.ej. Restart-Service
@@ -743,7 +870,7 @@ function Download-WordPress($dir, $log) {
     "WordPress descomprimido." | Add-Content $log
 }
 function Run-Job($id, $job) {
-    $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"; $withdb=[bool]$job.withdb
+    $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"; $withdb=[bool]$job.withdb; $extName="$($job.extName)"
     $logDir = Join-Path $Root "logs\jobs"; New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $log = Join-Path $logDir "$id.log"
     $dir = Join-Path $Www $name
@@ -762,6 +889,7 @@ function Run-Job($id, $job) {
             "wordpress" { Download-WordPress $dir $log }
             "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
             "xdebug"    { $dest = Join-Path $PhpBase "$php\ext\php_xdebug.dll"; "Descargando Xdebug: $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 20000)) { $ok=$false; $err="No se descargo la DLL de Xdebug"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Xdebug descargado ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
+            "phpext"    { $dest = Join-Path $PhpBase "$php\ext\php_$extName.dll"; "Descargando extension '$extName': $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 1024)) { $ok=$false; $err="No se descargo el .dll (revisa la URL)"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Extension '$extName' descargada ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
             "mailpit"   { $mpDir = Join-Path $Bin "mailpit"; New-Item -ItemType Directory -Force -Path $mpDir | Out-Null; $zip = Join-Path $mpDir "mailpit.zip"; "Descargando Mailpit..." | Add-Content $log; & curl.exe -s -L -o "$zip" "https://github.com/axllent/mailpit/releases/latest/download/mailpit-windows-amd64.zip" 2>&1 | Add-Content $log; if (Test-Path $zip) { Expand-Archive $zip $mpDir -Force; Remove-Item $zip -Force -ErrorAction SilentlyContinue }; if (-not (Test-Path $Mailpit)) { $ok=$false; $err="No se descargo Mailpit" } else { "Mailpit descargado." | Add-Content $log } }
             "mariadb"   {
                 $mdDir = Join-Path $Bin "mariadb"; New-Item -ItemType Directory -Force -Path $mdDir | Out-Null
@@ -800,6 +928,51 @@ function Run-Job($id, $job) {
                 }
                 if (-not (Test-Path $PgCtl)) { $ok=$false; $err="No se descargo PostgreSQL" } else { "PostgreSQL descargado." | Add-Content $log }
             }
+            "mongodb"   {
+                $mgDir = Join-Path $Bin "mongodb"; New-Item -ItemType Directory -Force -Path $mgDir | Out-Null
+                $zip = Join-Path $mgDir "mongodb.zip"
+                "Descargando MongoDB Community 8.0 (esto puede tardar, ~450 MB)..." | Add-Content $log
+                & curl.exe -s -L -o "$zip" "https://fastdl.mongodb.org/windows/mongodb-windows-x86_64-8.0.4.zip" 2>&1 | Add-Content $log
+                if (Test-Path $zip) {
+                    $work = Join-Path $TmpDir ("mg-" + [System.IO.Path]::GetRandomFileName())
+                    Expand-Archive $zip $work -Force
+                    # el zip trae una carpeta raiz "mongodb-win32-x86_64-..." con bin/
+                    $inner = Get-ChildItem $work -Directory | Select-Object -First 1
+                    if ($inner) {
+                        Get-ChildItem $mgDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'mongodb.zip' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $inner.FullName -Force | Move-Item -Destination $mgDir -Force
+                    }
+                    Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                }
+                if (-not (Test-Path $Mongod)) { $ok=$false; $err="No se descargo MongoDB" } else { "MongoDB descargado." | Add-Content $log }
+                # Node.js portable, solo si hace falta (runtime para mongo-express)
+                if ($ok -and -not (Test-Path $NodeExe)) {
+                    New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
+                    $nzip = Join-Path $NodeDir "node.zip"
+                    "Descargando Node.js LTS (runtime para mongo-express)..." | Add-Content $log
+                    & curl.exe -s -L -o "$nzip" "https://nodejs.org/dist/v22.13.1/node-v22.13.1-win-x64.zip" 2>&1 | Add-Content $log
+                    if (Test-Path $nzip) {
+                        $nwork = Join-Path $TmpDir ("node-" + [System.IO.Path]::GetRandomFileName())
+                        Expand-Archive $nzip $nwork -Force
+                        $ninner = Get-ChildItem $nwork -Directory | Select-Object -First 1
+                        if ($ninner) {
+                            Get-ChildItem $NodeDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'node.zip' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                            Get-ChildItem $ninner.FullName -Force | Move-Item -Destination $NodeDir -Force
+                        }
+                        Remove-Item $nwork -Recurse -Force -ErrorAction SilentlyContinue
+                        Remove-Item $nzip -Force -ErrorAction SilentlyContinue
+                    }
+                    if (-not (Test-Path $NodeExe)) { $ok=$false; $err="No se descargo Node.js" } else { "Node.js descargado." | Add-Content $log }
+                }
+                # mongo-express (GUI web), instalado via npm del Node bundleado
+                if ($ok -and -not (Test-Path $MongoExpressApp)) {
+                    New-Item -ItemType Directory -Force -Path $MongoExpress | Out-Null
+                    "Instalando mongo-express (npm)..." | Add-Content $log
+                    & $NpmCmd install mongo-express --no-save --no-audit --no-fund --production --prefix "$MongoExpress" 2>&1 | Add-Content $log
+                    if (-not (Test-Path $MongoExpressApp)) { $ok=$false; $err="No se instalo mongo-express (ver log)" } else { "mongo-express instalado." | Add-Content $log }
+                }
+            }
             "ftp_deploy" {
                 $ftpHost = "$($job.ftpHost)"; $ftpPort = "$($job.ftpPort)"; $ftpUser = "$($job.ftpUser)"; $ftpPass = "$($job.ftpPass)"
                 $ftpPath = "$($job.ftpPath)".Trim('/'); $ftpSsl = [bool]$job.ftpSsl
@@ -830,7 +1003,7 @@ function Run-Job($id, $job) {
             }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'ftp_deploy') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'ftp_deploy') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -838,6 +1011,10 @@ function Run-Job($id, $job) {
             Set-PhpInis | Out-Null
             if (Test-HttpdConfig) { Restart-Apache }
             Set-JobStatus $id $name $type "done" "Xdebug activado en PHP $php"
+        } elseif ($type -eq 'phpext') {
+            Set-PhpInis | Out-Null
+            if (Test-HttpdConfig) { Restart-Apache }
+            Set-JobStatus $id $name $type "done" "Extension '$extName' instalada para PHP $php."
         } elseif ($type -eq 'mailpit') {
             Set-PhpInis | Out-Null
             Start-Mailpit
@@ -855,6 +1032,11 @@ function Run-Job($id, $job) {
             Start-Postgres
             if (Postgres-Up) { Set-JobStatus $id $name $type "done" "PostgreSQL activo en 127.0.0.1:5432 (usuario postgres, sin contrasena)" }
             else { Set-JobStatus $id $name $type "error" "PostgreSQL se descargo pero no arranco (revisa logs\postgres)" }
+        } elseif ($type -eq 'mongodb') {
+            Start-MongoDb
+            if (MongoDb-Up) { Start-MongoExpress }
+            if ((MongoDb-Up) -and (MongoExpress-Up)) { Set-JobStatus $id $name $type "done" "MongoDB activo en 127.0.0.1:27017 (sin autenticacion). mongo-express en http://127.0.0.1:8081/" }
+            else { Set-JobStatus $id $name $type "error" "MongoDB se descargo pero no arranco del todo (revisa logs\mongodb y logs\jobs)" }
         } elseif ($type -eq 'ftp_deploy') {
             Set-JobStatus $id $name $type "done" "Desplegado por FTP a $ftpHost ($total archivo(s))"
         } else {
@@ -1008,6 +1190,8 @@ function Cmd-Status {
     Write-Host ("  PHP instalados  : {0}" -f ((Get-PhpVersions) -join ', '))
     $mdTxt = "apagado"; $mdC = "Yellow"; if (MariaDb-Up) { $mdTxt="corriendo (127.0.0.1:3306)"; $mdC="Green" }
     Write-Host "  MySQL (MariaDB) : " -NoNewline; Write-Host $mdTxt -ForegroundColor $mdC
+    $mgTxt = "apagado"; $mgC = "Yellow"; if (MongoDb-Up) { $mgTxt="corriendo (127.0.0.1:27017)"; $mgC="Green" }
+    Write-Host "  MongoDB         : " -NoNewline; Write-Host $mgTxt -ForegroundColor $mgC
     Write-Host "  Sitios:"; Cmd-ListSites; Write-Host ""
 }
 function Cmd-Hosts {

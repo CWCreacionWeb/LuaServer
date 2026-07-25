@@ -15,11 +15,13 @@
 /config/mariadb.on
 /config/postgres.on
 /config/postgres_root.pass
+/config/mongodb.on
 /config/terminal.on
 /config/lanexpose.on
 /config/lan-ip.txt
 /config/mysql_root.pass
 /config/ftp/
+/config/php/extra-extensions.json
 
 # ===== registro de proyectos: estado de cada maquina (plantilla: sites.example.json) =====
 /config/sites.json
