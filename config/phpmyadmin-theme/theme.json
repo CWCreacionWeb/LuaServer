@@ -1,0 +1,8 @@
+{
+    "name": "lua",
+    "version": "1.0",
+    "description": "Tema del panel lua-server (oscuro/claro segun el sistema)",
+    "author": "lua-server",
+    "url": "http://localhost",
+    "supports": ["5.0", "5.1", "5.2"]
+}

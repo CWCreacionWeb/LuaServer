@@ -139,6 +139,33 @@ function Install-CatalogItem {
             Move-Item $inner.FullName $dest -Force
             Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
+            # Reconstruye el tema "lua" (personalizado) a partir del tema de fabrica
+            # "pmahomme" que acaba de llegar en el zip: iconos y screen.png son
+            # identicos a los de fabrica (no hace falta versionarlos), solo
+            # theme.json/fonts/override.css son de lua-server (versionados en
+            # config\phpmyadmin-theme\) y logo/favicon se reusan de tools\dashboard\assets\
+            # (ya versionados, son los mismos archivos).
+            $themeSrc = Join-Path $dest "themes\pmahomme"
+            $themeDst = Join-Path $dest "themes\lua"
+            $luaThemeCfg = Join-Path $Root "config\phpmyadmin-theme"
+            if ((Test-Path $themeSrc) -and (Test-Path $luaThemeCfg)) {
+                Copy-Item $themeSrc $themeDst -Recurse -Force
+                Copy-Item (Join-Path $luaThemeCfg "theme.json") (Join-Path $themeDst "theme.json") -Force
+                Copy-Item (Join-Path $Root "tools\dashboard\assets\logo.svg")    (Join-Path $themeDst "logo.svg") -Force
+                Copy-Item (Join-Path $Root "tools\dashboard\assets\favicon.svg") (Join-Path $themeDst "favicon.svg") -Force
+                New-Item -ItemType Directory -Force -Path (Join-Path $themeDst "fonts") | Out-Null
+                Copy-Item (Join-Path $luaThemeCfg "fonts\*") (Join-Path $themeDst "fonts") -Force
+                # -Encoding UTF8 explicito al leer: el theme.css de pmahomme es UTF-8 SIN
+                # BOM, y Get-Content sin -Encoding lo interpreta con el codepage ANSI del
+                # sistema, corrompiendo cualquier caracter no-ASCII (p.ej. un guion largo
+                # queda como "â€”"). WriteAllText + UTF8Encoding($false) al escribir: sin
+                # BOM (Set-Content -Encoding utf8 en PowerShell 5.1 SI escribe BOM, y el
+                # theme.css original no lo lleva).
+                $vendorCss   = Get-Content (Join-Path $themeDst "css\theme.css") -Raw -Encoding UTF8
+                $overrideCss = Get-Content (Join-Path $luaThemeCfg "override.css") -Raw -Encoding UTF8
+                [System.IO.File]::WriteAllText((Join-Path $themeDst "css\theme.css"), ($vendorCss + "`n" + $overrideCss), (New-Object System.Text.UTF8Encoding($false)))
+            }
+
             $secret = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
             $cfgPhp = @"
 <?php
@@ -152,6 +179,8 @@ function Install-CatalogItem {
 `$cfg['Servers'][`$i]['AllowNoPassword'] = true;
 `$cfg['UploadDir'] = '';
 `$cfg['SaveDir'] = '';
+`$cfg['ThemeDefault'] = 'lua';
+`$cfg['ThemeManager'] = true;
 "@
             [System.IO.File]::WriteAllText((Join-Path $dest "config.inc.php"), $cfgPhp, (New-Object System.Text.UTF8Encoding($false)))
         }
