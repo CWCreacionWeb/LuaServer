@@ -2194,11 +2194,12 @@ setTimeout(ping,1500);})();
   .btn-git{display:inline-flex;align-items:center;gap:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:5px;padding:8px 16px;font-size:14px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:background-color .12s}
   .btn-git:hover{background:#22272e}
 
-  .dbrow{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
+  .dbrow{display:flex;align-items:center;flex-wrap:wrap;gap:16px;padding:14px 0;border-top:1px solid var(--line)}
   .dbrow:first-of-type{border-top:none}
   .dbrow .dbname{font-weight:600;font-family:ui-monospace,Consolas,monospace;font-size:13px}
-  .dbimport{display:flex;align-items:center;gap:6px}
-  .filepick{position:relative;display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border:1px dashed var(--line);border-radius:5px;color:var(--mut);font-size:12px;cursor:pointer;max-width:170px;min-width:0;transition:color .12s,border-color .12s,background-color .12s}
+  .dbactions{display:flex;align-items:center;gap:16px;min-width:420px;justify-content:flex-end}
+  .dbimport{display:flex;align-items:center;gap:10px}
+  .filepick{position:relative;display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px dashed var(--line);border-radius:5px;color:var(--mut);font-size:12px;cursor:pointer;max-width:190px;min-width:0;transition:color .12s,border-color .12s,background-color .12s}
   .filepick:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.06)}
   .filepick.has-file{color:var(--tx);border-style:solid}
   .filepick svg{flex:0 0 auto}
@@ -3791,6 +3792,7 @@ setTimeout(ping,1500);})();
   <?php elseif ($tab==='bd'): /* ---------- PESTAÑA BASES DE DATOS ---------- */
       $mariaOn = is_file($ROOT.'/config/mariadb.on');
       $pgOn    = is_file($ROOT.'/config/postgres.on');
+      $mongoOn = is_file($ROOT.'/config/mongodb.on');
       $rootHasPass = mysql_root_pass($ROOT) !== '';
       $mysqlUsers = $mariaOn ? mysql_users() : null;
       // Motor mostrado: ?engine=pg|mysql. Por defecto MySQL, salvo que solo Postgres este activo.
@@ -3800,7 +3802,15 @@ setTimeout(ping,1500);})();
     <div class="row" style="gap:8px;margin-bottom:16px">
       <a class="btn <?= $dbEngine==='mysql'?'':'ghost' ?> sm" href="?tab=bd&engine=mysql">MySQL / MariaDB<?= $mariaOn?'':' · inactivo' ?></a>
       <a class="btn <?= $dbEngine==='pg'?'':'ghost' ?> sm" href="?tab=bd&engine=pg">PostgreSQL<?= $pgOn?'':' · inactivo' ?></a>
+      <?php if ($mongoOn): ?>
+        <a class="btn ghost sm" href="http://127.0.0.1:8081/" target="_blank">MongoDB (mongo-express &#8599;)</a>
+      <?php else: ?>
+        <a class="btn ghost sm" href="?tab=config">MongoDB · inactivo</a>
+      <?php endif; ?>
     </div>
+    <?php if ($mongoOn): ?>
+      <div class="muted" style="margin-bottom:16px;font-size:12px">MongoDB no usa SQL, así que no tiene un listado de bases de datos aquí: gestiónalo desde <b>mongo-express</b> (arriba).</div>
+    <?php endif; ?>
 
     <?php if ($dbEngine==='pg'): /* ===== PostgreSQL ===== */ ?>
 
@@ -3845,18 +3855,20 @@ setTimeout(ping,1500);})();
             <div class="dbrow">
               <div class="dbname"><?= e($db) ?></div>
               <div class="spacer"></div>
-              <a class="btn ghost sm no-loader" href="?export_pg=<?= e(rawurlencode($db)) ?>">Exportar</a>
-              <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportPg(event, this, '<?= e($db) ?>')">
-                <input type="hidden" name="action" value="pg_db_import">
-                <input type="hidden" name="dbname" value="<?= e($db) ?>">
-                <label class="filepick">
-                  <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
-                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                  <span class="filepick-name">Elegir .sql&hellip;</span>
-                </label>
-                <button class="btn ghost sm" type="submit">Importar</button>
-              </form>
-              <button type="button" class="btn danger sm" onclick="luaAskDropPg('<?= e($db) ?>')">Eliminar</button>
+              <div class="dbactions">
+                <a class="btn ghost sm no-loader" href="?export_pg=<?= e(rawurlencode($db)) ?>">Exportar</a>
+                <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportPg(event, this, '<?= e($db) ?>')">
+                  <input type="hidden" name="action" value="pg_db_import">
+                  <input type="hidden" name="dbname" value="<?= e($db) ?>">
+                  <label class="filepick">
+                    <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <span class="filepick-name">Elegir .sql&hellip;</span>
+                  </label>
+                  <button class="btn ghost sm" type="submit">Importar</button>
+                </form>
+                <button type="button" class="btn danger sm" onclick="luaAskDropPg('<?= e($db) ?>')">Eliminar</button>
+              </div>
             </div>
           <?php endforeach; endif; ?>
         </div>
@@ -3995,18 +4007,20 @@ setTimeout(ping,1500);})();
           <div class="dbrow">
             <div class="dbname"><?= e($db) ?></div>
             <div class="spacer"></div>
-            <a class="btn ghost sm no-loader" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
-            <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
-              <input type="hidden" name="action" value="db_import">
-              <input type="hidden" name="dbname" value="<?= e($db) ?>">
-              <label class="filepick">
-                <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
-                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                <span class="filepick-name">Elegir .sql&hellip;</span>
-              </label>
-              <button class="btn ghost sm" type="submit">Importar</button>
-            </form>
-            <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
+            <div class="dbactions">
+              <a class="btn ghost sm no-loader" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
+              <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
+                <input type="hidden" name="action" value="db_import">
+                <input type="hidden" name="dbname" value="<?= e($db) ?>">
+                <label class="filepick">
+                  <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  <span class="filepick-name">Elegir .sql&hellip;</span>
+                </label>
+                <button class="btn ghost sm" type="submit">Importar</button>
+              </form>
+              <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
+            </div>
           </div>
         <?php endforeach; endif; ?>
       </div>
