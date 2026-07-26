@@ -28,8 +28,22 @@ admin salvo cuando hace falta (HTTPS, hosts, servicio de Windows).
   `tools/phpmyadmin/` (fuera de `www\`, vía el campo `path` en
   `sites.json`, igual que un proyecto externo) para que `www\` quede
   limpio. Tampoco está en este repo (`/tools/phpmyadmin/` en
-  `.gitignore`) — si se reinstala desde cero hay que rehacer el tema
-  `lua`.
+  `.gitignore`), pero el tema `lua` **sí** — su parte realmente custom
+  (todo lo demás es idéntico de fábrica al tema `pmahomme`: los 254
+  iconos y `screen.png` no se versionan, se copian tal cual en cada
+  instalación) vive en `config/phpmyadmin-theme/` (`theme.json`,
+  `override.css` — el bloque de reskin, no el `theme.css` de
+  `pmahomme` — y las dos fuentes autoalojadas). `logo.svg`/`favicon.svg`
+  se reutilizan directamente de `tools/dashboard/assets/` (mismos
+  archivos que el logo del panel, ya versionados, sin duplicar). Al
+  (re)instalar phpMyAdmin (`Install-CatalogItem`, caso `'phpmyadmin'`,
+  en `config/install-lib.ps1`, usado tanto por `install.ps1` como por
+  `bootstrap.ps1`), el tema `lua` se reconstruye solo: copia
+  `themes/pmahomme/` → `themes/lua/`, pisa `theme.json`/fuentes/logo con
+  las versiones de lua-server, y concatena el `theme.css` recién
+  copiado (fábrica) con `override.css` (custom). `config.inc.php` fija
+  además `ThemeDefault = 'lua'` para que arranque ya con ese tema, sin
+  tener que elegirlo a mano en el selector de temas de phpMyAdmin.
 
 ## ⚠️ Trampa nº1: el watcher cachea el código en memoria
 

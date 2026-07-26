@@ -1,0 +1,446 @@
+/* ============================================================
+   lua-server :: reskin de phpMyAdmin con la identidad del panel
+   Mismos tokens y MISMO mecanismo que tools/dashboard/index.php:
+   oscuro por defecto, claro via prefers-color-scheme: light.
+   No es "un tema oscuro": se adapta al sistema, igual que el panel.
+   ============================================================ */
+:root,
+[data-bs-theme=light],
+[data-bs-theme=dark]{
+  --lua-bg:#0f1117;
+  --lua-card:#1a1d27;
+  --lua-in:#11141c;
+  --lua-line:#2a2f3d;
+  --lua-tx:#e6e8ee;
+  --lua-mut:#8b90a0;
+  --lua-ac:#6ea8fe;
+  --lua-ac-hover:#5a97f0;
+  --lua-ok:#3fb950;
+  --lua-warn:#d29922;
+  --lua-err:#f85149;
+  --lua-err-dark:#b3261e;
+  --lua-brand-start:#6ea8fe;
+  --lua-brand-end:#9b6efe;
+}
+@media (prefers-color-scheme: light){
+  :root,
+  [data-bs-theme=light],
+  [data-bs-theme=dark]{
+    --lua-bg:#f4f6fb;
+    --lua-card:#fff;
+    --lua-in:#fff;
+    --lua-line:#e3e7f0;
+    --lua-tx:#1a1d27;
+    --lua-mut:#5b6172;
+    --lua-ac:#2b6cff;
+    --lua-ac-hover:#1a5ae8;
+    /* ok/warn/err/brand-start/brand-end: iguales en ambos modos (igual que el panel) */
+  }
+}
+
+/* Tipografia: autoalojada (sin CDN externo, coherente con lua-server portable).
+   Space Grotesk para UI (geometrica, tecnologica) + JetBrains Mono para
+   codigo/SQL. Ambas son variable fonts: un solo archivo cubre todos los pesos. */
+@font-face{
+  font-family:'Space Grotesk';
+  font-style:normal;
+  font-weight:400 700;
+  font-display:swap;
+  src:url('../fonts/space-grotesk.woff2') format('woff2');
+  unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215;
+}
+@font-face{
+  font-family:'JetBrains Mono';
+  font-style:normal;
+  font-weight:400 600;
+  font-display:swap;
+  src:url('../fonts/jetbrains-mono.woff2') format('woff2');
+  unicode-range:U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215;
+}
+:root{
+  --lua-font-sans:'Space Grotesk',system-ui,'Segoe UI',Roboto,sans-serif;
+  --lua-font-mono:'JetBrains Mono',ui-monospace,Consolas,monospace;
+}
+
+/* Variables internas de Bootstrap que usa pmahomme */
+:root{
+  --bs-body-bg:var(--lua-bg);
+  --bs-body-color:var(--lua-tx);
+  --bs-body-font-family:var(--lua-font-sans);
+  --bs-border-color:var(--lua-line);
+  --bs-border-radius:8px;
+  --bs-primary:var(--lua-ac);
+  --bs-primary-rgb:110,168,254;
+  --bs-link-color:var(--lua-ac);
+  --bs-link-hover-color:var(--lua-ac-hover);
+  --bs-emphasis-color:var(--lua-tx);
+  --bs-secondary-color:var(--lua-mut);
+  --bs-tertiary-bg:var(--lua-in);
+  --bs-heading-color:var(--lua-tx);
+}
+
+/* ---------- Base ---------- */
+html,body{background:var(--lua-bg) !important;color:var(--lua-tx) !important}
+html,body,button,input,select,textarea,.btn,.form-control,.form-select,
+.navbar,.nav-link,.card,.dropdown-menu,.modal-content,table,th,td,label{
+  font-family:var(--lua-font-sans) !important;
+}
+body{font-size:14px}
+h1,h2,h3,h4,h5,h6,.card-header,summary{font-family:var(--lua-font-sans) !important;letter-spacing:-.01em}
+a{color:var(--lua-ac) !important;text-decoration:none}
+a:hover{color:var(--lua-ac-hover) !important}
+hr{border-color:var(--lua-line);opacity:1}
+.text-muted,.text-secondary,small,.small{color:var(--lua-mut) !important}
+h1,h2,h3,h4,h5,h6{color:var(--lua-tx)}
+::selection{background:rgba(110,168,254,.30)}
+
+*{scrollbar-color:var(--lua-line) transparent}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--lua-line);border-radius:999px}
+
+/* ============================================================
+   MARCA — logo LUA con degradado (idéntico al panel)
+   ============================================================ */
+#pma_navigation_header #pmalogo{
+  display:flex !important;
+  align-items:center;
+  gap:11px;
+  padding:14px 16px !important;
+  margin:0 !important;
+  border-bottom:1px solid var(--lua-line) !important;
+  background:transparent !important;
+  text-align:left !important;
+  min-height:0 !important;
+}
+#pma_navigation_header #pmalogo a{display:contents}
+#pma_navigation_header #pmalogo img,
+#pma_navigation_header #pmalogo h1{display:none !important}
+#pma_navigation_header #pmalogo::before{
+  content:"";
+  flex-shrink:0;
+  width:40px;height:40px;
+  background:url('../logo.svg') center/contain no-repeat;
+}
+#pma_navigation_header #pmalogo::after{
+  content:"lua-server";
+  color:var(--lua-tx);
+  font-weight:700;font-size:16px;letter-spacing:.2px;
+}
+
+.container:has(#login_form) .logo,
+.loginform .logo,
+form.login .logo{
+  display:flex !important;
+  flex-direction:column;
+  align-items:center;
+  gap:12px;
+  width:100%;
+  margin:0 0 6px !important;
+}
+.container:has(#login_form) .logo img,
+.loginform .logo img{display:none !important}
+.container:has(#login_form) .logo::before,
+.loginform .logo::before{
+  content:"";
+  width:64px;height:60px;
+  background:url('../logo.svg') center/contain no-repeat;
+}
+
+/* ============================================================
+   PANTALLA DE LOGIN — tarjeta centrada estilo panel
+   ============================================================ */
+.container:has(#login_form){
+  max-width:460px !important;
+  margin:9vh auto 0 !important;
+}
+.container:has(#login_form) h1{
+  text-align:center;
+  font-size:19px !important;
+  font-weight:700 !important;
+  margin:0 0 20px !important;
+}
+#login_form .card,
+.container:has(#login_form) .card{
+  background:var(--lua-card) !important;
+  border:1px solid var(--lua-line) !important;
+  border-radius:8px !important;
+  box-shadow:0 8px 30px rgba(0,0,0,.12);
+}
+#login_form .card-header{
+  background:transparent !important;
+  border-bottom:1px solid var(--lua-line) !important;
+  font-weight:700;font-size:14px;
+  color:var(--lua-tx) !important;
+}
+#login_form .btn-primary,
+#login_form input[type=submit]{width:100%;margin-top:6px}
+
+/* ============================================================
+   SIDEBAR DE NAVEGACIÓN
+   ============================================================ */
+#pma_navigation{
+  background:var(--lua-card) !important;
+  color:var(--lua-tx) !important;
+  border-right:1px solid var(--lua-line) !important;
+}
+#pma_navigation_content,#pma_navigation_tree,
+.pma_quick_warp,#navigationMain,#pma_navigation_header{
+  background:transparent !important;color:var(--lua-tx) !important;
+}
+#navipanellinks{border-bottom:1px solid var(--lua-line);padding-bottom:6px}
+#navipanellinks a{color:var(--lua-mut) !important}
+#navipanellinks a:hover{color:var(--lua-ac) !important}
+#pma_navigation a,#pma_navigation span,#navigationMain a,
+#pma_navigation .list-group-item{color:var(--lua-tx) !important;background:transparent !important}
+#pma_navigation li a:hover,
+#pma_navigation .list-group-item:hover{background:var(--lua-line) !important}
+#pma_navigation li.selected>a,#pma_navigation .selected>a{
+  background:rgba(110,168,254,.14) !important;color:var(--lua-ac) !important;
+}
+#pma_navigation_resizer{background:var(--lua-line) !important}
+.fast_filter input,.fast_filter{background:var(--lua-in) !important}
+.pageselector,.navItemControls a{color:var(--lua-mut) !important}
+
+/* ============================================================
+   BARRA SUPERIOR (breadcrumb) + PESTAÑAS
+   ============================================================ */
+#server-breadcrumb,.breadcrumb,.breadcrumb-navbar{
+  background:var(--lua-card) !important;
+  border-bottom:1px solid var(--lua-line) !important;
+  color:var(--lua-tx) !important;
+  border-radius:0 !important;
+}
+#server-breadcrumb a,.breadcrumb a{
+  color:var(--lua-mut) !important;
+  font-size:12px;
+  text-shadow:none !important;
+}
+.breadcrumb-item.active{color:var(--lua-mut) !important}
+.breadcrumb-item+.breadcrumb-item::before{color:var(--lua-mut) !important}
+
+/* Barra de navegacion de resultados (paginacion + "Numero de filas" + orden),
+   <table class="navigation"> encima de cada tabla de datos */
+.navigation{
+  margin:.8em 0 !important;
+  border-radius:5px !important;
+  background:var(--lua-card) !important;
+  background-image:none !important;
+  border:1px solid var(--lua-line) !important;
+  color:var(--lua-tx) !important;
+}
+.navigation td,.navigation th{border:none !important;background:transparent !important}
+.navigation input[type=submit]{
+  filter:none;
+  background-color:black !important;
+  background-image:none !important;
+  padding:4px;
+  margin:0 2px;
+  border-radius:4px !important;
+}
+
+#topmenucontainer,
+nav.navbar,.navbar,.navbar-light,.bg-light{
+  background:var(--lua-card) !important;
+  background-image:none !important;
+  border-bottom:1px solid var(--lua-line) !important;
+}
+#topmenu{background:transparent !important;border:none !important;gap:2px}
+/* pmahomme pinta el fondo/degradado en el <li class="nav-item">, no en el <a> */
+.navbar-nav .nav-item{
+  background:transparent !important;
+  background-image:none !important;
+  border:none !important;
+  border-bottom:2px solid transparent !important;
+}
+.navbar-nav .nav-item:hover{background:var(--lua-in) !important}
+.navbar-nav .nav-item.active{background:transparent !important;border-bottom:2px solid var(--lua-ac) !important}
+#topmenu li a,.navbar-nav .nav-link,.nav-link{
+  color:var(--lua-mut) !important;
+  background:transparent !important;
+  background-image:none !important;
+  border:none !important;
+  border-radius:0 !important;
+  font-weight:600;font-size:14px;
+  padding:9px 14px !important;
+}
+#topmenu li a:hover,.nav-link:hover{color:var(--lua-tx) !important;background:transparent !important}
+#topmenu li.active a,#topmenu li a.tabactive,
+#topmenu li a.active,.nav-link.active,
+.navbar-nav .nav-item.active .nav-link{
+  color:var(--lua-ac) !important;
+  background:transparent !important;
+}
+.navbar-toggler{border-color:var(--lua-line) !important}
+
+/* ============================================================
+   CONTENIDO / CARDS
+   ============================================================ */
+#page_content,#main_pane_left,#main_pane_right,
+.container-fluid,.pma-container,#maincontainer{
+  background:var(--lua-bg) !important;color:var(--lua-tx) !important;
+}
+.card,.panel{
+  background:var(--lua-card) !important;
+  border:1px solid var(--lua-line) !important;
+  border-radius:8px !important;
+  color:var(--lua-tx) !important;
+}
+/* pmahomme dibuja el card-header como una "etiqueta flotante" sobre el borde
+   (position relative + top negativo + box-shadow + border en 4 lados, todo gris
+   fijo #aaa/#bbb). Lo aplanamos para que sea una cabecera normal, como el panel. */
+.card-header,.panel-heading{
+  position:static !important;
+  top:auto !important;
+  margin:0 !important;
+  width:auto !important;
+  max-width:none !important;
+  box-shadow:none !important;
+  text-shadow:none !important;
+  border:none !important;
+  border-bottom:1px solid var(--lua-line) !important;
+  border-radius:0 !important;
+  background:var(--lua-in) !important;
+  color:var(--lua-tx) !important;
+  font-weight:700;
+}
+.card,.card-footer{box-shadow:none !important;text-shadow:none !important}
+.card-footer{background:var(--lua-in) !important;border-top:1px solid var(--lua-line) !important}
+.list-group-item{
+  background:var(--lua-card) !important;
+  border-color:var(--lua-line) !important;
+  color:var(--lua-tx) !important;
+}
+.list-group-item:hover{background:var(--lua-in) !important}
+
+/* ============================================================
+   TABLAS
+   ============================================================ */
+table.table,table.data,table.insertRowTable,table.show_create{
+  color:var(--lua-tx) !important;
+  border-color:var(--lua-line) !important;
+  --bs-table-bg:var(--lua-card);
+  --bs-table-color:var(--lua-tx);
+  --bs-table-border-color:var(--lua-line);
+  --bs-table-hover-bg:rgba(110,168,254,.10);
+  --bs-table-hover-color:var(--lua-tx);
+}
+table.table thead th,table.data thead th,th.column_heading,.table>thead th{
+  background:var(--lua-in) !important;
+  color:var(--lua-tx) !important;
+  border-color:var(--lua-line) !important;
+  font-weight:700;
+}
+table.table th,table.data th,table.table td,table.data td{border-color:var(--lua-line) !important}
+table.table tbody tr:nth-child(odd)>*,table.data tbody tr:nth-child(odd)>*{background:var(--lua-in) !important}
+table.table tbody tr:nth-child(even)>*,table.data tbody tr:nth-child(even)>*{background:var(--lua-card) !important}
+table.table tbody tr:hover>*,table.data tbody tr:hover>*,
+tr.hover>*,tr.marked>*,tr.marked{background:rgba(110,168,254,.12) !important}
+.value{color:var(--lua-tx)}
+
+/* ============================================================
+   BOTONES — degradado corporativo (igual que el logo) en todos
+   ============================================================ */
+.btn{border-radius:5px !important;font-weight:600;font-size:14px}
+.btn,.btn-primary,.btn-secondary,.btn-danger,.btn-success,.btn-warning,
+.btn-info,.btn-light,.btn-dark,.btn-default,.btn-outline-primary,.btn-outline-secondary{
+  background-image:linear-gradient(135deg, var(--lua-brand-start), var(--lua-brand-end)) !important;
+  background-color:var(--lua-ac) !important;
+  color:#fff !important;
+  border:1px solid transparent !important;
+  text-shadow:none !important;
+  box-shadow:none !important;
+  transition:filter .12s;
+}
+.btn:hover,.btn-primary:hover,.btn-secondary:hover,.btn-danger:hover,.btn-success:hover,
+.btn-warning:hover,.btn-outline-primary:hover,.btn-outline-secondary:hover,.btn-default:hover{
+  filter:brightness(1.08);color:#fff !important;
+}
+/* Botones de peligro/eliminar: mismo degradado, en tonos rojos (para no perder la senal de accion destructiva) */
+.btn-danger,.btn-outline-danger{
+  background-image:linear-gradient(135deg, var(--lua-err), var(--lua-err-dark)) !important;
+  background-color:var(--lua-err) !important;
+  color:#fff !important;
+  border-color:transparent !important;
+}
+
+/* ============================================================
+   FORMULARIOS
+   ============================================================ */
+input,select,textarea,.form-control,.form-select,.form-check-input{
+  background:var(--lua-in) !important;
+  color:var(--lua-tx) !important;
+  border-color:var(--lua-line) !important;
+  border-radius:5px !important;
+}
+input:focus,select:focus,textarea:focus,.form-control:focus,.form-select:focus{
+  border-color:var(--lua-ac) !important;
+  box-shadow:0 0 0 .15rem rgba(110,168,254,.25) !important;
+}
+.form-check-input:checked{background-color:var(--lua-ac) !important;border-color:var(--lua-ac) !important}
+::placeholder{color:var(--lua-mut) !important;opacity:1}
+label,.col-form-label,legend,.form-label{color:var(--lua-tx)}
+select option{background:var(--lua-in);color:var(--lua-tx)}
+fieldset{background:var(--lua-card) !important;border:1px solid var(--lua-line) !important;border-radius:8px !important}
+fieldset legend{color:var(--lua-tx) !important}
+
+/* ============================================================
+   PÍLDORAS / BADGES (mismo patron que .jstate del panel)
+   ============================================================ */
+.badge{border-radius:999px !important;font-weight:700;font-size:11px;letter-spacing:.3px;padding:3px 9px !important}
+.badge.bg-primary,.badge.bg-info{background:rgba(110,168,254,.15) !important;color:var(--lua-ac) !important}
+.badge.bg-success{background:rgba(63,185,80,.15) !important;color:var(--lua-ok) !important}
+.badge.bg-danger{background:rgba(248,81,73,.15) !important;color:var(--lua-err) !important}
+.badge.bg-warning{background:rgba(210,153,34,.15) !important;color:var(--lua-warn) !important}
+.badge.bg-secondary{background:var(--lua-line) !important;color:var(--lua-tx) !important}
+
+/* ============================================================
+   ALERTAS / MENSAJES
+   ============================================================ */
+.alert,.notice,.success,.error,.warning,.confirmation{border-radius:3px !important;border:0 !important}
+.result_query div.sqlOuter{background:transparent !important;text-align:left}
+.alert-success,.success{background:rgba(63,185,80,.12) !important;color:var(--lua-ok) !important;border-color:var(--lua-ok) !important}
+.alert-danger,.error{background:rgba(248,81,73,.12) !important;color:var(--lua-err) !important;border-color:var(--lua-err) !important}
+.alert-warning,.warning{background:rgba(210,153,34,.12) !important;color:var(--lua-warn) !important;border-color:var(--lua-warn) !important}
+.alert-info,.notice,.alert-primary{background:rgba(110,168,254,.12) !important;color:var(--lua-ac) !important;border-color:var(--lua-ac) !important}
+
+/* ============================================================
+   EDITOR SQL (CodeMirror)
+   ============================================================ */
+.CodeMirror{background:var(--lua-in) !important;color:var(--lua-tx) !important;border:1px solid var(--lua-line) !important;border-radius:6px;font-family:var(--lua-font-mono) !important}
+.CodeMirror-gutters{background:var(--lua-card) !important;border-color:var(--lua-line) !important}
+.CodeMirror-linenumber{color:var(--lua-mut) !important}
+.CodeMirror-cursor{border-left-color:var(--lua-tx) !important}
+.cm-keyword{color:var(--lua-ac) !important;font-weight:600}
+.cm-variable,.cm-variable-2{color:var(--lua-tx) !important}
+.cm-string{color:var(--lua-ok) !important}
+.cm-number{color:var(--lua-warn) !important}
+.cm-comment{color:var(--lua-mut) !important;font-style:italic}
+.cm-operator,.cm-punctuation{color:var(--lua-mut) !important}
+.CodeMirror-selected{background:rgba(110,168,254,.20) !important}
+.autocomplete-column-name{background:var(--lua-card) !important;color:var(--lua-tx) !important}
+
+/* ============================================================
+   DIÁLOGOS / MODALES / DROPDOWNS / TOOLTIPS
+   ============================================================ */
+.ui-widget-content,.ui-dialog{background:var(--lua-card) !important;color:var(--lua-tx) !important;border:1px solid var(--lua-line) !important;border-radius:8px}
+.ui-dialog-titlebar,.ui-widget-header{background:var(--lua-in) !important;color:var(--lua-tx) !important;border-color:var(--lua-line) !important}
+.ui-tooltip,.tooltip-inner{background:var(--lua-in) !important;color:var(--lua-tx) !important;border:1px solid var(--lua-line) !important}
+.modal-content{background:var(--lua-card) !important;color:var(--lua-tx) !important;border:1px solid var(--lua-line) !important;border-radius:8px}
+.modal-header,.modal-footer{border-color:var(--lua-line) !important}
+.dropdown-menu{background:var(--lua-card) !important;border:1px solid var(--lua-line) !important;border-radius:8px}
+.dropdown-item{color:var(--lua-tx) !important}
+.dropdown-item:hover{background:var(--lua-line) !important}
+
+/* ============================================================
+   PAGINACIÓN / CONSOLA / PROGRESO / CÓDIGO
+   ============================================================ */
+.pagination .page-link{background:var(--lua-card) !important;color:var(--lua-ac) !important;border-color:var(--lua-line) !important}
+.pagination .page-item.active .page-link{background:var(--lua-ac) !important;border-color:var(--lua-ac) !important;color:#fff !important}
+#pma_console,.console{background:var(--lua-in) !important;color:var(--lua-tx) !important;border-color:var(--lua-line) !important;font-family:var(--lua-font-mono) !important}
+#pma_console .toolbar,.console .toolbar{background:var(--lua-card) !important;border-color:var(--lua-line) !important}
+.progress{background:var(--lua-in) !important}
+.progress-bar{background:var(--lua-ac) !important}
+code,kbd,samp,.sqlSyntax,tt,.result_query,#togglequerybox{font-family:var(--lua-font-mono) !important;color:var(--lua-ac) !important}
+pre{background:var(--lua-in) !important;border:1px solid var(--lua-line) !important;border-radius:6px;color:var(--lua-tx) !important}
+.pmagfooter,#pma_footer,footer{color:var(--lua-mut) !important}
