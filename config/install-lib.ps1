@@ -163,6 +163,17 @@ function Install-CatalogItem {
                 # theme.css original no lo lleva).
                 $vendorCss   = Get-Content (Join-Path $themeDst "css\theme.css") -Raw -Encoding UTF8
                 $overrideCss = Get-Content (Join-Path $luaThemeCfg "override.css") -Raw -Encoding UTF8
+                # Nombre de marca (config\sites.json -> brand.name, igual que brand_name() en
+                # el panel): se hornea como texto literal en el ::after del logo porque CSS no
+                # puede leer config de PHP. Si luego se cambia desde el panel, pma_sync_brand_name()
+                # (tools\dashboard\index.php) reparcha este mismo css en caliente.
+                $brandName = 'lua-server'
+                $sitesJsonPath = Join-Path $Root "config\sites.json"
+                if (Test-Path $sitesJsonPath) {
+                    try { $bn = ((Get-Content $sitesJsonPath -Raw | ConvertFrom-Json).brand.name); if ($bn) { $brandName = $bn } } catch {}
+                }
+                $brandNameCss = $brandName -replace '(["\\])', '\$1'
+                $overrideCss = $overrideCss -replace '(#pma_navigation_header\s+#pmalogo::after\{\s*content:)"[^"]*"', "`${1}""$brandNameCss"""
                 [System.IO.File]::WriteAllText((Join-Path $themeDst "css\theme.css"), ($vendorCss + "`n" + $overrideCss), (New-Object System.Text.UTF8Encoding($false)))
             }
 

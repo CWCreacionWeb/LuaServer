@@ -566,6 +566,23 @@ function pma_sync_root_pass($root, $pass){
             function($m) use ($allow){ return $m[1].$allow.';'; }, $c, 1);
     @file_put_contents($f, $c);
 }
+// Sincroniza el nombre de marca (junto al logo, en la cabecera de navegacion de
+// phpMyAdmin) con el que se acaba de guardar en el panel. El nombre va "horneado"
+// como texto literal en el tema (content:"..." de un ::after, ver
+// config\phpmyadmin-theme\override.css) porque CSS no puede leer config de PHP en
+// caliente: aqui se parchea el css ya generado en disco. No-op si phpMyAdmin no
+// esta instalado (Install-CatalogItem ya usa el nombre correcto en instalaciones
+// nuevas, ver config\install-lib.ps1).
+function pma_sync_brand_name($root, $name){
+    $f = $root.'/tools/phpmyadmin/themes/lua/css/theme.css';
+    if (!is_file($f)) return;
+    $c = @file_get_contents($f);
+    if ($c === false) return;
+    $lit = '"'.addcslashes($name !== '' ? $name : 'lua-server', "\\\"").'"';
+    $c = preg_replace_callback('/(#pma_navigation_header\s+#pmalogo::after\{\s*content:)"[^"]*"/',
+            function($m) use ($lit){ return $m[1].$lit; }, $c, 1);
+    @file_put_contents($f, $c);
+}
 function mysql_pdo(){
     global $ROOT;
     $pass = mysql_root_pass($ROOT);
@@ -1730,6 +1747,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!isset($cfg['brand']) || !is_array($cfg['brand'])) $cfg['brand'] = [];
             $cfg['brand']['name'] = $bn;   // vacio => vuelve a "lua-server"
             write_json($CFG_FILE, $cfg);
+            pma_sync_brand_name($ROOT, $bn); // que la cabecera de phpMyAdmin no se quede con el nombre viejo
             $msg = $bn!=='' ? 'applied:Nombre de la plataforma cambiado a "'.$bn.'".' : 'applied:Nombre restablecido a "lua-server".';
         }
     }
