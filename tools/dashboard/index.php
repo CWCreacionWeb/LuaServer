@@ -199,6 +199,70 @@ function git_info($dir){
     return ['branch'=>$branch, 'dirty'=>$dirty, 'commits'=>$commits, 'remote'=>$remote];
 }
 
+// ---------------- Docker (opcional: solo se muestra si se detecta instalado) ----------------
+// Docker Desktop es un instalador de sistema pesado (WSL2/Hyper-V, admin, reinicio) muy
+// distinto de MariaDB/MongoDB (binarios portables que este mismo proyecto descarga y
+// lanza): por eso aqui NO se instala nada, solo se detecta lo que ya haya en la maquina
+// y se gestiona (contenedores). Comandos rapidos (ps/start/stop/...) van por proc_open
+// en forma de array -- igual de seguro que git_exec (el proceso termina solo y se drenan
+// los pipes hasta EOF, no cuelga el worker de mod_fcgid) pero sin la pesadilla de comillas
+// de cmd.exe que tendria un string con los templates --format de Docker ('{{'/'}}').
+// Lanzar Docker Desktop en si (una app persistente, no un comando que termina) es la
+// EXCEPCION: eso va por COM WScript.Shell.Run fire-and-forget, igual que apagar/reiniciar.
+function docker_binary(){
+    static $bin = null;
+    if ($bin !== null) return $bin;
+    $candidates = array_filter([
+        getenv('ProgramFiles') ? getenv('ProgramFiles').'\Docker\Docker\resources\bin\docker.exe' : null,
+        getenv('ProgramW6432') ? getenv('ProgramW6432').'\Docker\Docker\resources\bin\docker.exe' : null,
+        'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe',
+    ]);
+    foreach ($candidates as $cand) { if (is_file($cand)) return $bin = $cand; }
+    $probe = @proc_open(['docker','version','--format','{{.Client.Version}}'], [1=>['pipe','w'],2=>['pipe','w']], $pipes);
+    if (is_resource($probe)) {
+        @stream_get_contents($pipes[1]); @fclose($pipes[1]);
+        @stream_get_contents($pipes[2]); @fclose($pipes[2]);
+        if (proc_close($probe) === 0) return $bin = 'docker';
+    }
+    return $bin = false;
+}
+function docker_desktop_exe(){
+    $candidates = array_filter([
+        getenv('ProgramFiles') ? getenv('ProgramFiles').'\Docker\Docker\Docker Desktop.exe' : null,
+        getenv('ProgramW6432') ? getenv('ProgramW6432').'\Docker\Docker\Docker Desktop.exe' : null,
+        'C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe',
+    ]);
+    foreach ($candidates as $cand) { if (is_file($cand)) return $cand; }
+    return null;
+}
+function docker_installed(){ return docker_binary() !== false; }
+// El pipe con nombre \\.\pipe\docker_engine solo existe mientras dockerd esta escuchando:
+// sondearlo es instantaneo (no lanza ningun proceso), a diferencia de "docker version".
+function docker_running(){ return @file_exists('\\\\.\\pipe\\docker_engine'); }
+function docker_exec($args){
+    $bin = docker_binary();
+    if ($bin === false) return null;
+    $proc = @proc_open(array_merge([$bin], $args), [1=>['pipe','w'],2=>['pipe','w']], $pipes);
+    if (!is_resource($proc)) return null;
+    $out = stream_get_contents($pipes[1]); fclose($pipes[1]);
+    $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
+    $code = proc_close($proc);
+    return ['ok'=>$code===0, 'out'=>$out, 'err'=>$err];
+}
+// Listado de contenedores (activos + parados). null = docker no disponible / fallo el comando.
+function docker_containers(){
+    $r = docker_exec(['ps','-a','--format',"{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"]);
+    if ($r===null || !$r['ok']) return null;
+    $trimmed = trim($r['out']);
+    if ($trimmed==='') return [];
+    $out=[];
+    foreach (explode("\n", $trimmed) as $line) {
+        $p = explode("\t", rtrim($line, "\r"));
+        $out[] = ['id'=>$p[0]??'', 'image'=>$p[1]??'', 'name'=>$p[2]??'', 'status'=>$p[3]??'', 'ports'=>$p[4]??''];
+    }
+    return $out;
+}
+
 function ticon_chev(){ return '<svg class="tchev" viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>'; }
 function ticon_folder(){ return '<svg class="ticon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg>'; }
 function ticon_file(){ return '<svg class="ticon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'; }
@@ -870,6 +934,40 @@ function highlight_error_log($text){
     return implode("\n", $out);
 }
 function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n : ''; }
+// Agrupa los .log de logs/apache por proyecto, a partir del sufijo de nombre que pone
+// vhost.tpl ("<proyecto>-error.log" / "-access.log" / "-ssl-error.log"). Lo que no encaja
+// con ningun sufijo conocido (error.log, access.log, apply.log, watcher-error.log...) es
+// un log de sistema/Apache, no de un proyecto -> agrupado bajo el pseudo-proyecto '(sistema)'.
+// Deriva [proyecto, kind] del nombre de un .log a partir de su sufijo (ver vhost.tpl).
+// Se usa tanto para agrupar el listado (logs_group_by_project) como para saber a que
+// proyecto volver tras borrar un archivo (accion 'deletelog'), donde el fichero ya no
+// existe y por tanto no se puede derivar el proyecto desde $logFiles.
+function log_file_project($lf){
+    $suffixes = ['-ssl-error.log','-ssl-access.log','-error.log','-access.log'];
+    foreach ($suffixes as $suf) {
+        if (strlen($lf) > strlen($suf) && substr($lf, -strlen($suf)) === $suf) {
+            return [substr($lf, 0, -strlen($suf)), substr($suf, 1, -4)]; // "-error.log" -> "error"
+        }
+    }
+    return ['(sistema)', preg_replace('/\.log$/', '', $lf)];
+}
+function logs_group_by_project($logFiles){
+    $byProject = [];
+    foreach ($logFiles as $lf) {
+        [$proj, $kind] = log_file_project($lf);
+        $byProject[$proj][] = ['file'=>$lf, 'kind'=>$kind];
+    }
+    uksort($byProject, function($a,$b){
+        if ($a==='(sistema)') return 1; if ($b==='(sistema)') return -1;
+        return strnatcasecmp($a,$b);
+    });
+    return $byProject;
+}
+function log_kind_label($k){
+    $map = ['error'=>'Error','access'=>'Acceso','ssl-error'=>'Error (SSL)','ssl-access'=>'Acceso (SSL)'];
+    return $map[$k] ?? $k;
+}
+function log_project_label($p){ return $p==='(sistema)' ? 'Sistema (Apache)' : $p; }
 // Bloqueo de proyecto: existe si la raiz del proyecto contiene CUALQUIER archivo *.lua.
 // El panel crea/quita el marcador .locked.lua, pero cualquier .lua puesto a mano
 // tambien protege el proyecto contra el borrado.
@@ -1098,7 +1196,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_
 
 // ---------------- Endpoints AJAX de la terminal (devuelven JSON, no PRG) ----------------
 $__ta = $_REQUEST['action'] ?? '';
-if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
+if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop' || $__ta==='docker_term_run') {
     header('Content-Type: application/json; charset=utf-8');
     // JSON_INVALID_UTF8_SUBSTITUTE: la salida de comandos puede traer bytes no-UTF8 (muchas
     // herramientas de Windows escriben en OEM/ANSI pese al chcp 65001) o un carácter UTF-8
@@ -1168,11 +1266,62 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
         $launch = 'cmd /c ""'.term_win($cmdf).'" > "'.term_win($outf).'" 2>&1"';
         try {
             $sh = new COM('WScript.Shell');
-            $sh->Run($launch, 0, false);   // ventana oculta, sin esperar (no bloquea Apache)
+            // Exec() (no Run()): ademas de lanzar sin esperar, devuelve un objeto con
+            // ProcessID -- lo guardamos para poder matar el arbol por PID en term_stop.
+            // El intento anterior (taskkill por titulo de ventana, "title lua_<runid>")
+            // nunca mataba nada de verdad: un proceso con stdout/stderr redirigidos a
+            // fichero y lanzado oculto no expone un titulo de ventana localizable por
+            // tasklist/taskkill (confirmado: "tasklist /FI WINDOWTITLE eq ..." no
+            // encontraba nada aunque el proceso seguia vivo), asi que "Detener" no
+            // detenia nada en la practica.
+            $exec = $sh->Exec($launch);
+            @file_put_contents($dir.'/'.$runid.'.pid', (string)$exec->ProcessID);
         } catch (Throwable $e) {
             $reply(['error'=>'No se pudo lanzar el comando: '.$e->getMessage()]);
         }
         $reply(['runid'=>$runid, 'cwd'=>$cwd]);
+    }
+
+    if ($__ta==='docker_term_run') {
+        $cmd = (string)($_POST['cmd'] ?? '');
+        if (trim($cmd)==='') { $reply(['error'=>'Comando vacío.']); }
+        if (strlen($cmd) > 4000) { $reply(['error'=>'Comando demasiado largo.']); }
+        $container = (string)($_POST['container'] ?? '');
+        if (!preg_match('/^[a-f0-9]{6,64}$/i', $container)) { $reply(['error'=>'Contenedor no válido.']); }
+        if (!docker_running()) { $reply(['error'=>'Docker no está arrancado.']); }
+        $dockerBin = docker_binary();
+        if ($dockerBin === false) { $reply(['error'=>'Docker no está disponible.']); }
+        foreach ((array)@glob($ROOT.'/tmp/terminal/*', GLOB_ONLYDIR) as $old) {
+            if (@filemtime($old) < time()-86400) { foreach ((array)@glob($old.'/*') as $f) @unlink($f); @rmdir($old); }
+        }
+        $runid  = bin2hex(random_bytes(8));
+        $cmdf   = $dir.'/'.$runid.'.cmd';
+        $outf   = $dir.'/'.$runid.'.out';
+        $stdinf = $dir.'/'.$runid.'.stdin';
+        // El comando del usuario va tal cual (sin comillas propias) a un fichero, y ese
+        // fichero se redirige como stdin de "sh" dentro del contenedor: evita por completo
+        // el infierno de comillas anidadas (cmd.exe -> docker exec -> sh -c "...") que tendria
+        // construir la linea a mano -- aqui no hace falta escapar NADA del texto del usuario.
+        file_put_contents($stdinf, rtrim($cmd, "\r\n")."\n");
+        $wr  = "@echo off\r\n";
+        $wr .= "title lua_".$runid."\r\n";
+        $wr .= "chcp 65001 >NUL\r\n";
+        $wr .= '"'.$dockerBin.'" exec -i '.$container.' sh < "'.term_win($stdinf).'"'."\r\n";
+        $wr .= "set __LUA_EC=%ERRORLEVEL%\r\n";
+        $wr .= "echo __LUA_DONE__%__LUA_EC%\r\n";
+        file_put_contents($cmdf, $wr);
+        @file_put_contents($outf, '');
+        $launch = 'cmd /c ""'.term_win($cmdf).'" > "'.term_win($outf).'" 2>&1"';
+        try {
+            $sh = new COM('WScript.Shell');
+            // Exec() en vez de Run(): ver comentario en term_run sobre por que hace
+            // falta el PID (ProcessID) para poder matar el arbol de verdad en term_stop.
+            $exec = $sh->Exec($launch);
+            @file_put_contents($dir.'/'.$runid.'.pid', (string)$exec->ProcessID);
+        } catch (Throwable $e) {
+            $reply(['error'=>'No se pudo lanzar el comando: '.$e->getMessage()]);
+        }
+        $reply(['runid'=>$runid]);
     }
 
     if ($__ta==='term_poll') {
@@ -1180,11 +1329,14 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
         if (!preg_match('/^[a-f0-9]{16}$/', $runid)) { $reply(['error'=>'runid no válido.']); }
         $off  = max(0, (int)($_REQUEST['off'] ?? 0));
         $outf = $dir.'/'.$runid.'.out';
+        // El fichero de salida solo falta si el runid nunca existió o si otro poll ya
+        // detectó el fin y lo limpió (p.ej. al reconectar tras recargar la página con el
+        // comando ya terminado antes): sin esto, el polling en segundo plano se quedaría
+        // esperando para siempre una marca de fin que nunca va a llegar.
+        if (!is_file($outf)) { $reply(['data'=>'', 'off'=>$off, 'done'=>true, 'code'=>null, 'cwd'=>null]); }
         $data = '';
-        if (is_file($outf)) {
-            $fh = @fopen($outf,'rb');
-            if ($fh) { if ($off>0) fseek($fh,$off); $data=stream_get_contents($fh); fclose($fh); }
-        }
+        $fh = @fopen($outf,'rb');
+        if ($fh) { if ($off>0) fseek($fh,$off); $data=stream_get_contents($fh); fclose($fh); }
         // Recortar del final una secuencia UTF-8 multibyte cortada en el límite de lectura:
         // sus bytes se leerán completos en el próximo poll (no avanzamos $newoff sobre ellos),
         // evitando un carácter de reemplazo basura en la costura. Los bytes ASCII (incl. la
@@ -1213,6 +1365,7 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
             $cwdf = $dir.'/'.$runid.'.cwd';
             if (is_file($cwdf)) { $c=trim((string)@file_get_contents($cwdf)); if ($c!=='' && is_dir($c)) { @file_put_contents($dir.'/cwd',$c); $cwd=$c; } }
             @unlink($cmdf ?? ($dir.'/'.$runid.'.cmd')); @unlink($outf); @unlink($dir.'/'.$runid.'.cwd');
+            @unlink($dir.'/'.$runid.'.pid'); @unlink($dir.'/'.$runid.'.stdin');
         }
         $reply(['data'=>$data, 'off'=>$newoff, 'done'=>$done, 'code'=>$code, 'cwd'=>$cwd]);
     }
@@ -1220,8 +1373,10 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop') {
     if ($__ta==='term_stop') {
         $runid = $_REQUEST['runid'] ?? '';
         if (!preg_match('/^[a-f0-9]{16}$/', $runid)) { $reply(['error'=>'runid no válido.']); }
-        // matar el arbol de procesos por el titulo de ventana unico del wrapper
-        @exec('taskkill /F /T /FI "WINDOWTITLE eq lua_'.$runid.'*" 2>&1');
+        // Matar el arbol de procesos por PID real (ver comentario en term_run/Exec()).
+        $pidf = $dir.'/'.$runid.'.pid';
+        $pid = is_file($pidf) ? (int)trim((string)@file_get_contents($pidf)) : 0;
+        if ($pid > 0) { @exec('taskkill /F /T /PID '.$pid.' 2>&1'); }
         // al matar el proceso, el wrapper no escribe la marca de fin: la añadimos
         // nosotros para que el polling del panel termine limpio (código 130 = interrumpido).
         $outf = $dir.'/'.$runid.'.out';
@@ -1497,7 +1652,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $tab='logs';
         if ($lf && is_file($ROOT.'/logs/apache/'.$lf)) { @unlink($ROOT.'/logs/apache/'.$lf); $msg='applied:Log '.$lf.' eliminado.'; }
         else { $msg='error:Ese log ya no existe.'; }
-        header('Location: ?tab=logs&msg='.urlencode($msg)); exit;
+        // El archivo borrado ya no se puede volver a seleccionar: se vuelve al mismo
+        // proyecto (derivado del propio nombre) y, si le quedan otros archivos, se
+        // selecciona uno (preferiblemente "error") para no dejar la vista en blanco
+        // pidiendo elegir de nuevo -- solo si el proyecto se queda sin ninguno se cae
+        // al estado "elige un archivo".
+        [$proj] = log_file_project($lf);
+        $remaining = [];
+        foreach (glob($ROOT.'/logs/apache/*.log') as $f) { $remaining[] = basename($f); }
+        $projFiles = logs_group_by_project($remaining)[$proj] ?? [];
+        $fallback = '';
+        foreach ($projFiles as $f) { if ($f['kind']==='error') { $fallback = $f['file']; break; } }
+        if ($fallback === '' && $projFiles) { $fallback = $projFiles[0]['file']; }
+        $loc = '?tab=logs&project='.urlencode($proj).($fallback!==''?'&log='.urlencode($fallback):'').'&msg='.urlencode($msg);
+        header('Location: '.$loc); exit;
     }
     elseif ($action === 'switch') {
         $name=$_POST['name']??''; $php=$_POST['php']??'';
@@ -2107,6 +2275,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($enable) { @file_put_contents($ROOT.'/config/terminal.on','1'); $msg='applied:Terminal activada. Ejecuta comandos desde la pestaña Terminal.'; }
         else { @unlink($ROOT.'/config/terminal.on'); $msg='applied:Terminal desactivada.'; }
     }
+    elseif ($action === 'docker_start_desktop') {
+        $tab='docker';
+        $exe = docker_desktop_exe();
+        if ($exe === null) { $msg='error:No se encontró Docker Desktop instalado.'; }
+        else {
+            try { $sh = new COM('WScript.Shell'); $sh->Run('"'.$exe.'"', 1, false); $msg='info:Arrancando Docker Desktop… puede tardar un minuto en estar listo.'; }
+            catch (Throwable $e) { $msg='error:No se pudo lanzar Docker Desktop: '.$e->getMessage(); }
+        }
+    }
+    elseif ($action === 'docker_container') {
+        $tab='docker';
+        $op = $_POST['op'] ?? '';
+        $id = trim($_POST['id'] ?? '');
+        if (!preg_match('/^[a-f0-9]{6,64}$/i', $id)) { $msg='error:Contenedor no válido.'; }
+        elseif (!in_array($op, ['start','stop','restart','rm'], true)) { $msg='error:Acción no válida.'; }
+        else {
+            $r = docker_exec($op==='rm' ? ['rm','-f',$id] : [$op,$id]);
+            if ($r===null) { $msg='error:Docker no está disponible.'; }
+            elseif (!$r['ok']) { $msg='error:'.trim($r['err'] !== '' ? $r['err'] : $r['out']); }
+            else { $msg='applied:Hecho.'; }
+        }
+    }
 
     header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').($redirName?'&name='.urlencode($redirName):'').(isset($tab_engine)?'&engine='.urlencode($tab_engine):'').'&msg='.urlencode($msg));
     exit;
@@ -2269,11 +2459,14 @@ setTimeout(ping,1500);})();
   .runlink svg{flex:0 0 auto;opacity:.7;transition:opacity .12s}
   .runlink:hover svg{opacity:1}
   .runlink:disabled{opacity:.5;cursor:default;text-decoration:none}
+  .runlink.off{opacity:.4;pointer-events:none;text-decoration:none}
   .runlink-wrap{display:inline-flex;align-items:center;gap:2px}
   .runlink-del{background:none;border:none;color:var(--mut);font-size:14px;line-height:1;cursor:pointer;padding:3px 5px;border-radius:4px;transition:color .12s,background-color .12s}
   .runlink-del:hover{color:var(--err);background:rgba(248,81,73,.10)}
-  .runbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0 0 0 1px;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s}
+  .runbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0 0 0 1px;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
   .runbtn:hover{color:var(--ac);border-color:var(--ac)}
+  .runbtn.running{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.14)}
+  .runbtn.running:hover{color:var(--ok);border-color:var(--ok)}
   .sitecard.is-locked .lockbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.12)}
   .sitecard.unregistered{background:var(--line);border-style:dashed;border-color:var(--line);opacity:.55}
   .sitecard.unregistered .name{color:var(--mut);font-weight:600}
@@ -2379,6 +2572,7 @@ setTimeout(ping,1500);})();
   .loader-spin{width:22px;height:22px;flex:0 0 auto;border-radius:999px;border:3px solid var(--line);border-top-color:var(--ac);animation:loaderspin .7s linear infinite}
   .loader-tx{font-size:14px;font-weight:600;color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   @keyframes loaderspin{to{transform:rotate(360deg)}}
+  .btn-spin{display:inline-block;width:12px;height:12px;border-radius:999px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;animation:loaderspin .7s linear infinite;vertical-align:-2px;margin-right:6px}
 
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:16px 12px}
   .grid label{min-height:2.6em}
@@ -2406,6 +2600,19 @@ setTimeout(ping,1500);})();
   .logview .log-deprecated{color:var(--mut);opacity:.6}
   .logview .log-notice{color:var(--ac)}
   .logview .log-info{color:var(--tx)}
+
+  /* ---------- Selector de log con buscador (pestaña Logs) ---------- */
+  .logpicker{position:relative;width:260px;max-width:100%}
+  .logpicker-input{width:100%}
+  .logpicker-list{position:absolute;z-index:20;top:calc(100% + 4px);left:0;right:0;max-height:280px;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:6px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+  .logpicker-opt{padding:7px 10px;cursor:pointer;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .logpicker-opt:hover,.logpicker-opt.on{background:rgba(110,168,254,.14);color:var(--ac)}
+  .logpicker-opt.sel{font-weight:600}
+  .logpicker-empty{padding:7px 10px;color:var(--mut);font-size:13px}
+  .loglink{color:var(--ac);font-size:13px;text-decoration:none}
+  .loglink:hover{text-decoration:underline}
+  .loglink.active{color:var(--tx);font-weight:700;text-decoration:none;cursor:default}
+  .loglink-sep{color:var(--mut);font-size:12px}
 
   /* ---------- Editor de codigo (tema propio de CodeMirror, sigue la paleta del panel) ---------- */
   #fileEditorHost .CodeMirror{height:100%;background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:6px;font-family:ui-monospace,Consolas,'Courier New',monospace;font-size:13px;line-height:1.5}
@@ -2548,6 +2755,9 @@ setTimeout(ping,1500);})();
       <a href="?tab=proyectos" class="<?= ($tab==='proyectos'||$tab==='proyecto')?'on':'' ?>">Proyectos</a>
       <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
       <a href="?tab=bd" class="<?= $tab==='bd'?'on':'' ?>">Bases de datos</a>
+      <?php if (docker_installed()): ?>
+        <a href="?tab=docker" class="<?= $tab==='docker'?'on':'' ?>">Docker</a>
+      <?php endif; ?>
       <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">Logs</a>
       <a href="?tab=terminal" class="<?= $tab==='terminal'?'on':'' ?>">Terminal</a>
       <a href="?tab=config" class="<?= $tab==='config'?'on':'' ?>">Configuración del servidor</a>
@@ -2916,8 +3126,10 @@ setTimeout(ping,1500);})();
         <div class="row" style="margin-bottom:10px">
           <h3 id="runnerTitle" style="margin:0;font-size:16px">Ejecutar</h3>
           <div class="spacer"></div>
-          <button type="button" class="btn ghost sm" id="runnerStop" disabled>Detener</button>
-          <button type="button" class="btn ghost sm" onclick="luaCloseRunner()">Cerrar</button>
+          <a href="javascript:void(0)" id="runnerStop" class="runlink off">Detener</a>
+          <button type="button" class="lockbtn" onclick="luaCloseRunner()" title="Cerrar" aria-label="Cerrar">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
         </div>
         <div id="runnerBtns" class="row" style="gap:6px 16px;margin-bottom:10px;flex-wrap:wrap"></div>
         <div class="row" style="gap:6px;margin-bottom:10px">
@@ -2925,16 +3137,24 @@ setTimeout(ping,1500);})();
           <button type="button" class="btn ghost sm" id="runnerAddBtn" title="Guardar como acceso rápido y ejecutarlo">+ Guardar</button>
         </div>
         <div id="runnerOut" class="termout" style="height:280px;border:1px solid var(--line);border-radius:6px;background:var(--in)"></div>
+        <div class="row" style="margin-top:6px;justify-content:flex-end">
+          <a href="javascript:void(0)" id="runnerClear" class="runlink">Limpiar consola</a>
+        </div>
       </div>
     </div>
     <script>
       (function(){
         var modal=document.getElementById('runnerModal'), title=document.getElementById('runnerTitle'),
             btnsEl=document.getElementById('runnerBtns'), out=document.getElementById('runnerOut'),
-            stopBtn=document.getElementById('runnerStop'),
+            stopBtn=document.getElementById('runnerStop'), clearBtn=document.getElementById('runnerClear'),
             addBtn=document.getElementById('runnerAddBtn'), customInput=document.getElementById('runnerCustomCmd');
-        var sid=null, path=null, phpVer=null, running=false, curRun=null, curBuiltins=[];
+        // runs: comandos en marcha por proyecto (clave = ruta). Sobreviven a cerrar el
+        // modal -- el comando sigue en marcha en segundo plano (proceso propio de Windows,
+        // WScript.Shell.Run, independiente de esta página) y el play de la card se marca
+        // en verde mientras dure.
+        var runs={}, curPath=null, curName=null, curPhpVer=null, curBuiltins=[];
         var savedPresets=<?= json_encode($runPresets, JSON_UNESCAPED_SLASHES) ?>;
+        var LS_KEY='lua_runner_jobs';
 
         function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
         var ANSI={30:'k',31:'r',32:'g',33:'y',34:'b',35:'m',36:'c',37:'w',90:'K',91:'R',92:'G',93:'Y',94:'B',95:'M',96:'C',97:'W'};
@@ -2950,8 +3170,15 @@ setTimeout(ping,1500);})();
           span(s.slice(last));
           return res;
         }
-        function append(html){ out.insertAdjacentHTML('beforeend', html); out.scrollTop=out.scrollHeight; }
         function setButtons(disabled){ Array.from(btnsEl.querySelectorAll('button')).forEach(function(b){ b.disabled=disabled; }); }
+        function findBtn(p){ return Array.from(document.querySelectorAll('.lua-runbtn')).find(function(b){ return b.dataset.path===p; }) || null; }
+        function markBtn(p, on){ var b=findBtn(p); if(b) b.classList.toggle('running', !!on); }
+        function saveJobs(){
+          var o={};
+          Object.keys(runs).forEach(function(p){ var r=runs[p]; if(r.runid) o[p]={sid:r.sid,runid:r.runid,name:r.name,phpVer:r.phpVer,cmd:r.cmd}; });
+          try{ localStorage.setItem(LS_KEY, JSON.stringify(o)); }catch(e){}
+        }
+        function renderOut(p){ if(curPath===p && !modal.hidden){ out.innerHTML=runs[p].html; out.scrollTop=out.scrollHeight; } }
 
         // Icono de terminal (estatico, sin datos de usuario -> innerHTML es seguro aqui).
         var TERM_ICON='<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>';
@@ -2982,40 +3209,70 @@ setTimeout(ping,1500);})();
           });
         }
 
-        function poll(runid, off, fails){
-          fails=fails||0;
-          fetch('?action=term_poll&sid='+sid+'&runid='+runid+'&off='+off)
-          .then(r=>r.json()).then(function(j){
-            if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); finish(); return; }
-            if(j.data){ append(ansiToHtml(j.data)); }
+        function finishRun(p){
+          delete runs[p];
+          saveJobs();
+          markBtn(p, false);
+          if(curPath===p){ stopBtn.classList.add('off'); setButtons(false); }
+        }
+        function pollRun(p){
+          var r=runs[p]; if(!r) return;
+          fetch('?action=term_poll&sid='+r.sid+'&runid='+r.runid+'&off='+r.off)
+          .then(function(resp){ return resp.json(); })
+          .then(function(j){
+            r=runs[p]; if(!r) return;
+            if(j.error){ r.html+='<span class="a-r">'+esc(j.error)+'</span>\n'; renderOut(p); finishRun(p); return; }
+            if(j.data){ r.html+=ansiToHtml(j.data); r.off=j.off; }
             if(j.done){
-              if(out.textContent && !out.textContent.endsWith('\n')) append('\n');
-              append('<span class="'+(j.code?'a-r':'a-g')+'">[salida '+(j.code||0)+']</span>\n');
-              finish();
-            } else { setTimeout(function(){ poll(runid, j.off, 0); }, 300); }
+              if(r.html && !r.html.endsWith('\n')) r.html+='\n';
+              r.html+='<span class="'+(j.code?'a-r':'a-g')+'">[salida '+(j.code||0)+']</span>\n';
+              renderOut(p); finishRun(p);
+            } else { renderOut(p); setTimeout(function(){ pollRun(p); }, 500); }
           }).catch(function(){
-            if(fails>=5){ append('<span class="a-r">[error de red]</span>\n'); finish(); return; }
-            setTimeout(function(){ poll(runid, off, fails+1); }, 500);
+            r=runs[p]; if(!r) return;
+            r.fails=(r.fails||0)+1;
+            if(r.fails>=5){ r.html+='<span class="a-r">[error de red]</span>\n'; renderOut(p); finishRun(p); return; }
+            setTimeout(function(){ pollRun(p); }, 700);
           });
         }
-        function finish(){ running=false; curRun=null; stopBtn.disabled=true; setButtons(false); }
-
-        window.luaRunPreset=function(cmd){
-          if(running) return;
-          running=true; setButtons(true); stopBtn.disabled=false;
-          append('<span class="a-prompt">&gt; </span>'+esc(cmd)+'\n');
-          var full='cd /d "'+path+'" && '+cmd;
+        function startRun(p, name, phpVer, cmd){
+          if(runs[p]) return;
+          var sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
+          runs[p]={sid:sid, runid:null, name:name, phpVer:phpVer, cmd:cmd, off:0,
+            html:'<span class="a-prompt">&gt; </span>'+esc(cmd)+'\n'};
+          markBtn(p, true);
+          if(curPath===p){ setButtons(true); stopBtn.classList.remove('off'); }
+          renderOut(p);
+          var full='cd /d "'+p+'" && '+cmd;
           fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
             body:'action=term_run&sid='+sid+'&php='+encodeURIComponent(phpVer||'')+'&cmd='+encodeURIComponent(full)})
-          .then(r=>r.json()).then(function(j){
-            if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); finish(); return; }
-            curRun=j.runid; poll(j.runid, 0);
-          }).catch(function(){ append('<span class="a-r">[no se pudo lanzar]</span>\n'); finish(); });
+          .then(function(resp){ return resp.json(); })
+          .then(function(j){
+            var r=runs[p]; if(!r) return;
+            if(j.error){ r.html+='<span class="a-r">'+esc(j.error)+'</span>\n'; renderOut(p); finishRun(p); return; }
+            r.runid=j.runid; saveJobs(); pollRun(p);
+          }).catch(function(){
+            var r=runs[p]; if(!r) return;
+            r.html+='<span class="a-r">[no se pudo lanzar]</span>\n'; renderOut(p); finishRun(p);
+          });
+        }
+
+        window.luaRunPreset=function(cmd){
+          if(!curPath || runs[curPath]) return;
+          startRun(curPath, curName, curPhpVer, cmd);
         };
         stopBtn.onclick=function(){
-          if(!running||!curRun) return;
+          var r=curPath && runs[curPath];
+          if(!r || !r.runid) return;
+          stopBtn.classList.add('off');
           fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'action=term_stop&sid='+sid+'&runid='+curRun}).then(()=>{});
+            body:'action=term_stop&sid='+r.sid+'&runid='+r.runid}).then(function(){});
+        };
+        // Solo vacia el papel visible (y el acumulado en memoria, para que el proximo
+        // poll no lo vuelva a pintar entero): no toca el comando que siga en marcha.
+        clearBtn.onclick=function(){
+          out.innerHTML='';
+          if(curPath && runs[curPath]) runs[curPath].html='';
         };
 
         function luaDelPreset(cmd){
@@ -3027,13 +3284,13 @@ setTimeout(ping,1500);})();
         }
         addBtn.onclick=function(){
           var cmd=customInput.value.trim();
-          if(!cmd || running) return;
+          if(!cmd || (curPath && runs[curPath])) return;
           addBtn.disabled=true;
           fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
             body:'action=run_preset_add&cmd='+encodeURIComponent(cmd)})
           .then(r=>r.json()).then(function(j){
             addBtn.disabled=false;
-            if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); return; }
+            if(j.error){ out.insertAdjacentHTML('beforeend','<span class="a-r">'+esc(j.error)+'</span>\n'); return; }
             savedPresets=j.presets; customInput.value=''; renderBtns();
             luaRunPreset(cmd);
           }).catch(function(){ addBtn.disabled=false; });
@@ -3041,14 +3298,16 @@ setTimeout(ping,1500);})();
         customInput.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); addBtn.click(); } });
 
         window.luaOpenRunner=function(name, projectPath, hasComposer, hasNpm, phpVersion){
-          path=projectPath; phpVer=phpVersion||null;
-          sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
+          curPath=projectPath; curName=name; curPhpVer=phpVersion||null;
           title.textContent='Ejecutar en '+name;
-          out.innerHTML=''; running=false; curRun=null; stopBtn.disabled=true; customInput.value='';
+          customInput.value='';
           curBuiltins=[];
           if(hasComposer){ curBuiltins.push(['composer install','composer install'],['composer update','composer update']); }
           if(hasNpm){ curBuiltins.push(['npm install','npm install'],['npm run build','npm run build']); }
           renderBtns();
+          var r=runs[curPath];
+          if(r){ out.innerHTML=r.html; out.scrollTop=out.scrollHeight; setButtons(true); stopBtn.classList.remove('off'); }
+          else { out.innerHTML=''; setButtons(false); stopBtn.classList.add('off'); }
           modal.hidden=false;
           document.addEventListener('keydown', luaEscRunner);
         };
@@ -3063,12 +3322,30 @@ setTimeout(ping,1500);})();
           if (!btn) return;
           luaOpenRunner(btn.dataset.name, btn.dataset.path, btn.dataset.composer==='1', btn.dataset.npm==='1', btn.dataset.php);
         });
+        // Cerrar el modal ya NO mata el comando: sigue en marcha en segundo plano (el
+        // play de la card queda en verde) y se puede reabrir luego para verlo o pararlo.
         window.luaCloseRunner=function(){
-          if(running && curRun){ fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=term_stop&sid='+sid+'&runid='+curRun}).then(()=>{}); }
           modal.hidden=true;
           document.removeEventListener('keydown', luaEscRunner);
         };
         function luaEscRunner(e){ if(e.key==='Escape') luaCloseRunner(); }
+
+        // Reengancha, al cargar la página, los comandos que quedaron corriendo en segundo
+        // plano de una carga anterior (recarga, cambio de pestaña...): el proceso de
+        // Windows es independiente de esta página (WScript.Shell.Run), solo hace falta
+        // recuperar el sid/runid guardados para retomar el polling.
+        (function reconnect(){
+          var saved={};
+          try{ saved=JSON.parse(localStorage.getItem(LS_KEY)||'{}')||{}; }catch(e){}
+          Object.keys(saved).forEach(function(p){
+            var j=saved[p];
+            if(!j||!j.sid||!j.runid) return;
+            runs[p]={sid:j.sid, runid:j.runid, name:j.name, phpVer:j.phpVer, cmd:j.cmd, off:0,
+              html:'<span class="a-prompt">&gt; </span>'+esc(j.cmd||'')+'\n'};
+            markBtn(p, true);
+            pollRun(p);
+          });
+        })();
       })();
     </script>
 
@@ -3521,22 +3798,97 @@ setTimeout(ping,1500);})();
       $logFiles = [];
       foreach (glob($logDir.'/*.log') as $f) $logFiles[] = basename($f);
       sort($logFiles);
-      if (!$logFiles) $logFiles = ['error.log'];
+      $byProject = logs_group_by_project($logFiles);
+      $projects = array_keys($byProject);
+
       $sel = safe_logname($_GET['log'] ?? '');
-      if (!$sel || !in_array($sel,$logFiles,true)) $sel = in_array('error.log',$logFiles,true)?'error.log':$logFiles[0];
+      if ($sel !== '' && !in_array($sel, $logFiles, true)) $sel = '';
+      $selProject = (string)($_GET['project'] ?? '');
+      if ($sel !== '') {
+          // el archivo manda: derivar su proyecto real, por si la URL trae uno inconsistente
+          foreach ($byProject as $p => $files) {
+              foreach ($files as $f) { if ($f['file'] === $sel) { $selProject = $p; break 2; } }
+          }
+      } elseif ($selProject === '' || !isset($byProject[$selProject])) {
+          $selProject = '';
+      }
+      // Sin ?project= ni ?log= (primera visita a la pestaña): mismo valor por defecto de
+      // siempre (error.log de sistema), solo que ahora expresado en el modelo proyecto+archivo.
+      if ($sel === '' && $selProject === '' && $byProject) {
+          $selProject = isset($byProject['(sistema)']) ? '(sistema)' : $projects[0];
+          foreach ($byProject[$selProject] as $f) { if ($f['kind']==='error') { $sel = $f['file']; break; } }
+          if ($sel === '' && isset($byProject[$selProject][0])) $sel = $byProject[$selProject][0]['file'];
+      }
+
       $refresh = (($_GET['refresh']??'')==='1');
-      $content = tail_file($logDir.'/'.$sel, 300);
+      $content = $sel !== '' ? tail_file($logDir.'/'.$sel, 300) : '';
   ?>
-    <div class="row" style="margin-bottom:14px;gap:8px;flex-wrap:wrap">
-      <?php foreach ($logFiles as $lf): ?>
-        <a href="?tab=logs&log=<?= urlencode($lf) ?><?= $refresh?'&refresh=1':'' ?>" class="btn <?= $lf===$sel?'':'ghost' ?> sm"><?= e($lf) ?></a>
-      <?php endforeach; ?>
+    <div class="row" style="margin-bottom:14px;gap:8px 16px;flex-wrap:wrap;align-items:flex-start">
+      <div class="logpicker">
+        <input type="text" id="logProjectInput" class="logpicker-input" autocomplete="off" spellcheck="false"
+               placeholder="Buscar proyecto&hellip; (<?= count($projects) ?>)" value="<?= $selProject!==''?e(log_project_label($selProject)):'' ?>">
+        <div id="logProjectList" class="logpicker-list" hidden></div>
+      </div>
+      <?php if ($selProject !== ''): ?>
+        <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+          <?php foreach ($byProject[$selProject] as $i => $f): ?>
+            <?php if ($i > 0): ?><span class="loglink-sep">&middot;</span><?php endif; ?>
+            <a href="?tab=logs&project=<?= urlencode($selProject) ?>&log=<?= urlencode($f['file']) ?><?= $refresh?'&refresh=1':'' ?>"
+               class="loglink<?= $f['file']===$sel?' active':'' ?>"><?= e(log_kind_label($f['kind'])) ?></a>
+          <?php endforeach; ?>
+        </div>
+      <?php endif; ?>
       <div class="spacer"></div>
-      <a href="?tab=logs&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost sm"><?= $refresh?'⏸ Auto-refresco ON':'▶ Auto-refresco' ?></a>
-      <button type="button" class="btn ghost sm" onclick="luaAskClearLog('<?= e($sel) ?>')">Vaciar</button>
-      <button type="button" class="btn danger sm" onclick="luaAskDeleteLog('<?= e($sel) ?>')">Eliminar</button>
+      <?php if ($sel !== ''): ?>
+        <a href="?tab=logs&project=<?= urlencode($selProject) ?>&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost sm"><?= $refresh?'Auto-refresco ON':'Auto-refresco' ?></a>
+        <button type="button" class="btn ghost sm" onclick="luaAskClearLog('<?= e($sel) ?>')">Vaciar</button>
+        <button type="button" class="btn danger sm" onclick="luaAskDeleteLog('<?= e($sel) ?>')">Eliminar</button>
+      <?php endif; ?>
     </div>
-    <pre class="logview"><?= $content!=='' ? highlight_error_log($content) : '(vacío)' ?></pre>
+    <?php if ($sel === ''): ?>
+      <div class="card muted">Elige un proyecto y luego un archivo de log para ver su contenido.</div>
+    <?php else: ?>
+      <pre class="logview"><?= $content!=='' ? highlight_error_log($content) : '(vac&iacute;o)' ?></pre>
+    <?php endif; ?>
+    <script>
+      (function(){
+        var PROJECTS=<?= json_encode(array_map(function($p){ return ['key'=>$p,'label'=>log_project_label($p)]; }, $projects), JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE) ?>;
+        var SEL_PROJECT=<?= json_encode($selProject) ?>, SEL_LABEL=<?= json_encode($selProject!==''?log_project_label($selProject):'') ?>, REFRESH=<?= $refresh?'true':'false' ?>;
+        var inp=document.getElementById('logProjectInput'), list=document.getElementById('logProjectList');
+        var items=[], active=-1;
+        function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+        function go(key){ location.href='?tab=logs&project='+encodeURIComponent(key)+(REFRESH?'&refresh=1':''); }
+        function render(filter){
+          var f=(filter||'').toLowerCase();
+          items = PROJECTS.filter(function(p){ return p.label.toLowerCase().indexOf(f)!==-1; });
+          active=-1;
+          if(!items.length){ list.innerHTML='<div class="logpicker-empty">Sin coincidencias</div>'; list.hidden=false; return; }
+          list.innerHTML = items.map(function(p){
+            return '<div class="logpicker-opt'+(p.key===SEL_PROJECT?' sel':'')+'" data-key="'+esc(p.key)+'">'+esc(p.label)+'</div>';
+          }).join('');
+          list.hidden=false;
+        }
+        function highlight(i){
+          Array.from(list.querySelectorAll('.logpicker-opt')).forEach(function(el,j){ el.classList.toggle('on', j===i); });
+          active=i;
+          var el=list.children[i]; if(el && el.scrollIntoView) el.scrollIntoView({block:'nearest'});
+        }
+        inp.addEventListener('focus', function(){ render(''); inp.select(); });
+        inp.addEventListener('input', function(){ render(inp.value); });
+        inp.addEventListener('keydown', function(e){
+          if(list.hidden){ if(e.key==='ArrowDown'||e.key==='ArrowUp'){ render(''); e.preventDefault(); } return; }
+          if(e.key==='ArrowDown'){ e.preventDefault(); highlight(Math.min(active+1, items.length-1)); }
+          else if(e.key==='ArrowUp'){ e.preventDefault(); highlight(Math.max(active-1,0)); }
+          else if(e.key==='Enter'){ e.preventDefault(); if(items[active]) go(items[active].key); else if(items.length===1) go(items[0].key); }
+          else if(e.key==='Escape'){ list.hidden=true; inp.value=SEL_LABEL; inp.blur(); }
+        });
+        list.addEventListener('mousedown', function(e){
+          var opt=e.target.closest('.logpicker-opt'); if(!opt||!opt.dataset.key) return;
+          go(opt.dataset.key);
+        });
+        document.addEventListener('click', function(e){ if(!e.target.closest('.logpicker')){ list.hidden=true; inp.value=SEL_LABEL; } });
+      })();
+    </script>
 
     <!-- Modal de confirmacion de borrado de archivo de log -->
     <div id="delLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDeleteLog()">
@@ -3980,8 +4332,8 @@ setTimeout(ping,1500);})();
             <h3>¿Importar backup?</h3>
             <p class="modal-tx">Se ejecutará el <code>.sql</code> en <strong id="importPgName"></strong>. Si incluye objetos con el mismo nombre, <strong>pueden sobrescribirse o dar error</strong>.</p>
             <div class="modal-actions">
-              <button type="button" class="btn ghost" onclick="luaCloseImportPg()">Cancelar</button>
-              <button type="button" class="btn danger" onclick="luaConfirmImportPg()">Sí, importar</button>
+              <button type="button" class="btn ghost" id="importPgCancelBtn" onclick="luaCloseImportPg()">Cancelar</button>
+              <button type="button" class="btn danger" id="importPgConfirmBtn" onclick="luaConfirmImportPg()">Sí, importar</button>
             </div>
           </div>
         </div>
@@ -3994,7 +4346,20 @@ setTimeout(ping,1500);})();
           function luaEscDeletePgRole(e){ if(e.key==='Escape') luaCloseDeletePgRole(); }
           var luaImportPgForm=null;
           function luaAskImportPg(ev, form, db){ ev.preventDefault(); luaImportPgForm=form; document.getElementById('importPgName').textContent=db; document.getElementById('importPgModal').hidden=false; document.addEventListener('keydown',luaEscImportPg); return false; }
-          function luaConfirmImportPg(){ luaCloseImportPg(); if(luaImportPgForm) luaImportPgForm.requestSubmit(); }
+          function luaConfirmImportPg(){
+            if (!luaImportPgForm) { luaCloseImportPg(); return; }
+            var btn = document.getElementById('importPgConfirmBtn');
+            document.getElementById('importPgCancelBtn').disabled = true;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="btn-spin"></span>Importando&hellip;';
+            document.removeEventListener('keydown', luaEscImportPg);
+            luaImportPgForm.requestSubmit();
+            setTimeout(function(){
+              btn.disabled = false; btn.innerHTML = 'Sí, importar';
+              document.getElementById('importPgCancelBtn').disabled = false;
+              luaCloseImportPg();
+            }, 20000);
+          }
           function luaCloseImportPg(){ document.getElementById('importPgModal').hidden=true; document.removeEventListener('keydown',luaEscImportPg); }
           function luaEscImportPg(e){ if(e.key==='Escape') luaCloseImportPg(); }
         </script>
@@ -4198,8 +4563,8 @@ setTimeout(ping,1500);})();
           <h3 id="importDbTitle">¿Importar backup?</h3>
           <p class="modal-tx">Se importará el archivo en <strong id="importDbName"></strong>. Si el <code>.sql</code> incluye tablas con el mismo nombre, <strong>se sobrescribirán</strong>.</p>
           <div class="modal-actions">
-            <button type="button" class="btn ghost" onclick="luaCloseImportDb()">Cancelar</button>
-            <button type="button" class="btn danger" onclick="luaConfirmImportDb()">Sí, importar</button>
+            <button type="button" class="btn ghost" id="importDbCancelBtn" onclick="luaCloseImportDb()">Cancelar</button>
+            <button type="button" class="btn danger" id="importDbConfirmBtn" onclick="luaConfirmImportDb()">Sí, importar</button>
           </div>
         </div>
       </div>
@@ -4214,11 +4579,23 @@ setTimeout(ping,1500);})();
           return false;
         }
         function luaConfirmImportDb(){
-          luaCloseImportDb();
+          if (!luaImportDbForm) { luaCloseImportDb(); return; }
+          var btn = document.getElementById('importDbConfirmBtn');
+          document.getElementById('importDbCancelBtn').disabled = true;
+          btn.disabled = true;
+          btn.innerHTML = '<span class="btn-spin"></span>Importando&hellip;';
+          document.removeEventListener('keydown', luaEscImportDb);
           // requestSubmit() (no submit()): dispara el evento 'submit' de verdad, para que
           // el loader global aparezca durante la importacion real (que puede tardar si el
-          // .sql es grande) en vez de no mostrarse nunca.
-          if (luaImportDbForm) luaImportDbForm.requestSubmit();
+          // .sql es grande) en vez de no mostrarse nunca. El modal se deja abierto (con el
+          // boton en marcha) hasta que la navegacion real lo sustituya.
+          luaImportDbForm.requestSubmit();
+          // Red de seguridad: si la pagina no llega a navegar, no dejar el boton colgado.
+          setTimeout(function(){
+            btn.disabled = false; btn.innerHTML = 'Sí, importar';
+            document.getElementById('importDbCancelBtn').disabled = false;
+            luaCloseImportDb();
+          }, 20000);
         }
         function luaCloseImportDb(){
           document.getElementById('importDbModal').hidden = true;
@@ -4227,6 +4604,196 @@ setTimeout(ping,1500);})();
         function luaEscImportDb(e){ if(e.key==='Escape') luaCloseImportDb(); }
       </script>
 
+    <?php endif; ?>
+
+  <?php elseif ($tab==='docker'): /* ---------- PESTAÑA DOCKER (solo si se detecta instalado) ---------- */
+      $dockerUp = docker_running();
+      $containers = $dockerUp ? docker_containers() : null; ?>
+
+    <?php if (!$dockerUp): ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:6px">Docker Desktop no está arrancado</div>
+        <div class="muted" style="margin-bottom:14px">Se detectó Docker instalado en esta máquina, pero el motor no responde ahora mismo. Arráncalo y recarga esta página en cuanto esté listo (puede tardar un minuto).</div>
+        <form method="post">
+          <input type="hidden" name="action" value="docker_start_desktop">
+          <button class="btn" type="submit">Iniciar Docker Desktop</button>
+        </form>
+      </div>
+    <?php else: ?>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px;gap:12px;flex-wrap:wrap">
+          <h2 style="margin:0;font-size:15px">Contenedores</h2>
+          <input type="text" id="dockerSearchInput" placeholder="Buscar contenedor&hellip;" autocomplete="off" spellcheck="false" style="width:220px">
+          <div class="spacer"></div>
+          <a class="btn ghost sm" href="?tab=docker">Refrescar</a>
+        </div>
+        <div id="dockerRows">
+        <?php if ($containers === null): ?>
+          <div class="muted">No se pudo listar los contenedores (&iquest;acaba de arrancar Docker? espera unos segundos y recarga).</div>
+        <?php elseif (!$containers): ?>
+          <div class="muted">No hay contenedores todav&iacute;a.</div>
+        <?php else: foreach ($containers as $c): $up = stripos($c['status'],'Up ')===0; ?>
+          <div class="dbrow" data-search="<?= e(strtolower($c['name'].' '.$c['image'])) ?>">
+            <div>
+              <div class="dbname"><?= e($c['name']) ?></div>
+              <div class="muted" style="font-size:12px;max-width:480px;line-height:1.5;word-break:break-word"><?= e($c['image']) ?><?= $c['ports']!==''? ' &middot; '.e($c['ports']) : '' ?></div>
+            </div>
+            <div class="spacer"></div>
+            <span class="jstate <?= $up?'ok':'err' ?>"><?= e($c['status']) ?></span>
+            <div class="dbactions">
+              <?php if ($up): ?>
+                <form method="post"><input type="hidden" name="action" value="docker_container"><input type="hidden" name="op" value="restart"><input type="hidden" name="id" value="<?= e($c['id']) ?>"><button class="btn ghost sm" type="submit">Reiniciar</button></form>
+                <form method="post"><input type="hidden" name="action" value="docker_container"><input type="hidden" name="op" value="stop"><input type="hidden" name="id" value="<?= e($c['id']) ?>"><button class="btn ghost sm" type="submit">Parar</button></form>
+                <button type="button" class="btn ghost sm" onclick="luaOpenDockerTerm('<?= e($c['id']) ?>','<?= e(addslashes($c['name'])) ?>')">Terminal</button>
+              <?php else: ?>
+                <form method="post"><input type="hidden" name="action" value="docker_container"><input type="hidden" name="op" value="start"><input type="hidden" name="id" value="<?= e($c['id']) ?>"><button class="btn ghost sm" type="submit">Arrancar</button></form>
+              <?php endif; ?>
+              <button type="button" class="btn danger sm" onclick="luaAskRmContainer('<?= e($c['id']) ?>','<?= e(addslashes($c['name'])) ?>')">Eliminar</button>
+            </div>
+          </div>
+        <?php endforeach; endif; ?>
+        </div>
+      </div>
+      <script>
+        (function(){
+          var inp=document.getElementById('dockerSearchInput');
+          if(!inp) return;
+          inp.addEventListener('input', function(){
+            var q=inp.value.toLowerCase();
+            Array.from(document.querySelectorAll('#dockerRows .dbrow')).forEach(function(row){
+              row.style.display = (row.dataset.search||'').indexOf(q)===-1 ? 'none' : '';
+            });
+          });
+        })();
+      </script>
+
+      <!-- Modal de confirmacion de eliminar contenedor -->
+      <div id="rmContainerModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseRmContainer()">
+        <div class="modal-box" role="dialog" aria-modal="true">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+            </svg>
+          </div>
+          <h3>&iquest;Eliminar el contenedor?</h3>
+          <p class="modal-tx">Se eliminar&aacute; <strong id="rmContainerName"></strong> (forzado, aunque est&eacute; en marcha). Los datos que no est&eacute;n en un volumen se perder&aacute;n.</p>
+          <form method="post" class="modal-actions">
+            <input type="hidden" name="action" value="docker_container">
+            <input type="hidden" name="op" value="rm">
+            <input type="hidden" name="id" id="rmContainerId">
+            <button type="button" class="btn ghost" onclick="luaCloseRmContainer()">Cancelar</button>
+            <button type="submit" class="btn danger">S&iacute;, eliminar</button>
+          </form>
+        </div>
+      </div>
+      <script>
+        function luaAskRmContainer(id,name){
+          document.getElementById('rmContainerName').textContent = name;
+          document.getElementById('rmContainerId').value = id;
+          document.getElementById('rmContainerModal').hidden = false;
+          document.addEventListener('keydown', luaEscRmContainer);
+        }
+        function luaCloseRmContainer(){
+          document.getElementById('rmContainerModal').hidden = true;
+          document.removeEventListener('keydown', luaEscRmContainer);
+        }
+        function luaEscRmContainer(e){ if(e.key==='Escape') luaCloseRmContainer(); }
+      </script>
+
+      <!-- Modal: terminal dentro de un contenedor (docker exec) -->
+      <div id="dockerTermModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDockerTerm()">
+        <div class="modal-box" role="dialog" aria-modal="true" style="max-width:720px;text-align:left">
+          <div class="row" style="margin-bottom:10px">
+            <h3 id="dockerTermTitle" style="margin:0;font-size:16px">Terminal</h3>
+            <div class="spacer"></div>
+            <button type="button" class="btn ghost sm" id="dockerTermStop" disabled>Detener</button>
+            <button type="button" class="btn ghost sm" onclick="luaCloseDockerTerm()">Cerrar</button>
+          </div>
+          <div id="dockerTermOut" class="termout" style="height:320px;border:1px solid var(--line);border-radius:6px;background:var(--in)"></div>
+          <div class="termin" style="margin-top:8px">
+            <span class="termprompt">&gt;</span>
+            <input type="text" id="dockerTermCmd" class="termcmd-input" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="comando dentro del contenedor, p.ej. ls -la">
+          </div>
+        </div>
+      </div>
+      <script>
+        (function(){
+          var modal=document.getElementById('dockerTermModal'), title=document.getElementById('dockerTermTitle'),
+              out=document.getElementById('dockerTermOut'), inp=document.getElementById('dockerTermCmd'),
+              stopBtn=document.getElementById('dockerTermStop');
+          var sid=null, containerId=null, running=false, curRun=null;
+          function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+          var ANSI={30:'k',31:'r',32:'g',33:'y',34:'b',35:'m',36:'c',37:'w',90:'K',91:'R',92:'G',93:'Y',94:'B',95:'M',96:'C',97:'W'};
+          function ansiToHtml(s){
+            var res='', open=false, cls='', bold=false;
+            var re=/\x1b\[([0-9;]*)m/g, last=0, m;
+            function span(t){ if(!t)return; if(open){res+='<span class="a-'+cls+(bold?' a-bold':'')+'">'+esc(t)+'</span>';} else {res+=esc(t);} }
+            while((m=re.exec(s))!==null){
+              span(s.slice(last,m.index)); last=re.lastIndex;
+              var codes=m[1].split(';').filter(x=>x!=='').map(Number); if(codes.length===0)codes=[0];
+              codes.forEach(function(c){ if(c===0){open=false;cls='';bold=false;} else if(c===1){bold=true;} else if(ANSI[c]){cls=ANSI[c];open=true;} });
+            }
+            span(s.slice(last));
+            return res;
+          }
+          function append(html){ out.insertAdjacentHTML('beforeend', html); out.scrollTop=out.scrollHeight; }
+          function poll(runid, off, fails){
+            fails=fails||0;
+            fetch('?action=term_poll&sid='+sid+'&runid='+runid+'&off='+off)
+            .then(r=>r.json()).then(function(j){
+              if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); finish(); return; }
+              if(j.data){ append(ansiToHtml(j.data)); }
+              if(j.done){
+                if(out.textContent && !out.textContent.endsWith('\n')) append('\n');
+                append('<span class="'+(j.code?'a-r':'a-g')+'">[salida '+(j.code||0)+']</span>\n');
+                finish();
+              } else { setTimeout(function(){ poll(runid, j.off, 0); }, 300); }
+            }).catch(function(){
+              if(fails>=5){ append('<span class="a-r">[error de red]</span>\n'); finish(); return; }
+              setTimeout(function(){ poll(runid, off, fails+1); }, 500);
+            });
+          }
+          function finish(){ running=false; curRun=null; stopBtn.disabled=true; inp.disabled=false; inp.focus(); }
+          function run(cmd){
+            running=true; inp.disabled=true; stopBtn.disabled=false;
+            append('<span class="a-prompt">&gt; </span>'+esc(cmd)+'\n');
+            fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+              body:'action=docker_term_run&sid='+sid+'&container='+encodeURIComponent(containerId)+'&cmd='+encodeURIComponent(cmd)})
+            .then(r=>r.json()).then(function(j){
+              if(j.error){ append('<span class="a-r">'+esc(j.error)+'</span>\n'); finish(); return; }
+              curRun=j.runid; poll(j.runid, 0);
+            }).catch(function(){ append('<span class="a-r">[no se pudo lanzar]</span>\n'); finish(); });
+          }
+          inp.addEventListener('keydown', function(e){
+            if(e.key==='Enter'){
+              var cmd=inp.value; if(!cmd.trim()||running) return;
+              inp.value='';
+              run(cmd);
+            }
+          });
+          stopBtn.onclick=function(){
+            if(!running||!curRun) return;
+            fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+              body:'action=term_stop&sid='+sid+'&runid='+curRun}).then(function(){});
+          };
+          window.luaOpenDockerTerm=function(id, name){
+            containerId=id;
+            sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
+            title.textContent='Terminal: '+name;
+            out.innerHTML=''; running=false; curRun=null; stopBtn.disabled=true; inp.value=''; inp.disabled=false;
+            modal.hidden=false;
+            document.addEventListener('keydown', luaEscDockerTerm);
+            inp.focus();
+          };
+          window.luaCloseDockerTerm=function(){
+            if(running && curRun){ fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'action=term_stop&sid='+sid+'&runid='+curRun}).then(function(){}); }
+            modal.hidden=true;
+            document.removeEventListener('keydown', luaEscDockerTerm);
+          };
+          function luaEscDockerTerm(e){ if(e.key==='Escape') luaCloseDockerTerm(); }
+        })();
+      </script>
     <?php endif; ?>
 
   <?php elseif ($tab==='terminal'): /* ---------- PESTAÑA TERMINAL ---------- */
