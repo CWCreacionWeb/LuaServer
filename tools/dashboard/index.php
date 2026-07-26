@@ -2264,6 +2264,14 @@ setTimeout(ping,1500);})();
   .pwrbtn:active{transform:scale(.94)}
   .toollink{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:6px 10px;border:1px solid var(--line);border-radius:5px;color:var(--mut);font-size:12px;font-weight:600;text-decoration:none;transition:color .12s,border-color .12s,background-color .12s}
   .toollink:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.08)}
+  .runlink{display:inline-flex;align-items:center;gap:6px;background:none;border:none;padding:3px 2px;color:var(--mut);font-family:ui-monospace,Consolas,monospace;font-size:13px;cursor:pointer;text-decoration:none;transition:color .12s}
+  .runlink:hover{color:var(--ac);text-decoration:underline}
+  .runlink svg{flex:0 0 auto;opacity:.7;transition:opacity .12s}
+  .runlink:hover svg{opacity:1}
+  .runlink:disabled{opacity:.5;cursor:default;text-decoration:none}
+  .runlink-wrap{display:inline-flex;align-items:center;gap:2px}
+  .runlink-del{background:none;border:none;color:var(--mut);font-size:14px;line-height:1;cursor:pointer;padding:3px 5px;border-radius:4px;transition:color .12s,background-color .12s}
+  .runlink-del:hover{color:var(--err);background:rgba(248,81,73,.10)}
   .runbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0 0 0 1px;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s}
   .runbtn:hover{color:var(--ac);border-color:var(--ac)}
   .sitecard.is-locked .lockbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.12)}
@@ -2911,7 +2919,7 @@ setTimeout(ping,1500);})();
           <button type="button" class="btn ghost sm" id="runnerStop" disabled>Detener</button>
           <button type="button" class="btn ghost sm" onclick="luaCloseRunner()">Cerrar</button>
         </div>
-        <div id="runnerBtns" class="row" style="gap:6px;margin-bottom:10px;flex-wrap:wrap"></div>
+        <div id="runnerBtns" class="row" style="gap:6px 16px;margin-bottom:10px;flex-wrap:wrap"></div>
         <div class="row" style="gap:6px;margin-bottom:10px">
           <input type="text" id="runnerCustomCmd" placeholder="Comando personalizado, p.ej. npm run dev" style="flex:1" maxlength="200">
           <button type="button" class="btn ghost sm" id="runnerAddBtn" title="Guardar como acceso rápido y ejecutarlo">+ Guardar</button>
@@ -2945,27 +2953,31 @@ setTimeout(ping,1500);})();
         function append(html){ out.insertAdjacentHTML('beforeend', html); out.scrollTop=out.scrollHeight; }
         function setButtons(disabled){ Array.from(btnsEl.querySelectorAll('button')).forEach(function(b){ b.disabled=disabled; }); }
 
-        // Construida con la API del DOM (textContent + closures), no innerHTML: los comandos
-        // guardados son texto libre del usuario y podrian llevar comillas u otros caracteres
-        // que romperian un atributo onclick="..." armado a mano.
+        // Icono de terminal (estatico, sin datos de usuario -> innerHTML es seguro aqui).
+        var TERM_ICON='<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>';
+        // El texto del comando se anade aparte con createTextNode (nunca con innerHTML):
+        // los comandos guardados son texto libre del usuario y podrian llevar '<'/'>'/comillas
+        // que romperian el HTML (o un atributo onclick="..." armado a mano) si se insertaran tal cual.
+        function runlink(text, onClick, title){
+          var b=document.createElement('button');
+          b.type='button'; b.className='runlink'; if(title) b.title=title;
+          b.innerHTML=TERM_ICON; b.appendChild(document.createTextNode(text));
+          b.onclick=onClick;
+          return b;
+        }
         function renderBtns(){
           btnsEl.innerHTML='';
           curBuiltins.forEach(function(p){
-            var b=document.createElement('button');
-            b.type='button'; b.className='btn ghost sm'; b.textContent=p[0];
-            b.onclick=function(){ luaRunPreset(p[1]); };
-            btnsEl.appendChild(b);
+            btnsEl.appendChild(runlink(p[0], function(){ luaRunPreset(p[1]); }));
           });
           savedPresets.forEach(function(cmd){
             var wrap=document.createElement('span');
-            wrap.style.display='inline-flex'; wrap.style.gap='2px';
-            var b=document.createElement('button');
-            b.type='button'; b.className='btn ghost sm'; b.textContent=cmd; b.title='Ejecutar';
-            b.onclick=function(){ luaRunPreset(cmd); };
+            wrap.className='runlink-wrap';
+            wrap.appendChild(runlink(cmd, function(){ luaRunPreset(cmd); }, 'Ejecutar'));
             var d=document.createElement('button');
-            d.type='button'; d.className='btn ghost sm'; d.textContent='×'; d.title='Eliminar acceso rapido';
+            d.type='button'; d.className='runlink-del'; d.textContent='×'; d.title='Eliminar acceso rapido';
             d.onclick=function(){ luaDelPreset(cmd); };
-            wrap.appendChild(b); wrap.appendChild(d);
+            wrap.appendChild(d);
             btnsEl.appendChild(wrap);
           });
         }

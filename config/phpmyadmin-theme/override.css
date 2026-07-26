@@ -87,8 +87,6 @@ html,body,button,input,select,textarea,.btn,.form-control,.form-select,
 }
 body{font-size:14px}
 h1,h2,h3,h4,h5,h6,.card-header,summary{font-family:var(--lua-font-sans) !important;letter-spacing:-.01em}
-a{color:var(--lua-ac) !important;text-decoration:none}
-a:hover{color:var(--lua-ac-hover) !important}
 hr{border-color:var(--lua-line);opacity:1}
 .text-muted,.text-secondary,small,.small{color:var(--lua-mut) !important}
 h1,h2,h3,h4,h5,h6{color:var(--lua-tx)}
