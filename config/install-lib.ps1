@@ -149,6 +149,10 @@ function Install-CatalogItem {
             $themeDst = Join-Path $dest "themes\lua"
             $luaThemeCfg = Join-Path $Root "config\phpmyadmin-theme"
             if ((Test-Path $themeSrc) -and (Test-Path $luaThemeCfg)) {
+                # Si $themeDst ya existe, Copy-Item -Recurse lo copia COMO SUBCARPETA
+                # dentro (no fusiona su contenido) -- hay que borrarlo antes para que
+                # este paso sea idempotente y no duplique el theme.css en reinstalaciones.
+                if (Test-Path $themeDst) { Remove-Item $themeDst -Recurse -Force }
                 Copy-Item $themeSrc $themeDst -Recurse -Force
                 Copy-Item (Join-Path $luaThemeCfg "theme.json") (Join-Path $themeDst "theme.json") -Force
                 Copy-Item (Join-Path $Root "tools\dashboard\assets\logo.svg")    (Join-Path $themeDst "logo.svg") -Force

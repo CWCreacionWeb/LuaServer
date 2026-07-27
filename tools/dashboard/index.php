@@ -2392,14 +2392,14 @@ setTimeout(ping,1500);})();
   input:focus,select:focus,textarea:focus{outline:none;border-color:var(--ac)}
   textarea{width:100%;min-height:300px;font-family:ui-monospace,Consolas,monospace;font-size:13px;resize:vertical}
 
-  .btn{background:var(--ac);background-image:linear-gradient(135deg,var(--brand-start),var(--brand-end));color:#fff;border:1px solid transparent;border-radius:5px;padding:8px 16px;font-size:14px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:filter .12s,background .12s,color .12s,border-color .12s}
+  .btn{background:var(--ac);background-image:linear-gradient(135deg,var(--brand-start),var(--brand-end));color:#fff;border:1px solid transparent;border-radius:5px;padding:6px 13px;font-size:13px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:filter .12s,background .12s,color .12s,border-color .12s}
   .btn:hover{filter:brightness(1.08)}
   .btn.sm{padding:4px 10px;font-size:13px}
   .btn.ghost{background-image:linear-gradient(135deg,var(--brand-start),var(--brand-end));border-color:transparent;color:#fff}
   .btn.ghost:hover{filter:brightness(1.08)}
   .btn.danger{background-image:linear-gradient(135deg,var(--err),var(--err-dark));border-color:transparent;color:#fff}
   .btn.danger:hover{filter:brightness(1.08)}
-  .btn-git{display:inline-flex;align-items:center;gap:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:5px;padding:8px 16px;font-size:14px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:background-color .12s}
+  .btn-git{display:inline-flex;align-items:center;gap:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:5px;padding:6px 13px;font-size:13px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:background-color .12s}
   .btn-git:hover{background:#22272e}
 
   .dbrow{display:flex;align-items:center;flex-wrap:wrap;gap:16px;padding:14px 0;border-top:1px solid var(--line)}
@@ -2564,7 +2564,7 @@ setTimeout(ping,1500);})();
   .modal-tx{color:var(--mut);font-size:13px;line-height:1.5;margin:0 0 20px}
   .modal-tx strong{color:var(--tx)}
   .modal-actions{display:flex;gap:8px;justify-content:center}
-  .modal-actions .btn{width:auto;padding:8px 18px}
+  .modal-actions .btn{width:auto;padding:6px 15px}
 
   .loader-overlay{position:fixed;inset:0;background:rgba(6,7,10,.5);display:flex;align-items:center;justify-content:center;z-index:200}
   .loader-overlay[hidden]{display:none}

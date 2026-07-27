@@ -339,7 +339,7 @@ tr.hover>*,tr.marked>*,tr.marked{background:rgba(110,168,254,.12) !important}
 /* ============================================================
    BOTONES — degradado corporativo (igual que el logo) en todos
    ============================================================ */
-.btn{border-radius:5px !important;font-weight:600;font-size:14px}
+.btn{border-radius:5px !important;font-weight:600;font-size:13px;padding:6px 13px !important}
 .btn,.btn-primary,.btn-secondary,.btn-danger,.btn-success,.btn-warning,
 .btn-info,.btn-light,.btn-dark,.btn-default,.btn-outline-primary,.btn-outline-secondary{
   background-image:linear-gradient(135deg, var(--lua-brand-start), var(--lua-brand-end)) !important;
