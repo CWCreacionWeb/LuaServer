@@ -99,6 +99,12 @@ $MongoExpressPort    = 8081
 $LanExposeFlag = Join-Path $Root "config\lanexpose.on"
 $LanIpFile     = Join-Path $Root "config\lan-ip.txt"
 $FwRulePrefix  = "lua-server"
+# --- Actualizaciones (la plataforma es un repo de git) ---
+# El fetch va por SSH contra origin, asi que SOLO puede hacerlo el watcher: corre en la sesion
+# del usuario y tiene sus claves. El panel (Apache como SYSTEM) no las tiene, por eso se limita
+# a leer el estado que este proceso deja escrito y a pedir acciones por archivo-senal.
+$UpdateCfgFile    = Join-Path $Root "config\update.json"
+$UpdateStatusFile = Join-Path $TmpDir "update-status.json"
 
 $SvcApache  = "luaApache"
 $DefaultTld = "lua.test"
@@ -108,7 +114,11 @@ $HostsEnd   = "# === lua-server END ==="
 # extensiones PHP a habilitar (solo si existe su DLL). mysqli/pdo_mysql incluidas
 # por si tus proyectos conectan a un MySQL (p.ej. en Docker) via 127.0.0.1.
 # com_dotnet lo usa el panel para lanzar la recarga de Apache en segundo plano.
-$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_pgsql','pgsql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet')
+# pdo_odbc: lo necesita la pestana SQL Server. Va aqui (lista VERSIONADA) y no en
+# config\php\extra-extensions.json, que esta en .gitignore: si estuviera alli, al actualizar
+# la plataforma los demas equipos se quedarian sin el driver y la pestana no arrancaria.
+# Set-PhpInis solo activa las que tengan su DLL, y php_pdo_odbc.dll viene con PHP en Windows.
+$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_pgsql','pgsql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet','pdo_odbc')
 
 function Info($m){ Write-Host "[lua] $m" -ForegroundColor Cyan }
 function Ok($m){ Write-Host "[ok]  $m" -ForegroundColor Green }
@@ -173,7 +183,15 @@ function Apache-Up { [bool](Get-Process httpd -ErrorAction SilentlyContinue) }
 function Port80-Free { -not (Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue) }
 # Reinicio robusto: usa el servicio si existe; en consola espera a que el puerto 80 quede libre.
 function Restart-Apache {
-    if (Service-Exists $SvcApache) { Restart-Service $SvcApache; return }
+    if (Service-Exists $SvcApache) {
+        # Sin admin, Restart-Service sobre el servicio lanza excepcion (acceso denegado al SCM).
+        # Antes eso abortaba en seco al LLAMANTE (Cmd-Apply se quedaba a medias tras regenerar
+        # los php.ini, sin avisar de nada). Se degrada a aviso: quien SI puede reiniciarlo es el
+        # propio panel (PHP corre bajo el servicio, como SYSTEM) o una consola elevada.
+        try { Restart-Service $SvcApache -ErrorAction Stop }
+        catch { Warn "Apache es un servicio y esta consola no esta elevada: no se pudo reiniciar. Usa el boton Reiniciar del panel (o abre PowerShell como administrador) para aplicar los cambios." }
+        return
+    }
     Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force
     for ($i=0; $i -lt 24; $i++) { Start-Sleep -Milliseconds 250; if (Port80-Free) { break } }
     Start-Process -FilePath $Httpd -WindowStyle Hidden
@@ -196,6 +214,16 @@ function Test-HttpdConfig {
 function Write-Utf8NoBom($path, $content) {
     $text = if ($content -is [System.Array]) { [string]::Join("`r`n", $content) + "`r`n" } else { [string]$content }
     [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+# Para ProcessStartInfo.Arguments (string) en vez de .ArgumentList: en esta PowerShell 5.1,
+# ArgumentList devuelve $null (no soportado aqui), asi que hay que construir la linea de
+# comandos a mano. Solo hace falta para el streaming a mariadb.exe (db_import_file) -- el
+# resto del script ya invoca procesos via "& $exe @args", que no tiene este problema.
+function Quote-Win32Arg($s) {
+    $s = [string]$s
+    if ($s -eq '') { return '""' }
+    if ($s -notmatch '[\s"]') { return $s }
+    return '"' + ($s -replace '"','\"') + '"'
 }
 
 # ============================================================
@@ -666,7 +694,14 @@ function Stop-MongoExpress {
 }
 
 function Cmd-Start {
-    if (Service-Exists $SvcApache) { Start-Service $SvcApache; Ok "Apache (servicio) arriba" }
+    # -ErrorAction SilentlyContinue: igual que Cmd-Stop con Stop-Service. Una vez Apache es
+    # servicio de Windows, Start-Service pide permiso de gestion del SCM incluso si el servicio
+    # ya esta arriba (falla con "acceso denegado" desde una PowerShell no elevada) -- sin esto,
+    # el error paraba aqui todo el resto de Cmd-Start (watcher, Mailpit, MariaDB...) en seco.
+    if (Service-Exists $SvcApache) {
+        Start-Service $SvcApache -ErrorAction SilentlyContinue
+        if (Apache-Up) { Ok "Apache (servicio) arriba" } else { Info "Apache (servicio): no se pudo gestionar sin permisos de administrador, pero sigue arriba si ya lo estaba" }
+    }
     elseif (Apache-Up) { Info "Apache ya estaba arriba" }
     else { Start-Process -FilePath $Httpd -WindowStyle Hidden; Ok "Apache arrancado" }
     Start-Watcher
@@ -704,6 +739,11 @@ function Cmd-Watch {
     # reescritura de my.ini en bucle). Se reintenta como mucho cada 30s.
     $nextMariaTry = [datetime]::MinValue
     $nextPgTry    = [datetime]::MinValue
+    $fUpdChk      = Join-Path $TmpDir "update-check.flag"
+    $fUpdNow      = Join-Path $TmpDir "update-now.flag"
+    # Primera comprobacion a los 30s de arrancar (no en el mismo instante: el arranque ya
+    # tiene bastante trabajo, y si no hay red todavia daria un error inutil).
+    $nextUpdTry   = [datetime]::Now.AddSeconds(30)
     while ($true) {
         try {
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
@@ -735,6 +775,70 @@ function Cmd-Watch {
             if (-not $mongoOn -and (MongoDb-Up)) { Stop-MongoDb }
             if ($mongoOn -and (MongoDb-Up) -and -not (MongoExpress-Up)) { Start-MongoExpress }
             if ((-not $mongoOn -or -not (MongoDb-Up)) -and (MongoExpress-Up)) { Stop-MongoExpress }
+            # Dialogo nativo "Elegir carpeta": el panel corre bajo el servicio de Apache (sesion 0,
+            # sin escritorio), asi que no puede mostrar UI el mismo -- lo pide aqui, en el watcher,
+            # que corre en la sesion interactiva del usuario. El panel solo espera el resultado
+            # haciendo polling AJAX sobre el .res que se escribe abajo.
+            $pfDir = Join-Path $TmpDir "pickfolder"
+            if (Test-Path $pfDir) {
+                foreach ($pfReq in (Get-ChildItem $pfDir -Filter *.req -ErrorAction SilentlyContinue)) {
+                    $pfId = [System.IO.Path]::GetFileNameWithoutExtension($pfReq.Name)
+                    Remove-Item $pfReq.FullName -Force -ErrorAction SilentlyContinue
+                    $pfOut = try {
+                        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+                        # Formulario invisible "topmost" solo para forzar que el dialogo salga al
+                        # frente -- sin owner, ShowDialog() desde un host sin ventana visible a
+                        # veces se abre detras de otras ventanas y parece que "no ha pasado nada".
+                        $pfOwner = New-Object System.Windows.Forms.Form
+                        $pfOwner.TopMost = $true; $pfOwner.ShowInTaskbar = $false
+                        $pfOwner.StartPosition = 'CenterScreen'; $pfOwner.Width = 0; $pfOwner.Height = 0
+                        $pfOwner.Show(); $pfOwner.Activate()
+                        $pfDlg = New-Object System.Windows.Forms.FolderBrowserDialog
+                        $pfDlg.Description = "Elige la carpeta con los archivos .sql"
+                        $pfDlg.ShowNewFolderButton = $false
+                        $pfResult = $pfDlg.ShowDialog($pfOwner)
+                        $pfOwner.Close()
+                        if ($pfResult -eq [System.Windows.Forms.DialogResult]::OK) {
+                            @{ status = 'done'; path = $pfDlg.SelectedPath } | ConvertTo-Json -Compress
+                        } else {
+                            @{ status = 'cancelled' } | ConvertTo-Json -Compress
+                        }
+                    } catch {
+                        @{ status = 'error'; msg = $_.Exception.Message } | ConvertTo-Json -Compress
+                    }
+                    # Write-Utf8NoBom, no Set-Content -Encoding utf8: este metia BOM y el
+                    # json_decode() del lado PHP fallaba con el JSON perfectamente valido que
+                    # tenia detras ("respuesta ilegible") -- mismo gotcha ya conocido en .env.
+                    Write-Utf8NoBom (Join-Path $pfDir "$pfId.res") $pfOut
+                }
+            }
+            # --- Actualizaciones ---
+            # Comprobacion periodica + peticiones puntuales del panel. Si el propio lua.ps1 se
+            # ha actualizado, este proceso relanza uno nuevo y termina: seguir vivo significaria
+            # seguir ejecutando el codigo antiguo.
+            $updCfg = Get-UpdateConfig
+            $pideChk = Test-Path $fUpdChk
+            $pideNow = Test-Path $fUpdNow
+            if ($pideChk) { Remove-Item $fUpdChk -Force -ErrorAction SilentlyContinue }
+            if ($pideNow) { Remove-Item $fUpdNow -Force -ErrorAction SilentlyContinue }
+            if ($pideNow) {
+                $r = Update-Apply
+                if ($r -eq 'relanzar') {
+                    Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
+                    return
+                }
+            }
+            elseif ($pideChk -or [datetime]::Now -ge $nextUpdTry) {
+                $nextUpdTry = [datetime]::Now.AddHours($updCfg.cada_horas)
+                $est = Update-Check
+                if ($updCfg.auto -and -not $est.error -and $est.detras -gt 0 -and -not $est.sucio -and $est.delante -eq 0) {
+                    $r = Update-Apply
+                    if ($r -eq 'relanzar') {
+                        Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
+                        return
+                    }
+                }
+            }
             Process-Jobs
         } catch {
             # Antes esto se tragaba en silencio: un fallo aqui (p.ej. Restart-Service
@@ -797,12 +901,107 @@ function Cmd-Apply {
 }
 
 # ============================================================
+#  ACTUALIZACIONES (la plataforma es un repo de git)
+# ============================================================
+# Config: config\update.json -> { "auto": bool, "cada_horas": int }
+function Get-UpdateConfig {
+    $def = @{ auto = $false; cada_horas = 6 }
+    if (-not (Test-Path $UpdateCfgFile)) { return $def }
+    try {
+        $j = Get-Content $UpdateCfgFile -Raw | ConvertFrom-Json
+        return @{
+            auto       = [bool]$j.auto
+            cada_horas = if ($j.cada_horas -and [int]$j.cada_horas -ge 1) { [int]$j.cada_horas } else { 6 }
+        }
+    } catch { return $def }
+}
+function Save-UpdateConfig($cfg) {
+    Write-Utf8NoBom $UpdateCfgFile (($cfg | ConvertTo-Json -Compress))
+}
+# Version legible. Sin etiquetas en el repo se usa el nº de commit + el hash corto ("r33 3de3c0a");
+# si algun dia se etiqueta una version, git describe manda y se muestra la etiqueta.
+function Get-LuaVersion {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $tag = (& git -C "$Root" describe --tags --abbrev=0 2>$null | Select-Object -First 1)
+        $sha = (& git -C "$Root" rev-parse --short HEAD 2>$null | Select-Object -First 1)
+        $n   = (& git -C "$Root" rev-list --count HEAD 2>$null | Select-Object -First 1)
+        if ($tag) { return "$tag" }
+        if ($sha) { return "r$n $sha" }
+        return "desconocida"
+    } catch { return "desconocida" } finally { $ErrorActionPreference = $prev }
+}
+function Write-UpdateStatus($o) {
+    New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+    Write-Utf8NoBom $UpdateStatusFile (($o | ConvertTo-Json -Compress))
+}
+# Consulta el remoto y deja el resultado en tmp\update-status.json. No modifica el repo:
+# 'git fetch' solo trae referencias, nunca toca los archivos de trabajo.
+function Update-Check {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $o = @{ comprobado = (Get-Date -Format o); version = (Get-LuaVersion); error = $null
+            detras = 0; delante = 0; sucio = $false; remoto = $null; mensaje = $null }
+    try {
+        $fetch = (& git -C "$Root" fetch --quiet origin 2>&1)
+        if ($LASTEXITCODE -ne 0) {
+            # Tipico: sin clave SSH cargada, sin red, o el remoto pide autenticacion.
+            $o.error = "No se pudo consultar el remoto: $fetch"
+            Write-UpdateStatus $o; return $o
+        }
+        $up = (& git -C "$Root" rev-parse --abbrev-ref '@{u}' 2>$null | Select-Object -First 1)
+        if (-not $up) { $o.error = 'La rama actual no sigue a ninguna rama remota.'; Write-UpdateStatus $o; return $o }
+        $o.remoto  = "$up"
+        $o.detras  = [int]((& git -C "$Root" rev-list --count "HEAD..$up" 2>$null | Select-Object -First 1))
+        $o.delante = [int]((& git -C "$Root" rev-list --count "$up..HEAD" 2>$null | Select-Object -First 1))
+        $o.sucio   = [bool]((& git -C "$Root" status --porcelain 2>$null) -ne $null -and (& git -C "$Root" status --porcelain 2>$null).Count -gt 0)
+        if ($o.detras -gt 0) {
+            $o.mensaje = ((& git -C "$Root" log --format='%h %s' -n 5 "HEAD..$up" 2>$null) -join "`n")
+        }
+    } catch { $o.error = $_.Exception.Message }
+    finally { $ErrorActionPreference = $prev }
+    Write-UpdateStatus $o
+    return $o
+}
+# Aplica la actualizacion. Deliberadamente conservador: --ff-only y NUNCA con cambios locales
+# sin confirmar, para no provocar conflictos ni perder trabajo del usuario. La config de cada
+# maquina (sites.json, *.pass, sqlsrv-servers.json, www\...) no esta versionada, asi que un
+# pull no la toca.
+function Update-Apply {
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $est = Update-Check
+        if ($est.error)      { Err "Actualizacion cancelada: $($est.error)"; return $false }
+        if ($est.detras -eq 0) { Ok "Ya estas en la ultima version ($($est.version))."; return $true }
+        if ($est.sucio)      { Err "Hay cambios locales sin confirmar: no se actualiza para no pisarlos. Confirmalos o descartalos primero."; return $false }
+        if ($est.delante -gt 0) { Err "Tu rama tiene $($est.delante) commit(s) propios sin subir: actualiza a mano para decidir como integrarlos."; return $false }
+
+        $antesLua = (Get-FileHash (Join-Path $Root "lua.ps1") -Algorithm MD5).Hash
+        Info "Actualizando desde $($est.remoto)..."
+        $out = (& git -C "$Root" merge --ff-only "$($est.remoto)" 2>&1)
+        if ($LASTEXITCODE -ne 0) { Err "No se pudo actualizar: $out"; return $false }
+        Ok "Actualizado a $(Get-LuaVersion)."
+
+        Cmd-Apply   # regenera php.ini/vhosts y reinicia Apache si la config es valida
+        Update-Check | Out-Null
+
+        # Trampa nº1 de CLAUDE.md: el watcher tiene el codigo viejo cargado en memoria. Si el
+        # propio lua.ps1 ha cambiado, hay que relanzarlo o las novedades no existirian hasta
+        # el siguiente arranque manual.
+        $despuesLua = (Get-FileHash (Join-Path $Root "lua.ps1") -Algorithm MD5).Hash
+        if ($antesLua -ne $despuesLua) { return 'relanzar' }
+        return $true
+    } catch { Err "Error al actualizar: $($_.Exception.Message)"; return $false }
+    finally { $ErrorActionPreference = $prev }
+}
+
+# ============================================================
 #  Sistema de TAREAS (crear proyectos: plantillas, WordPress, git)
 #  El panel deja un .job en tmp\jobs\; el watcher lo ejecuta aqui.
 # ============================================================
-function Set-JobStatus($id, $name, $type, $state, $msg) {
+function Set-JobStatus($id, $name, $type, $state, $msg, $pct=$null) {
     $jd = Join-Path $TmpDir "jobs"; New-Item -ItemType Directory -Force -Path $jd | Out-Null
     $o = @{ id=$id; name=$name; type=$type; state=$state; msg=$msg; time=(Get-Date -Format "HH:mm:ss") }
+    if ($null -ne $pct) { $o.pct = $pct }
     [System.IO.File]::WriteAllText((Join-Path $jd "$id.status"), ($o | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
 }
 function Add-SiteToConfig($name, $php) {
@@ -973,6 +1172,87 @@ function Run-Job($id, $job) {
                     if (-not (Test-Path $MongoExpressApp)) { $ok=$false; $err="No se instalo mongo-express (ver log)" } else { "mongo-express instalado." | Add-Content $log }
                 }
             }
+            "db_import_dir" {
+                $dbname = "$($job.dbname)"; $srcDir = "$($job.dir)"
+                $mariadbExe = Join-Path $MariaDb "bin\mariadb.exe"
+                if (-not (Test-Path $mariadbExe)) { $ok=$false; $err="MariaDB no esta instalado" }
+                elseif (-not (Test-Path -LiteralPath $srcDir -PathType Container)) { $ok=$false; $err="La carpeta '$srcDir' no existe en el servidor" }
+                else {
+                    $rootPassFile = Join-Path $Root "config\mysql_root.pass"
+                    $rootPass = if (Test-Path $rootPassFile) { (Get-Content $rootPassFile -Raw).Trim() } else { "" }
+                    $sqlFiles = Get-ChildItem -LiteralPath $srcDir -Filter *.sql -File | Sort-Object Name
+                    if (-not $sqlFiles) { $ok=$false; $err="No hay archivos .sql en esa carpeta" }
+                    else {
+                        $total = $sqlFiles.Count; $i = 0; $failCount = 0
+                        "Importando $total archivo(s) .sql en `"$dbname`" desde $srcDir..." | Add-Content $log
+                        $mdArgs = @('--host=127.0.0.1','--port=3306','--user=root')
+                        if ($rootPass -ne '') { $mdArgs += "--password=$rootPass" }
+                        # "source <ruta>" (en vez de piping por stdin) deja que sea el propio cliente
+                        # mariadb.exe quien lea el fichero -- evita cargar el .sql entero en memoria de
+                        # PowerShell para luego canalizarlo (algunos dumps de esta carpeta pasan de 80 MB).
+                        foreach ($f in $sqlFiles) {
+                            $i++
+                            Set-JobStatus $id $name $type "running" "Importando $i/$total`: $($f.Name)" ([math]::Floor(($i-1)*100/$total))
+                            $fFwd = $f.FullName -replace '\\','/'
+                            $out = & $mariadbExe @mdArgs -e "source $fFwd" $dbname 2>&1
+                            if ($LASTEXITCODE -ne 0) { $failCount++; "[$i/$total] FALLO: $($f.Name) -> $out" | Add-Content $log }
+                            else { "[$i/$total] OK: $($f.Name)" | Add-Content $log }
+                        }
+                        if ($failCount -gt 0) { $ok=$false; $err="$failCount de $total archivo(s) fallaron (ver log)" }
+                    }
+                }
+            }
+            "db_import_file" {
+                # Import de un .sql subido desde el panel (boton "Importar" de una BD). Se hace
+                # como job (igual que db_import_dir) para no bloquear el worker de PHP con
+                # archivos grandes, y streameado a mano (en vez de "-e source <ruta>") para poder
+                # reportar progreso real en bytes -- el pipe entre PowerShell y mariadb.exe actua
+                # de cuello de botella natural, asi que "bytes enviados" se mantiene cerca de
+                # "bytes realmente procesados" (salvo dumps dominados por un INSERT gigante de una
+                # sola tabla, donde el cliente puede tragarse el stdin antes de terminar de
+                # ejecutarlo -- el % puede llegar a 100 un poco antes de que el proceso acabe).
+                $dbname = "$($job.dbname)"; $srcFile = "$($job.file)"
+                try {
+                    $mariadbExe = Join-Path $MariaDb "bin\mariadb.exe"
+                    if (-not (Test-Path $mariadbExe)) { $ok=$false; $err="MariaDB no esta instalado" }
+                    elseif (-not (Test-Path -LiteralPath $srcFile -PathType Leaf)) { $ok=$false; $err="El archivo subido ya no existe" }
+                    else {
+                        $rootPassFile = Join-Path $Root "config\mysql_root.pass"
+                        $rootPass = if (Test-Path $rootPassFile) { (Get-Content $rootPassFile -Raw).Trim() } else { "" }
+                        $totalBytes = (Get-Item -LiteralPath $srcFile).Length
+                        "Importando $([math]::Round($totalBytes/1MB,1)) MB en `"$dbname`"..." | Add-Content $log
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = $mariadbExe
+                        $argParts = @('--host=127.0.0.1','--port=3306','--user=root')
+                        if ($rootPass -ne '') { $argParts += (Quote-Win32Arg "--password=$rootPass") }
+                        $argParts += (Quote-Win32Arg $dbname)
+                        $psi.Arguments = $argParts -join ' '
+                        $psi.RedirectStandardInput = $true
+                        $psi.RedirectStandardError = $true
+                        $psi.UseShellExecute = $false
+                        $proc = [System.Diagnostics.Process]::Start($psi)
+                        $errTask = $proc.StandardError.ReadToEndAsync()
+                        $inStream = $proc.StandardInput.BaseStream
+                        $fileStream = [System.IO.File]::OpenRead($srcFile)
+                        $buffer = New-Object byte[] (1MB)
+                        $sent = 0L; $lastPct = -1
+                        try {
+                            while (($read = $fileStream.Read($buffer,0,$buffer.Length)) -gt 0) {
+                                $inStream.Write($buffer,0,$read)
+                                $sent += $read
+                                $pct = if ($totalBytes -gt 0) { [math]::Floor($sent*100/$totalBytes) } else { 99 }
+                                if ($pct -ne $lastPct) { Set-JobStatus $id $name $type "running" "Importando... $pct%" $pct; $lastPct = $pct }
+                            }
+                        } finally { $fileStream.Close(); $proc.StandardInput.Close() }
+                        $proc.WaitForExit()
+                        $stderrText = $errTask.GetAwaiter().GetResult()
+                        if ($proc.ExitCode -ne 0) { $ok=$false; $err="mariadb fallo: $stderrText" }
+                        else { "Importacion completa ($([math]::Round($totalBytes/1MB,1)) MB)." | Add-Content $log }
+                    }
+                } finally {
+                    Remove-Item -LiteralPath $srcFile -Force -ErrorAction SilentlyContinue
+                }
+            }
             "ftp_deploy" {
                 $ftpHost = "$($job.ftpHost)"; $ftpPort = "$($job.ftpPort)"; $ftpUser = "$($job.ftpUser)"; $ftpPass = "$($job.ftpPass)"
                 $ftpPath = "$($job.ftpPath)".Trim('/'); $ftpSsl = [bool]$job.ftpSsl
@@ -1003,7 +1283,7 @@ function Run-Job($id, $job) {
             }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'ftp_deploy') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'ftp_deploy') -and ($type -ne 'db_import_dir') -and ($type -ne 'db_import_file') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -1039,6 +1319,10 @@ function Run-Job($id, $job) {
             else { Set-JobStatus $id $name $type "error" "MongoDB se descargo pero no arranco del todo (revisa logs\mongodb y logs\jobs)" }
         } elseif ($type -eq 'ftp_deploy') {
             Set-JobStatus $id $name $type "done" "Desplegado por FTP a $ftpHost ($total archivo(s))"
+        } elseif ($type -eq 'db_import_dir') {
+            Set-JobStatus $id $name $type "done" "Importados $total archivo(s) .sql en `"$dbname`"" 100
+        } elseif ($type -eq 'db_import_file') {
+            Set-JobStatus $id $name $type "done" "Importado en `"$dbname`" ($([math]::Round($totalBytes/1MB,1)) MB)" 100
         } else {
             Add-SiteToConfig $name $php
             Set-PhpInis | Out-Null
@@ -1340,5 +1624,13 @@ switch ($Command.ToLower()) {
     "lan-expose"      { Require-Admin; Cmd-LanExpose }
     "lan-unexpose"    { Require-Admin; Cmd-LanUnexpose }
     "logs"        { Cmd-Logs }
+    "version"     { Write-Output (Get-LuaVersion) }
+    "update-check" {
+        $e = Update-Check
+        if ($e.error) { Err $e.error }
+        elseif ($e.detras -gt 0) { Info "Hay $($e.detras) actualizacion(es) disponible(s). Version actual: $($e.version)"; Write-Host $e.mensaje }
+        else { Ok "Estas en la ultima version ($($e.version))." }
+    }
+    "update-now"  { $r = Update-Apply; if ($r -eq 'relanzar') { Warn "lua.ps1 ha cambiado: reinicia con .\lua.ps1 stop y .\lua.ps1 start" } }
     default       { Cmd-Help }
 }

@@ -1,0 +1,249 @@
+<!-- @dsCard group="Dashboard" viewport="1200x820" name="Dashboard App" subtitle="Interactive lua-server admin panel" -->
+<!-- @startingPoint section="UI Kits" subtitle="lua-server local server admin panel (3-tab interactive)" viewport="1200x820" -->
+<!doctype html><html lang="es"><head>
+<meta charset="utf-8"><title>lua-server</title>
+<link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<style>*{box-sizing:border-box}html{height:100%}body{margin:0;display:flex;flex-direction:column;height:100vh;overflow:hidden;background:var(--color-bg);color:var(--color-text);font-family:var(--font-sans)}#root{flex:1;display:flex;flex-direction:column;overflow:hidden}a{color:var(--color-accent)}a:hover{color:var(--color-accent-hover)}</style>
+</head><body><div id="root"></div>
+<script type="text/babel">
+const { Button, Badge, Card, Tabs, StatusBanner, LogViewer, Input, Select } = window['LuaServer_3c5b96'];
+
+const PHP_VERSIONS = ['7.4','8.1','8.2','8.3','8.4','8.5'];
+const INIT_SITES = [
+  { name:'cliente-web', php:'8.3', domain:'cliente-web.lua.test' },
+  { name:'mi-wordpress', php:'8.2', domain:'mi-wordpress.lua.test' },
+  { name:'api-slim', php:'8.4', domain:'api-slim.lua.test' },
+];
+const INIT_JOBS = [
+  { id:1, name:'nueva-tienda', type:'wordpress', state:'done', msg:'Listo → http://nueva-tienda.lua.test', time:'14:32:01' },
+  { id:2, name:'mi-laravel', type:'laravel', state:'running', msg:'Instalando dependencias con Composer…', time:'14:35:12' },
+];
+const MOCK_LOG = '[Mon Jul 21 14:30:01.123] [fcgid:warn] mod_fcgid: read data timeout in 40 seconds\n[Mon Jul 21 14:30:23.445] [core:notice] AH00094: Command line: httpd.exe\n[Mon Jul 21 14:31:00.001] [fcgid:info] spawn php-cgi.exe (8.3) pid 3920\n[Mon Jul 21 14:32:01.234] [ssl:warn] AH01909: localhost:443:0 server cert does NOT include an ID\n[Mon Jul 21 14:33:15.678] [core:info] AH00489: Apache/2.4.68 configured\n[Mon Jul 21 14:35:12.345] [fcgid:info] spawn php-cgi.exe (8.4) pid 4105\n[Mon Jul 21 14:36:00.000] [fcgid:warn] mod_fcgid: process 4105 gracefully killed';
+
+// ── Shared styles ──
+const fl = { display:'flex', alignItems:'flex-end', gap:8, flexWrap:'wrap' };
+const row = { display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' };
+const mut = { color:'var(--color-text-muted)', fontSize:'var(--text-sm)' };
+const h2s = { fontSize:'var(--text-sm)', color:'var(--color-text-muted)', textTransform:'uppercase', letterSpacing:'.5px', margin:'26px 0 12px', fontFamily:'var(--font-sans)' };
+const lbl = { display:'block', fontSize:'var(--text-sm)', color:'var(--color-text-muted)', marginBottom:4 };
+const inp = { background:'var(--color-input-bg)', color:'var(--color-text)', border:'1px solid var(--color-border)', borderRadius:'var(--radius-md)', padding:'8px 10px', fontSize:'var(--text-md)', fontFamily:'var(--font-sans)', outline:'none' };
+const code = { background:'rgba(128,128,128,.16)', padding:'2px 6px', borderRadius:'var(--radius-xs)', fontSize:'var(--text-base)', fontFamily:'var(--font-mono)' };
+const COMPOSER_LOG = '[14:35:12] composer create-project laravel/laravel mi-laravel\n[14:35:14] Downloading laravel/laravel (v11.x)...\n[14:35:20] Installing dependencies (217 packages)...';
+const jCls = { done:{ background:'rgba(63,185,80,.15)', color:'var(--color-success)' }, error:{ background:'rgba(248,81,73,.15)', color:'var(--color-error)' }, running:{ background:'rgba(110,168,254,.15)', color:'var(--color-accent)' }, queued:{ background:'rgba(210,153,34,.15)', color:'var(--color-warning)' } };
+
+// ── ProjectsTab ──
+function ProjectsTab() {
+  const [sites, setSites] = React.useState(INIT_SITES);
+  const [jobs, setJobs] = React.useState(INIT_JOBS);
+  const [type, setType] = React.useState('blank');
+  const [httpsOn, setHttpsOn] = React.useState(false);
+  const [mailOn, setMailOn] = React.useState(true);
+  const [banner, setBanner] = React.useState(null);
+  const show = (t, m) => { setBanner({ t, m }); setTimeout(() => setBanner(null), 3500); };
+
+  const handleDelete = name => { setSites(s => s.filter(x => x.name !== name)); show('applied', `Proyecto "${name}" eliminado (la carpeta se conserva).`); };
+  const handleSwitch = (name, php) => { setSites(s => s.map(x => x.name === name ? { ...x, php } : x)); show('applied', `"${name}" ahora usa PHP ${php}.`); };
+
+  return (
+    <div>
+      {banner && <StatusBanner type={banner.t} message={banner.m} />}
+      <Card style={{ marginBottom:14 }}>
+        <div style={fl}>
+          <div><label style={lbl}>Nombre del proyecto</label><input style={inp} placeholder="micliente" /></div>
+          <div><label style={lbl}>Tipo</label>
+            <select style={inp} value={type} onChange={e => setType(e.target.value)}>
+              <option value="blank">PHP en blanco</option><option value="laravel">Laravel</option>
+              <option value="wordpress">WordPress</option><option value="symfony">Symfony</option>
+              <option value="slim">Slim</option><option value="git">Desde Git…</option>
+            </select></div>
+          <div><label style={lbl}>Versión de PHP</label>
+            <select style={inp}>{PHP_VERSIONS.map(v => <option key={v}>PHP {v}</option>)}</select></div>
+          <Button onClick={() => show('job', 'Creando proyecto… mira el progreso abajo.')}>+ Crear</Button>
+        </div>
+        {type === 'git' && <div style={{ marginTop:12 }}><label style={lbl}>URL del repositorio Git</label><input style={{ ...inp, width:'100%' }} placeholder="https://github.com/usuario/repo.git" /></div>}
+        <div style={{ ...mut, marginTop:10 }}>Laravel/Symfony/Slim usan Composer; WordPress se descarga; Git clona el repo. Se hace en segundo plano.</div>
+      </Card>
+
+      <div style={{ ...row, margin:'22px 0 10px' }}>
+        <h2 style={{ ...h2s, margin:0 }}>Tareas</h2>
+        <div style={{ flex:1 }}></div>
+        <Button variant="ghost" onClick={() => setJobs([])}>Limpiar historial</Button>
+      </div>
+      {jobs.map(j => (
+        <Card key={j.id} padding="12px 16px" style={{ marginBottom:8 }}>
+          <div style={row}>
+            <span style={{ display:'inline-block', fontSize:'var(--text-xs)', fontWeight:'var(--font-bold)', padding:'3px 9px', borderRadius:'var(--radius-pill)', letterSpacing:'.3px', ...jCls[j.state] }}>{j.state.toUpperCase()}</span>
+            <span style={{ fontWeight:'var(--font-bold)' }}>{j.name}</span>
+            <span style={mut}>{j.type} · {j.time}</span>
+            <div style={{ flex:1 }}></div>
+            <span style={mut}>{j.msg}</span>
+          </div>
+          {j.state === 'running' && <pre style={{ background:'var(--color-input-bg)', border:'1px solid var(--color-border)', borderRadius:'var(--radius-xs)', padding:10, fontFamily:'var(--font-mono)', fontSize:11, color:'var(--color-text-muted)', margin:'10px 0 0', maxHeight:72, overflow:'auto' }}>{COMPOSER_LOG}</pre>}
+        </Card>
+      ))}
+
+      <h2 style={h2s}>Proyectos</h2>
+      {!sites.length && <Card><div style={mut}>Aún no hay proyectos. Crea el primero arriba.</div></Card>}
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(6,1fr)', gap:10, marginBottom:14 }}>
+        {sites.map(s => (
+          <Card key={s.name} padding="14px 16px" style={{ display:'flex', flexDirection:'column', gap:10 }}>
+            <div style={{ fontWeight:'var(--font-bold)', fontSize:'var(--text-md)', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{s.name}</div>
+            <a href="#" style={{ color:'var(--color-text-muted)', fontSize:11, textDecoration:'none', overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }} onClick={e=>e.preventDefault()}>{s.domain} ↗</a>
+            <select style={{ ...inp, width:'100%' }} value={s.php} onChange={e => handleSwitch(s.name, e.target.value)}>
+              {PHP_VERSIONS.map(v => <option key={v} value={v}>PHP {v}</option>)}
+            </select>
+            <Button variant="danger" style={{ width:'100%', justifyContent:'center' }} onClick={() => handleDelete(s.name)}>Eliminar</Button>
+          </Card>
+        ))}
+      </div>
+
+      <Card style={{ ...row, marginBottom:14 }}>
+        <div><div style={{ fontWeight:'var(--font-semibold)' }}>Dominios <code style={code}>.lua.test</code> en el navegador</div><div style={mut}>Registrar en el archivo hosts de Windows (una vez, como admin).</div></div>
+        <div style={{ flex:1 }}></div>
+        <Button variant="ghost" onClick={() => show('info', 'Sincronizando dominios: acepta el aviso de Windows (UAC).')}>Sincronizar dominios</Button>
+      </Card>
+      <Card style={{ ...row, marginBottom:14 }}>
+        <div>
+          <div style={{ ...row, gap:8 }}><span style={{ fontWeight:'var(--font-semibold)' }}>HTTPS local</span><Badge variant={httpsOn ? 'ok' : 'error'}>{httpsOn ? 'ACTIVO' : 'INACTIVO'}</Badge></div>
+          <div style={mut}>Certificados mkcert para <code style={code}>https://&lt;proyecto&gt;.lua.test</code> (candado verde).</div>
+        </div>
+        <div style={{ flex:1 }}></div>
+        <Button variant={httpsOn ? 'danger' : 'ghost'} onClick={() => { setHttpsOn(v => !v); show('info', httpsOn ? 'HTTPS desactivado.' : 'Activando HTTPS: acepta el aviso de Windows (UAC).'); }}>
+          {httpsOn ? 'Desactivar' : 'Activar'} HTTPS
+        </Button>
+      </Card>
+      <Card style={row}>
+        <div>
+          <div style={{ ...row, gap:8 }}><span style={{ fontWeight:'var(--font-semibold)' }}>Mailpit</span><Badge variant={mailOn ? 'ok' : 'error'}>{mailOn ? 'ACTIVO' : 'INACTIVO'}</Badge></div>
+          <div style={mut}>Captura emails PHP (SMTP <code style={code}>127.0.0.1:1025</code>). No salen a internet.</div>
+        </div>
+        <div style={{ flex:1 }}></div>
+        {mailOn && <Button variant="ghost" size="sm">Abrir buzón ↗</Button>}
+        <Button variant={mailOn ? 'danger' : 'ghost'} onClick={() => { setMailOn(v => !v); show('applied', mailOn ? 'Mailpit desactivado.' : 'Mailpit activado. Buzón en http://localhost:8025'); }}>
+          {mailOn ? 'Desactivar' : 'Activar'} Mailpit
+        </Button>
+      </Card>
+    </div>
+  );
+}
+
+// ── PhpTab ──
+const CURATED = [
+  { key:'date.timezone', label:'Zona horaria', ph:'Europe/Madrid' },
+  { key:'memory_limit', label:'Límite de memoria', ph:'512M' },
+  { key:'upload_max_filesize', label:'Tamaño máx. de subida', ph:'128M' },
+  { key:'post_max_size', label:'Tamaño máx. de POST', ph:'128M' },
+  { key:'max_execution_time', label:'Tiempo máx. ejecución (s)', ph:'120' },
+  { key:'max_input_vars', label:'Máx. vars de entrada', ph:'5000' },
+];
+function PhpTab() {
+  const [open, setOpen] = React.useState('8.4');
+  const [xdebug, setXdebug] = React.useState({ '8.3': true });
+  const [banner, setBanner] = React.useState(null);
+  const show = (m) => { setBanner(m); setTimeout(() => setBanner(null), 3000); };
+  return (
+    <div>
+      {banner && <StatusBanner type="applied" message={banner} />}
+      <div style={{ ...mut, marginBottom:14 }}>Los cambios se guardan como <em>overrides</em> y se aplican recargando Apache automáticamente.</div>
+      {PHP_VERSIONS.map(v => {
+        const isOpen = open === v;
+        const xOn = !!xdebug[v];
+        return (
+          <div key={v} style={{ border:'1px solid var(--color-border)', borderRadius:'var(--radius-lg)', marginBottom:12, background:'var(--color-surface)', overflow:'hidden' }}>
+            <div onClick={() => setOpen(isOpen ? null : v)} style={{ padding:'14px 18px', cursor:'pointer', fontWeight:'var(--font-bold)', fontSize:'var(--text-lg)', display:'flex', alignItems:'center', gap:10, userSelect:'none' }}>
+              PHP {v}
+              <span style={{ fontSize:'var(--text-sm)', color:'var(--color-text-muted)', fontWeight:'var(--font-normal)' }}>— config/php/{v}.overrides.ini</span>
+              <span style={{ marginLeft:'auto', fontSize:12, color:'var(--color-text-muted)' }}>{isOpen ? '▲' : '▼'}</span>
+            </div>
+            {isOpen && (
+              <div style={{ padding:'4px 18px 18px' }}>
+                <div style={{ ...row, marginBottom:4 }}>
+                  <span style={{ fontWeight:'var(--font-semibold)' }}>Xdebug</span>
+                  <Badge variant={xOn ? 'ok' : 'error'}>{xOn ? 'ACTIVADO' : 'DESACTIVADO'}</Badge>
+                  <div style={{ flex:1 }}></div>
+                  <Button variant={xOn ? 'danger' : 'ghost'} size="sm"
+                    onClick={() => { setXdebug(x => ({ ...x, [v]: !x[v] })); show(xOn ? `Xdebug desactivado en PHP ${v}.` : `Xdebug activado en PHP ${v}.`); }}>
+                    {xOn ? 'Desactivar' : 'Activar'} Xdebug
+                  </Button>
+                </div>
+                <div style={{ ...mut, marginBottom:16, fontSize:12 }}>Depuración paso a paso en el puerto <strong>9003</strong> (VS Code / PhpStorm).</div>
+                <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(190px,1fr))', gap:12 }}>
+                  {CURATED.map(f => (
+                    <div key={f.key}>
+                      <label style={lbl}>{f.label} <span style={{ opacity:.7 }}>({f.key})</span></label>
+                      <input defaultValue={f.ph} style={{ ...inp, width:'100%' }} />
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginTop:14 }}>
+                  <label style={lbl}>Directivas adicionales <span style={{ opacity:.7 }}>(formato clave = valor)</span></label>
+                  <textarea defaultValue="" style={{ ...inp, width:'100%', minHeight:70, fontFamily:'var(--font-mono)', fontSize:13, resize:'vertical' }} placeholder={'; ejemplo\nopcache.jit = 1255'} />
+                </div>
+                <div style={{ marginTop:14 }}><Button onClick={() => show(`php.ini de PHP ${v} guardado.`)}>Guardar y aplicar</Button></div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── LogsTab ──
+const LOG_FILES = ['error.log','access.log','nueva-tienda-error.log','mi-laravel-error.log'];
+function LogsTab() {
+  const [sel, setSel] = React.useState('error.log');
+  const [refresh, setRefresh] = React.useState(false);
+  return (
+    <div>
+      <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:14 }}>
+        {LOG_FILES.map(lf => <Button key={lf} variant={lf===sel ? 'primary' : 'ghost'} size="sm" onClick={() => setSel(lf)}>{lf}</Button>)}
+        <div style={{ flex:1 }}></div>
+        <Button variant="ghost" size="sm" onClick={() => setRefresh(r => !r)}>{refresh ? '⏸ Auto-refresco ON' : '▶ Auto-refresco'}</Button>
+        <Button variant="ghost" size="sm">Vaciar</Button>
+      </div>
+      <LogViewer content={sel === 'error.log' ? MOCK_LOG : '(vacío)'} maxHeight="62vh" />
+    </div>
+  );
+}
+
+// ── DashboardApp ──
+function DashboardApp() {
+  const [tab, setTab] = React.useState('proyectos');
+  const TABS = [{id:'proyectos',label:'Proyectos'},{id:'php',label:'Versiones PHP'},{id:'logs',label:'Logs'}];
+  const logoStyle = { width:44, height:44, borderRadius:'var(--radius-lg)', background:'linear-gradient(135deg,var(--color-brand-start),var(--color-brand-end))', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:'var(--font-extrabold)', fontSize:17, color:'#fff', letterSpacing:1, flexShrink:0 };
+  return (
+    <div style={{ display:'flex', flexDirection:'column', flex:1, overflow:'hidden' }}>
+      <header style={{ display:'flex', alignItems:'center', gap:14, padding:'10px 40px', background:'var(--color-surface)', borderBottom:'1px solid var(--color-border)', flexShrink:0 }}>
+        <div style={logoStyle}>LUA</div>
+        <div>
+          <h1 style={{ margin:0, fontSize:'var(--text-xl)', fontWeight:'var(--font-bold)', lineHeight:1.2 }}>lua-server</h1>
+          <div style={{ color:'var(--color-text-muted)', fontSize:'var(--text-sm)', marginTop:1 }}>Servidor PHP local · 3 proyecto(s) · PHP: {PHP_VERSIONS.join(', ')}</div>
+        </div>
+        <div style={{ flex:1 }}></div>
+        <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+          <Badge variant="ok">Apache UP</Badge>
+          <Badge variant="running">Watcher activo</Badge>
+        </div>
+      </header>
+      <div style={{ padding:'0 40px', background:'var(--color-surface)', borderBottom:'1px solid var(--color-border)', flexShrink:0 }}>
+        <Tabs tabs={TABS} activeTab={tab} onTabChange={setTab} />
+      </div>
+      <div style={{ flex:1, overflowY:'auto', padding:'28px 40px 48px' }}>
+        {tab === 'proyectos' && <ProjectsTab />}
+        {tab === 'php'       && <PhpTab />}
+        {tab === 'logs'      && <LogsTab />}
+      </div>
+      <footer style={{ padding:'8px 40px', color:'var(--color-text-muted)', fontSize:12, borderTop:'1px solid var(--color-border)', flexShrink:0, textAlign:'center' }}>
+        lua-server · Apache + mod_fcgid · panel solo accesible desde esta máquina
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<DashboardApp />);
+</script></body></html>

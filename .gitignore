@@ -20,8 +20,15 @@
 /config/lanexpose.on
 /config/lan-ip.txt
 /config/mysql_root.pass
+/config/mysql_users.pass.json
+
+# ===== conexiones a SQL Server externos (host/usuario/contrasena de cada maquina) =====
+/config/sqlsrv-servers.json
 /config/ftp/
 /config/php/extra-extensions.json
+
+# ===== preferencias de actualizacion de cada maquina (auto si/no, cada cuanto) =====
+/config/update.json
 
 # ===== registro de proyectos: estado de cada maquina (plantilla: sites.example.json) =====
 /config/sites.json

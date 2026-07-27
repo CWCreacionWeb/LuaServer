@@ -1,0 +1,28 @@
+/* LuaServer Design System — Color Tokens */
+:root {
+  --color-bg: #0f1117;
+  --color-surface: #1a1d27;
+  --color-input-bg: #11141c;
+  --color-border: #2a2f3d;
+  --color-text: #e6e8ee;
+  --color-text-muted: #8b90a0;
+  --color-accent: #6ea8fe;
+  --color-accent-hover: #5a97f0;
+  --color-brand-start: #6ea8fe;
+  --color-brand-end: #9b6efe;
+  --color-success: #3fb950;
+  --color-warning: #d29922;
+  --color-error: #f85149;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-bg: #f4f6fb;
+    --color-surface: #ffffff;
+    --color-input-bg: #ffffff;
+    --color-border: #e3e7f0;
+    --color-text: #1a1d27;
+    --color-text-muted: #5b6172;
+    --color-accent: #2b6cff;
+    --color-accent-hover: #1a5ae8;
+  }
+}

@@ -612,22 +612,76 @@ function mysql_root_pass($root){
     $f = $root.'/config/mysql_root.pass';
     return is_file($f) ? trim((string)@file_get_contents($f)) : '';
 }
-// Sincroniza el config.inc.php de phpMyAdmin (auth_type=config) con la contraseña de root.
-// Parchea IN SITU las dos líneas (no regenera: perdería el blowfish_secret aleatorio). Sin
-// esto, tras fijar contraseña phpMyAdmin seguía enviando '' y MariaDB lo rechazaba. No-op
-// si phpMyAdmin no está instalado.
-function pma_sync_root_pass($root, $pass){
+// Contraseñas de los usuarios MySQL creados desde el panel (config\mysql_users.pass.json,
+// fuera de git, mismo espiritu que mysql_root.pass): se guardan SOLO para poder ofrecerlos
+// en el desplegable de conexiones de phpMyAdmin (pma_sync_servers) sin volver a teclearlas.
+// Clave "usuario@host" porque el mismo nombre puede existir en mas de un host.
+function mysql_users_passwords($root){
+    $f = $root.'/config/mysql_users.pass.json';
+    if (!is_file($f)) return [];
+    $d = json_decode((string)@file_get_contents($f), true);
+    return is_array($d) ? $d : [];
+}
+function mysql_user_save_password($root, $user, $host, $pass){
+    $d = mysql_users_passwords($root);
+    $d[$user.'@'.$host] = $pass;
+    @file_put_contents($root.'/config/mysql_users.pass.json', json_encode($d));
+}
+function mysql_user_forget_password($root, $user, $host){
+    $d = mysql_users_passwords($root);
+    unset($d[$user.'@'.$host]);
+    @file_put_contents($root.'/config/mysql_users.pass.json', json_encode($d));
+}
+// Reconstruye, dentro de un bloque delimitado por marcadores, las conexiones de phpMyAdmin
+// (auth_type=config, con user/password ya puestos) para root y cada usuario MySQL creado
+// desde el panel -- asi el desplegable de servidores de phpMyAdmin entra directo, sin volver
+// a escribir credenciales. Solo toca lo que hay ENTRE los marcadores: cualquier conexion
+// que el usuario haya anadido a mano al archivo (fuera de ellos) se deja intacta. No-op si
+// phpMyAdmin no esta instalado, o si el archivo no tiene ni siquiera "$i = 0;" (estructura
+// demasiado distinta de lo esperado -- mejor no tocar nada que arriesgarse a romperlo).
+function pma_sync_servers($root){
     $f = $root.'/tools/phpmyadmin/config.inc.php';
     if (!is_file($f)) return;
     $c = @file_get_contents($f);
     if ($c === false) return;
-    $lit   = "'".addcslashes($pass, "\\'")."'";
-    $allow = $pass === '' ? 'true' : 'false';
-    // preg_replace_callback: el reemplazo se devuelve literal (no se parsean $1/\ del valor).
-    $c = preg_replace_callback("/(\\\$cfg\\['Servers'\\]\\[\\\$i\\]\\['password'\\]\\s*=\\s*)[^\\r\\n]*;/",
-            function($m) use ($lit){ return $m[1].$lit.';'; }, $c, 1);
-    $c = preg_replace_callback("/(\\\$cfg\\['Servers'\\]\\[\\\$i\\]\\['AllowNoPassword'\\]\\s*=\\s*)[^\\r\\n]*;/",
-            function($m) use ($allow){ return $m[1].$allow.';'; }, $c, 1);
+
+    $rootPass = mysql_root_pass($root);
+    $entries = [['verbose'=>'root (local)', 'host'=>'127.0.0.1', 'port'=>'3306', 'user'=>'root', 'pass'=>$rootPass, 'allowNoPass'=>$rootPass==='']];
+
+    $liveUsers = [];
+    try { foreach (mysql_users() ?: [] as $u) { $liveUsers[$u['user'].'@'.$u['host']] = true; } } catch (Throwable $e) {}
+    foreach (mysql_users_passwords($root) as $key => $pass) {
+        if (!isset($liveUsers[$key])) continue; // cuenta ya borrada de MySQL -> no ofrecerla
+        [$u, $h] = array_pad(explode('@', $key, 2), 2, '127.0.0.1');
+        if (strcasecmp($u, 'root') === 0) continue; // root ya tiene su propio slot arriba
+        $entries[] = ['verbose'=>$u, 'host'=>$h, 'port'=>'3306', 'user'=>$u, 'pass'=>$pass, 'allowNoPass'=>$pass===''];
+    }
+
+    $lines = ["// ===== lua-server: conexiones auto-generadas (NO editar a mano, se sobrescriben) ====="];
+    foreach ($entries as $e) {
+        $q = function($s){ return "'".addcslashes((string)$s, "\\'")."'"; };
+        $lines[] = '$i++;';
+        $lines[] = "\$cfg['Servers'][\$i]['verbose'] = ".$q($e['verbose']).';';
+        $lines[] = "\$cfg['Servers'][\$i]['host'] = ".$q($e['host']).';';
+        $lines[] = "\$cfg['Servers'][\$i]['port'] = ".$q($e['port']).';';
+        $lines[] = "\$cfg['Servers'][\$i]['auth_type'] = 'config';";
+        $lines[] = "\$cfg['Servers'][\$i]['user'] = ".$q($e['user']).';';
+        $lines[] = "\$cfg['Servers'][\$i]['password'] = ".$q($e['pass']).';';
+        $lines[] = "\$cfg['Servers'][\$i]['AllowNoPassword'] = ".($e['allowNoPass']?'true':'false').';';
+    }
+    $lines[] = "// ===== fin conexiones lua-server =====";
+    $block = implode("\n", $lines);
+
+    // preg_replace_callback (no preg_replace): el reemplazo se devuelve literal, si no PHP
+    // intenta interpretar los "$i"/"$cfg" del bloque como referencias de grupo ($1, etc.).
+    $marker = '/\/\/ ===== lua-server: conexiones auto-generadas.*?\/\/ ===== fin conexiones lua-server =====/s';
+    if (preg_match($marker, $c)) {
+        $c = preg_replace_callback($marker, function($m) use ($block){ return $block; }, $c, 1);
+    } elseif (preg_match('/\$i\s*=\s*0;/', $c)) {
+        $c = preg_replace_callback('/(\$i\s*=\s*0;)/', function($m) use ($block){ return $m[1]."\n\n".$block; }, $c, 1);
+    } else {
+        return;
+    }
     @file_put_contents($f, $c);
 }
 // Sincroniza el nombre de marca (junto al logo, en la cabecera de navegacion de
@@ -670,12 +724,32 @@ function mysql_users(){
         $pdo = mysql_pdo();
         $out = [];
         foreach ($pdo->query('SELECT User, Host FROM mysql.user') as $row) {
-            if ($row['User'] === '' || in_array($row['User'], $sys, true)) continue;
+            // Host vacio = rol interno (p.ej. PUBLIC en MariaDB 10.11+), no una cuenta con login real:
+            // nunca se crea desde este panel y "Eliminar" fallaria (valid_mysql_host lo rechaza).
+            if ($row['User'] === '' || $row['Host'] === '' || in_array($row['User'], $sys, true)) continue;
             $out[] = ['user'=>$row['User'], 'host'=>$row['Host']];
         }
         usort($out, function($a,$b){ return [$a['user'],$a['host']] <=> [$b['user'],$b['host']]; });
         return $out;
     } catch (Throwable $e) { return null; }
+}
+// Deduce a que bases de datos tiene acceso un usuario, leyendo SHOW GRANTS (evita depender
+// de columnas internas que cambian entre versiones de MariaDB/MySQL). null si falla.
+function mysql_user_scope($pdo, $user, $host){
+    try {
+        $rows = $pdo->query('SHOW GRANTS FOR '.$pdo->quote($user).'@'.$pdo->quote($host))->fetchAll(PDO::FETCH_COLUMN);
+    } catch (Throwable $e) { return null; }
+    $all = false; $dbs = [];
+    foreach ($rows as $line) {
+        // La primera fila de toda cuenta es "GRANT USAGE ON *.* TO ..." (solo para colgar la
+        // contraseña): no cuenta como acceso real, por eso se excluye explicitamente.
+        if (preg_match('/^GRANT\s+(.+?)\s+ON\s+\*\.\*/i', $line, $m)) {
+            if (strcasecmp(trim($m[1]), 'USAGE') !== 0) $all = true;
+        } elseif (preg_match('/^GRANT\s+.+?\s+ON\s+`([^`]+)`\.\*/i', $line, $m)) {
+            $dbs[] = $m[1];
+        }
+    }
+    return ['all'=>$all, 'dbs'=>array_values(array_unique($dbs))];
 }
 
 // ---------------- PostgreSQL (mismo patron que MySQL, via pdo_pgsql) ----------------
@@ -712,6 +786,255 @@ function pgsrv_roles(){
         }
         return $out;
     } catch (Throwable $e) { return null; }
+}
+
+// ---------------- SQL Server (Microsoft): conexiones guardadas y metadatos ----------------
+// A diferencia de MySQL/Postgres/Mongo, aqui NO gestionamos un motor propio: SQL Server no se
+// instala con la plataforma, se conecta a uno existente (local o de red). Por eso lo primero
+// es una lista de conexiones guardadas, no un flag de encendido.
+//
+// El fichero lleva la contraseña en claro, igual que config\mysql_root.pass y
+// config\mysql_users.pass.json (mismo modelo de amenaza: el panel solo escucha en 127.0.0.1).
+// Va fuera de git, como el resto de config de cada maquina.
+function sqlsrv_file($root){ return $root.'/config/sqlsrv-servers.json'; }
+function sqlsrv_servers($root){
+    $f = sqlsrv_file($root);
+    if (!is_file($f)) return [];
+    $d = json_decode((string)@file_get_contents($f), true);
+    return is_array($d) ? $d : [];
+}
+function sqlsrv_save_servers($root, $list){
+    @mkdir(dirname(sqlsrv_file($root)), 0777, true);
+    @file_put_contents(sqlsrv_file($root), json_encode(array_values($list), JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
+}
+function sqlsrv_find($root, $id){
+    foreach (sqlsrv_servers($root) as $s) { if (($s['id'] ?? '') === $id) return $s; }
+    return null;
+}
+function valid_sqlsrv_id($n){ return (bool)preg_match('/^[a-f0-9]{12}$/', (string)$n); }
+// Nombre de base de datos / esquema / tabla de SQL Server. Se validan ADEMAS de citarlos con
+// corchetes (sqlsrv_qi): los identificadores no pueden ir como parametro preparado, asi que la
+// unica defensa real es esa doble barrera.
+function valid_sqlsrv_ident($n){ return (bool)preg_match('/^[A-Za-z_][A-Za-z0-9_$#@ .\-]{0,126}$/u', (string)$n); }
+// Cita un identificador: [nombre], escapando el ] duplicandolo (regla de T-SQL).
+function sqlsrv_qi($n){ return '['.str_replace(']', ']]', (string)$n).']'; }
+
+// Driver ODBC a usar. Se prueba por el registro (COM RegRead, sin lanzar subprocesos: ver la
+// trampa nº5 de CLAUDE.md sobre exec() bajo mod_fcgid) porque el nombre EXACTO varia segun lo
+// que haya instalado la maquina y un DSN con un driver inexistente falla con un error opaco.
+function sqlsrv_odbc_driver(){
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    $candidates = ['ODBC Driver 18 for SQL Server','ODBC Driver 17 for SQL Server','ODBC Driver 13 for SQL Server','SQL Server Native Client 11.0','SQL Server'];
+    if (class_exists('COM')) {
+        try {
+            $sh = new COM('WScript.Shell');
+            foreach ($candidates as $c) {
+                try {
+                    $v = $sh->RegRead('HKLM\\SOFTWARE\\ODBC\\ODBCINST.INI\\ODBC Drivers\\'.$c);
+                    if (trim((string)$v) !== '') { return $cached = $c; }
+                } catch (Throwable $e) { /* ese driver no esta: siguiente */ }
+            }
+        } catch (Throwable $e) { /* sin COM: nos quedamos con el fallback de abajo */ }
+    }
+    return $cached = 'ODBC Driver 17 for SQL Server';
+}
+function sqlsrv_driver_kind(){ return extension_loaded('pdo_sqlsrv') ? 'sqlsrv' : 'odbc'; }
+// Conexion a un servidor guardado. $db = null -> se conecta a la BD por defecto del login.
+// pdo_sqlsrv (driver nativo de Microsoft) se usa si algun dia se instala; si no, pdo_odbc, que
+// ya viene con PHP en Windows y solo hay que activar.
+function sqlsrv_pdo($srv, $db = null){
+    $host = (string)($srv['host'] ?? '127.0.0.1');
+    $port = (int)($srv['port'] ?? 1433) ?: 1433;
+    $user = (string)($srv['user'] ?? '');
+    $pass = (string)($srv['pass'] ?? '');
+    $trust = !empty($srv['trust']);
+    if ($db !== null && $db !== '' && !valid_sqlsrv_ident($db)) { throw new RuntimeException('Nombre de base de datos no válido.'); }
+    // MARS (varios conjuntos de resultados activos a la vez): sin esto, tener un cursor sin
+    // agotar bloquea la siguiente consulta en la MISMA conexion con "La conexion esta ocupada
+    // con los resultados de otro comando". Le pasa al explorador constantemente (contar filas y
+    // luego leerlas). Aun asi se cierran los cursores a mano, que es lo correcto igualmente.
+    if (sqlsrv_driver_kind() === 'sqlsrv') {
+        $dsn = 'sqlsrv:Server='.$host.','.$port.';LoginTimeout=8;MultipleActiveResultSets=true';
+        if ($db) $dsn .= ';Database='.$db;
+        if ($trust) $dsn .= ';TrustServerCertificate=1';
+    } else {
+        $dsn = 'odbc:Driver={'.sqlsrv_odbc_driver().'};Server='.$host.','.$port.';LoginTimeout=8;MARS_Connection=yes;';
+        if ($db) $dsn .= 'Database='.$db.';';
+        if ($trust) $dsn .= 'TrustServerCertificate=yes;';
+    }
+    return new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+}
+// [ok, mensaje]: se usa tanto en "Probar conexion" como al guardar una conexion nueva.
+function sqlsrv_test($srv){
+    try {
+        $pdo = sqlsrv_pdo($srv);
+        $v = (string)$pdo->query('SELECT @@VERSION')->fetchColumn();
+        $v = trim(explode("\n", $v)[0]);
+        return [true, $v];
+    } catch (Throwable $e) { return [false, $e->getMessage()]; }
+}
+// Bases de datos accesibles. HAS_DBACCESS filtra las que el login no puede abrir: sin esto
+// aparecian en la lista y luego reventaban al pinchar (tipico con logins de solo una BD).
+function sqlsrv_databases($pdo){
+    $sql = "SELECT name, CASE WHEN database_id <= 4 THEN 1 ELSE 0 END AS es_sistema
+            FROM sys.databases
+            WHERE state = 0 AND HAS_DBACCESS(name) = 1
+            ORDER BY CASE WHEN database_id <= 4 THEN 1 ELSE 0 END, name";
+    $out = [];
+    foreach ($pdo->query($sql) as $r) { $out[] = ['name'=>$r['name'], 'sys'=>(bool)$r['es_sistema']]; }
+    return $out;
+}
+// Tablas y vistas con su nº de filas APROXIMADO (sys.partitions, instantaneo). El recuento
+// exacto solo se hace al abrir una tabla concreta: un COUNT(*) por tabla en una BD con cientos
+// de tablas tardaria demasiado para pintar la barra lateral.
+function sqlsrv_tables($pdo){
+    $sql = "SELECT s.name AS sch, t.name AS tbl, 'table' AS kind,
+                   ISNULL(SUM(CASE WHEN p.index_id IN (0,1) THEN p.rows END), 0) AS nrows
+            FROM sys.tables t
+            JOIN sys.schemas s ON s.schema_id = t.schema_id
+            LEFT JOIN sys.partitions p ON p.object_id = t.object_id
+            GROUP BY s.name, t.name
+            UNION ALL
+            SELECT s.name, v.name, 'view', -1
+            FROM sys.views v JOIN sys.schemas s ON s.schema_id = v.schema_id
+            ORDER BY sch, tbl";
+    $out = [];
+    foreach ($pdo->query($sql) as $r) {
+        $out[] = ['schema'=>$r['sch'], 'name'=>$r['tbl'], 'kind'=>$r['kind'], 'rows'=>(int)$r['nrows']];
+    }
+    return $out;
+}
+function sqlsrv_columns($pdo, $schema, $table){
+    $sql = "SELECT c.name, ty.name AS tipo, c.max_length, c.precision, c.scale,
+                   c.is_nullable, c.is_identity, c.is_computed, dc.definition AS def
+            FROM sys.columns c
+            JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+            LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id
+            WHERE c.object_id = OBJECT_ID(?)
+            ORDER BY c.column_id";
+    $st = $pdo->prepare($sql);
+    $st->execute([$schema.'.'.$table]);
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $out[] = [
+            'name'      => $r['name'],
+            'type'      => $r['tipo'],
+            'len'       => (int)$r['max_length'],
+            'precision' => (int)$r['precision'],
+            'scale'     => (int)$r['scale'],
+            'nullable'  => (bool)$r['is_nullable'],
+            'identity'  => (bool)$r['is_identity'],
+            'computed'  => (bool)$r['is_computed'],
+            'default'   => $r['def'],
+        ];
+    }
+    return $out;
+}
+// Columnas de la clave primaria, en orden. Lista vacia = tabla SIN clave primaria: es lo que
+// decide si se puede editar fila a fila (sin PK no hay WHERE que identifique una sola fila).
+function sqlsrv_pk($pdo, $schema, $table){
+    $sql = "SELECT c.name
+            FROM sys.indexes i
+            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE i.is_primary_key = 1 AND i.object_id = OBJECT_ID(?)
+            ORDER BY ic.key_ordinal";
+    $st = $pdo->prepare($sql);
+    $st->execute([$schema.'.'.$table]);
+    return $st->fetchAll(PDO::FETCH_COLUMN);
+}
+function sqlsrv_indexes($pdo, $schema, $table){
+    $sql = "SELECT i.name, i.is_unique, i.is_primary_key, i.type_desc, c.name AS col, ic.is_descending_key AS desc_
+            FROM sys.indexes i
+            JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            WHERE i.object_id = OBJECT_ID(?) AND i.type > 0
+            ORDER BY i.name, ic.key_ordinal";
+    $st = $pdo->prepare($sql);
+    $st->execute([$schema.'.'.$table]);
+    $by = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $k = $r['name'];
+        if (!isset($by[$k])) $by[$k] = ['name'=>$k, 'unique'=>(bool)$r['is_unique'], 'pk'=>(bool)$r['is_primary_key'], 'type'=>$r['type_desc'], 'cols'=>[]];
+        $by[$k]['cols'][] = $r['col'].($r['desc_'] ? ' DESC' : '');
+    }
+    return array_values($by);
+}
+// Tipos cuyo valor NO es texto legible: se muestran como hex y no se editan a ciegas.
+function sqlsrv_is_binary_type($t){ return in_array(strtolower((string)$t), ['binary','varbinary','image','timestamp','rowversion'], true); }
+// ---- Texto y codificacion: el rodeo por hexadecimal ----
+// pdo_odbc convierte el texto al codepage ANSI de Windows (1252 aqui) EN AMBOS SENTIDOS, y lo
+// que no cabe en 1252 se pierde antes de que PHP lo vea (comprobado: 中 llega como '?', y al
+// enviar, 'ñ' llega al servidor como dos caracteres sueltos). Eso, en un editor de filas, es
+// corrupcion silenciosa de datos.
+//
+// Solucion sin depender de otro driver: mover el texto como BINARIO. El binario viaja en
+// hexadecimal ASCII puro, inmune a cualquier codepage, y se convierte UTF-16 <-> UTF-8 en PHP.
+// Verificado sin perdidas con acentos, €, chino, emoji (pares suplentes), saltos de linea,
+// comillas y textos de 40.000 caracteres.
+//
+// Si algun dia se instala pdo_sqlsrv (que maneja UTF-8 nativamente), sqlsrv_hex_text() pasa a
+// false y todo el rodeo se desactiva solo.
+function sqlsrv_hex_text(){ return sqlsrv_driver_kind() === 'odbc'; }
+function sqlsrv_is_text_type($t){
+    return in_array(strtolower((string)$t), ['char','nchar','varchar','nvarchar','text','ntext','xml','sysname'], true);
+}
+// Tipos que pdo_odbc no devuelve tal cual (un "SELECT doc" sobre xml devuelve NULL aunque haya
+// valor) y que tampoco admiten CAST directo: se piden con .ToString().
+function sqlsrv_needs_tostring($t){
+    return in_array(strtolower((string)$t), ['geography','geometry','hierarchyid'], true);
+}
+function sqlsrv_needs_cast($t){
+    return in_array(strtolower((string)$t), ['xml','sql_variant'], true) || sqlsrv_needs_tostring($t);
+}
+// hex(UTF-16LE) -> UTF-8. Conserva la diferencia entre NULL y cadena vacia.
+function sqlsrv_dec_text($v){
+    if ($v === null) return null;
+    if ($v === '')   return '';
+    $bin = @hex2bin($v);
+    if ($bin === false) return $v; // no venia en hex: se devuelve tal cual
+    return mb_convert_encoding($bin, 'UTF-8', 'UTF-16LE');
+}
+// UTF-8 -> hex(UTF-16LE), para mandarlo como parametro.
+function sqlsrv_enc_text($s){ return bin2hex(mb_convert_encoding((string)$s, 'UTF-16LE', 'UTF-8')); }
+// Marcador de parametro para escribir texto: el CAST a varchar es imprescindible, porque el
+// parametro llega como nvarchar y CONVERT(...,2) NO interpreta el hexadecimal sobre nvarchar
+// (se limita a reinterpretar sus bytes). Comprobado.
+function sqlsrv_text_placeholder(){ return 'CONVERT(nvarchar(max), CONVERT(varbinary(max), CAST(? AS varchar(max)), 2))'; }
+// ¿El valor de esta columna viaja hexadecimado? (y por tanto hay que decodificarlo al leer)
+function sqlsrv_col_is_hex($c){
+    if (sqlsrv_is_binary_type($c['type'])) return false;   // el binario ya viene en hex, se muestra tal cual
+    return sqlsrv_hex_text() && (sqlsrv_is_text_type($c['type']) || sqlsrv_needs_cast($c['type']));
+}
+// Expresion de una columna para la lista del SELECT, ya citada y con alias estable.
+function sqlsrv_select_expr($c){
+    $q = sqlsrv_qi($c['name']);
+    $txt = sqlsrv_needs_tostring($c['type']) ? $q.'.ToString()' : 'CONVERT(nvarchar(max), '.$q.')';
+    if (sqlsrv_col_is_hex($c)) { return 'CONVERT(varbinary(max), '.$txt.') AS '.$q; }
+    if (sqlsrv_needs_cast($c['type'])) { return $txt.' AS '.$q; }
+    return $q;
+}
+function sqlsrv_select_list($cols){
+    if (!$cols) return '*';
+    return implode(', ', array_map('sqlsrv_select_expr', $cols));
+}
+// Decodifica in situ las columnas hexadecimadas de un lote de filas (FETCH_NUM).
+function sqlsrv_decode_rows(&$rows, $cols){
+    $hex = [];
+    foreach ($cols as $i => $c) { if (sqlsrv_col_is_hex($c)) $hex[] = $i; }
+    if (!$hex) return;
+    foreach ($rows as &$r) { foreach ($hex as $i) { if (isset($r[$i]) || $r[$i] === null) $r[$i] = sqlsrv_dec_text($r[$i]); } }
+    unset($r);
+}
+// Etiqueta de tipo tal y como la escribirias en un CREATE TABLE (nvarchar(120), decimal(12,2)...).
+function sqlsrv_type_label($c){
+    $t = strtolower($c['type']);
+    if (in_array($t, ['nvarchar','nchar'], true))            { $n = $c['len'] < 0 ? 'MAX' : (int)($c['len']/2); return $t.'('.$n.')'; }
+    if (in_array($t, ['varchar','char','varbinary','binary'], true)) { $n = $c['len'] < 0 ? 'MAX' : $c['len']; return $t.'('.$n.')'; }
+    if (in_array($t, ['decimal','numeric'], true))           { return $t.'('.$c['precision'].','.$c['scale'].')'; }
+    if (in_array($t, ['datetime2','time','datetimeoffset'], true) && $c['scale'] !== 7) { return $t.'('.$c['scale'].')'; }
+    return $t;
 }
 
 // ---------------- Terminal (sin PTY: ejecuta comandos, streamea su salida) ----------------
@@ -902,6 +1225,49 @@ function cover_mime($f){
 // fuera de git) y se sirve via ?brandlogo. Si no hay logo propio, se usa el de marca por
 // defecto (assets\logo.svg). Reutiliza cover_exts()/cover_mime() para validar/servir.
 function brand_name($cfg){ $n = trim((string)($cfg['brand']['name'] ?? '')); return $n!=='' ? $n : 'lua-server'; }
+
+// ---------------- Actualizaciones de la plataforma (repo de git) ----------------
+// El panel NO consulta el remoto: el remoto es SSH y Apache corre como SYSTEM, sin las claves
+// del usuario. Quien hace el 'git fetch' es el watcher (ver Update-Check en lua.ps1) y deja el
+// resultado aqui; el panel se limita a leerlo y a pedir acciones por archivo-senal.
+function update_status($root){
+    $f = $root.'/tmp/update-status.json';
+    if (!is_file($f)) return null;
+    $d = json_decode((string)@file_get_contents($f), true);
+    return is_array($d) ? $d : null;
+}
+function update_config($root){
+    $f = $root.'/config/update.json';
+    $def = ['auto'=>false, 'cada_horas'=>6];
+    if (!is_file($f)) return $def;
+    $d = json_decode((string)@file_get_contents($f), true);
+    if (!is_array($d)) return $def;
+    return ['auto'=>!empty($d['auto']), 'cada_horas'=>max(1, (int)($d['cada_horas'] ?? 6))];
+}
+// Version a mostrar. Se prefiere la que dejo el watcher; si aun no ha corrido, se deduce
+// leyendo .git a mano (sin lanzar git: es una lectura de dos archivos, y asi la cabecera no
+// depende de un subproceso en cada carga de pagina).
+function lua_version($root){
+    $st = update_status($root);
+    if ($st && !empty($st['version'])) return (string)$st['version'];
+    $head = @file_get_contents($root.'/.git/HEAD');
+    if ($head === false) return '';
+    $head = trim($head);
+    if (strpos($head, 'ref: ') === 0) {
+        $ref = substr($head, 5);
+        $sha = @file_get_contents($root.'/.git/'.$ref);
+        if ($sha === false) {
+            // Referencia empaquetada (git gc): se busca en packed-refs.
+            foreach (@file($root.'/.git/packed-refs', FILE_IGNORE_NEW_LINES) ?: [] as $l) {
+                if (substr($l, 0, 1) === '#') continue;
+                $p = explode(' ', $l, 2);
+                if (count($p) === 2 && trim($p[1]) === $ref) { $sha = $p[0]; break; }
+            }
+        }
+        return $sha ? substr(trim($sha), 0, 7) : '';
+    }
+    return substr($head, 0, 7);
+}
 function brand_logo_path($root){
     foreach (cover_exts() as $e) { $f=$root.'/data/brand/logo.'.$e; if (is_file($f)) return $f; }
     return null;
@@ -1009,6 +1375,33 @@ function job_log_tail($root,$id,$n=16){
     $lines=@file($f,FILE_IGNORE_NEW_LINES); if(!$lines) return '';
     return implode("\n", array_slice($lines,-$n));
 }
+// Tarjeta de progreso reutilizada por los jobs de import (carpeta de dumps y archivo .sql
+// unico): barra real si el job reporta 'pct' (ambos lo hacen mientras corre), log al final.
+function render_import_job_card($root, $j){
+    $st = $j['state'] ?? '?';
+    $cls = ['done'=>'ok','error'=>'err','running'=>'run','queued'=>'warn'];
+    $c = $cls[$st] ?? 'run';
+    $tail = in_array($st, ['running','error','queued'], true) ? job_log_tail($root, $j['id'] ?? '') : '';
+    $pct = isset($j['pct']) ? max(0, min(100, (int)$j['pct'])) : null;
+    ob_start(); ?>
+    <div class="card" style="padding:12px 16px;margin-top:12px">
+      <div class="row">
+        <span class="jstate <?= $c ?>"><?= e(strtoupper($st)) ?></span>
+        <span style="font-weight:700"><?= e($j['dbname'] ?? $j['name'] ?? '') ?></span>
+        <span class="muted"><?= isset($j['time']) ? e($j['time']) : '' ?></span>
+        <div class="spacer"></div>
+        <span class="muted"><?= e($j['msg'] ?? '') ?></span>
+      </div>
+      <?php if ($pct !== null && in_array($st, ['running','queued'], true)): ?>
+        <div class="progressbar"><div class="progressbar-fill" style="width:<?= $pct ?>%"></div></div>
+        <span class="progresspct"><?= $pct ?>%</span>
+      <?php elseif ($st === 'error' && $pct !== null): ?>
+        <div class="progressbar"><div class="progressbar-fill err" style="width:<?= $pct ?>%"></div></div>
+      <?php endif; ?>
+      <?php if ($tail): ?><pre class="joblog"><?= e($tail) ?></pre><?php endif; ?>
+    </div>
+    <?php return ob_get_clean();
+}
 // El watcher es un proceso PowerShell independiente (arrancado por 'lua.ps1 start'),
 // no un hijo de Apache: se comprueba igual que hace lua.ps1 (pid en tmp/watch.pid + tasklist).
 function watcher_alive($root){
@@ -1106,6 +1499,33 @@ if (isset($_GET['export_pg'])) {
     exit;
 }
 
+// ---------------- AJAX: dialogo nativo "Elegir carpeta" (via el watcher, ver mas abajo) ----------------
+// El panel corre bajo el servicio de Apache (sesion 0, sin escritorio): no puede mostrar un
+// FolderBrowserDialog el mismo. En vez de eso deja una peticion en tmp/pickfolder/ y el watcher
+// (que si corre en la sesion interactiva del usuario) la recoge, muestra el dialogo nativo y
+// escribe el resultado; este endpoint solo hace polling sobre ese resultado.
+if (($_GET['ajax'] ?? '') === 'pickfolder_start') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!watcher_alive($ROOT)) { echo json_encode(['error'=>'El watcher no está activo: no se puede abrir el selector de carpetas.']); exit; }
+    $pfDir = $ROOT.'/tmp/pickfolder';
+    @mkdir($pfDir, 0777, true);
+    $pfId = bin2hex(random_bytes(8));
+    file_put_contents($pfDir.'/'.$pfId.'.req', '');
+    echo json_encode(['id'=>$pfId]);
+    exit;
+}
+if (($_GET['ajax'] ?? '') === 'pickfolder_poll') {
+    header('Content-Type: application/json; charset=utf-8');
+    $pfId = (string)($_GET['id'] ?? '');
+    if (!preg_match('/^[a-f0-9]{16}$/', $pfId)) { echo json_encode(['status'=>'error','msg'=>'id no válido']); exit; }
+    $pfRes = $ROOT.'/tmp/pickfolder/'.$pfId.'.res';
+    if (!is_file($pfRes)) { echo json_encode(['status'=>'pending']); exit; }
+    $pfData = json_decode((string)@file_get_contents($pfRes), true);
+    @unlink($pfRes);
+    echo json_encode($pfData ?: ['status'=>'error','msg'=>'respuesta ilegible']);
+    exit;
+}
+
 // ---------------- AJAX: un nivel del arbol de archivos de un proyecto (carga perezosa) ----------------
 if (($_GET['ajax'] ?? '') === 'tree') {
     header('Content-Type: application/json; charset=utf-8');
@@ -1194,6 +1614,261 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_
     exit;
 }
 
+// ---------------- Endpoints AJAX del explorador de SQL Server (JSON, no PRG) ----------------
+// El explorador es demasiado interactivo para el patron PRG del resto del panel (cambiar de
+// tabla, paginar, ordenar) -> se sirve por AJAX. Todo identificador se valida Y se cita con
+// corchetes; todo valor viaja como parametro preparado.
+if (($_REQUEST['ajax'] ?? '') === 'sqlsrv') {
+    header('Content-Type: application/json; charset=utf-8');
+    $sreply = function($o){ echo json_encode($o, JSON_INVALID_UTF8_SUBSTITUTE|JSON_UNESCAPED_UNICODE); exit; };
+    $op = (string)($_REQUEST['op'] ?? '');
+
+    $srv = valid_sqlsrv_id((string)($_REQUEST['conn'] ?? '')) ? sqlsrv_find($ROOT, $_REQUEST['conn']) : null;
+    if (!$srv) { $sreply(['error'=>'Conexión no válida o ya eliminada.']); }
+
+    $db     = (string)($_REQUEST['db'] ?? '');
+    $schema = (string)($_REQUEST['schema'] ?? '');
+    $table  = (string)($_REQUEST['table'] ?? '');
+    if ($db !== '' && !valid_sqlsrv_ident($db))         { $sreply(['error'=>'Base de datos no válida.']); }
+    if ($schema !== '' && !valid_sqlsrv_ident($schema)) { $sreply(['error'=>'Esquema no válido.']); }
+    if ($table !== '' && !valid_sqlsrv_ident($table))   { $sreply(['error'=>'Tabla no válida.']); }
+
+    try {
+        $pdo = sqlsrv_pdo($srv, $db !== '' ? $db : null);
+
+        if ($op === 'dbs') {
+            $sreply(['dbs' => sqlsrv_databases($pdo)]);
+        }
+
+        if ($op === 'tables') {
+            $sreply(['tables' => sqlsrv_tables($pdo)]);
+        }
+
+        if ($op === 'struct') {
+            $cols = sqlsrv_columns($pdo, $schema, $table);
+            if (!$cols) { $sreply(['error'=>'La tabla no existe o no es accesible.']); }
+            $out = [];
+            foreach ($cols as $c) {
+                $out[] = [
+                    'name'=>$c['name'], 'type'=>sqlsrv_type_label($c), 'nullable'=>$c['nullable'],
+                    'identity'=>$c['identity'], 'computed'=>$c['computed'], 'default'=>$c['default'],
+                ];
+            }
+            $sreply(['cols'=>$out, 'pk'=>sqlsrv_pk($pdo, $schema, $table), 'indexes'=>sqlsrv_indexes($pdo, $schema, $table)]);
+        }
+
+        if ($op === 'rows') {
+            $kind = (string)($_REQUEST['kind'] ?? 'table');
+            $cols = sqlsrv_columns($pdo, $schema, $table);
+            if (!$cols) { $sreply(['error'=>'La tabla no existe o no es accesible.']); }
+            $pk   = sqlsrv_pk($pdo, $schema, $table);
+            $names = array_column($cols, 'name');
+
+            $per  = max(10, min(500, (int)($_REQUEST['per'] ?? 50)));
+            $page = max(1, (int)($_REQUEST['page'] ?? 1));
+            $sort = (string)($_REQUEST['sort'] ?? '');
+            $dir  = strtolower((string)($_REQUEST['dir'] ?? 'asc')) === 'desc' ? 'DESC' : 'ASC';
+            // OFFSET/FETCH exige ORDER BY. Si no se pide orden concreto se usa la clave primaria
+            // y, a falta de ella, la primera columna: cualquier cosa menos un orden indefinido,
+            // que haria que paginar devolviese filas repetidas o saltadas.
+            if ($sort === '' || !in_array($sort, $names, true)) { $sort = $pk ? $pk[0] : $names[0]; }
+            $orderBy = sqlsrv_qi($sort).' '.$dir;
+
+            $obj = sqlsrv_qi($schema).'.'.sqlsrv_qi($table);
+            // Recuento exacto solo si la estimacion no es enorme: un COUNT(*) sobre decenas de
+            // millones de filas bloquearia la peticion. Por encima del umbral se usa la
+            // estimacion de sys.partitions y se marca como aproximada.
+            // closeCursor() tras cada lectura parcial: fetchColumn() deja el cursor abierto y el
+            // siguiente execute() sobre la misma conexion fallaria (ver MARS en sqlsrv_pdo).
+            $est = 0;
+            if ($kind !== 'view') {
+                $stE = $pdo->prepare("SELECT ISNULL(SUM(CASE WHEN index_id IN (0,1) THEN rows END),0) FROM sys.partitions WHERE object_id = OBJECT_ID(?)");
+                $stE->execute([$schema.'.'.$table]);
+                $est = (int)$stE->fetchColumn();
+                $stE->closeCursor();
+            }
+            $aprox = ($est > 2000000);
+            if ($aprox) { $total = $est; }
+            else {
+                $stC = $pdo->query('SELECT COUNT(*) FROM '.$obj);
+                $total = (int)$stC->fetchColumn();
+                $stC->closeCursor();
+            }
+
+            $off = ($page - 1) * $per;
+            $sql = 'SELECT '.sqlsrv_select_list($cols).' FROM '.$obj.' ORDER BY '.$orderBy.
+                   ' OFFSET '.(int)$off.' ROWS FETCH NEXT '.(int)$per.' ROWS ONLY';
+            $rows = $pdo->query($sql)->fetchAll(PDO::FETCH_NUM);
+            sqlsrv_decode_rows($rows, $cols);
+
+            $meta = [];
+            foreach ($cols as $c) {
+                $meta[] = ['name'=>$c['name'], 'type'=>sqlsrv_type_label($c), 'bin'=>sqlsrv_is_binary_type($c['type']),
+                           'nullable'=>$c['nullable'], 'identity'=>$c['identity'], 'computed'=>$c['computed']];
+            }
+            // Sin PK no hay forma segura de identificar UNA fila -> edicion desactivada (no se
+            // inventa un WHERE por todas las columnas, que borraria duplicados sin avisar).
+            $editable = ($kind !== 'view') && !empty($pk);
+            $motivo = $kind === 'view' ? 'Es una vista: solo lectura.'
+                    : (empty($pk) ? 'La tabla no tiene clave primaria: no se puede identificar una fila concreta, así que la edición está desactivada.' : '');
+            $sreply(['cols'=>$meta, 'rows'=>$rows, 'total'=>$total, 'aprox'=>$aprox, 'page'=>$page, 'per'=>$per,
+                     'sort'=>$sort, 'dir'=>strtolower($dir), 'pk'=>$pk, 'editable'=>$editable, 'motivo'=>$motivo]);
+        }
+
+        // ---- Consola SQL: ejecuta lo que se escriba, tal cual ----
+        if ($op === 'query') {
+            $sql = (string)($_POST['sql'] ?? '');
+            if (trim($sql) === '') { $sreply(['error'=>'Consulta vacía.']); }
+            $t0 = microtime(true);
+            // Si la consulta lleva algo fuera de ASCII (p.ej. WHERE nombre = 'Peña'), enviarla
+            // tal cual la corromperia por el mismo motivo que los datos. Se manda hexadecimada
+            // via sp_executesql. Las consultas ASCII (la mayoria) van directas, sin cambiar su
+            // ambito de ejecucion.
+            if (sqlsrv_hex_text() && preg_match('/[^\x00-\x7F]/', $sql)) {
+                $st = $pdo->prepare('DECLARE @q nvarchar(max) = '.sqlsrv_text_placeholder().'; EXEC sp_executesql @q;');
+                $st->execute([sqlsrv_enc_text($sql)]);
+            } else {
+                $st = $pdo->query($sql);
+            }
+            $sets = []; $afect = 0;
+            // Un batch puede devolver varios conjuntos de resultados (y sentencias sin
+            // resultados en medio): se recorren todos con nextRowset.
+            do {
+                try {
+                    if ($st->columnCount() > 0) {
+                        $rows = $st->fetchAll(PDO::FETCH_NUM);
+                        $cols = [];
+                        for ($i = 0; $i < $st->columnCount(); $i++) {
+                            $m = @$st->getColumnMeta($i);
+                            $cols[] = ($m && !empty($m['name'])) ? $m['name'] : ('col'.($i+1));
+                        }
+                        $rows = array_slice($rows, 0, 1000);
+                        // A diferencia del explorador (que pide el texto hexadecimado columna a
+                        // columna porque conoce sus tipos), aqui la consulta es libre y su
+                        // resultado llega ya convertido al codepage ANSI por el driver. Se
+                        // recupera lo que sea Windows-1252; lo que el driver ya haya perdido no
+                        // se puede rescatar, y por eso la UI lo advierte.
+                        if (sqlsrv_hex_text()) {
+                            foreach ($rows as &$fr) {
+                                foreach ($fr as &$cv) {
+                                    if (is_string($cv) && !mb_check_encoding($cv, 'UTF-8')) { $cv = mb_convert_encoding($cv, 'UTF-8', 'Windows-1252'); }
+                                }
+                                unset($cv);
+                            }
+                            unset($fr);
+                        }
+                        $sets[] = ['cols'=>$cols, 'rows'=>$rows, 'truncado'=>count($rows) >= 1000];
+                    } else {
+                        $afect += $st->rowCount();
+                    }
+                } catch (Throwable $e) { /* conjunto sin resultados utilizables: se ignora */ }
+            } while ($st->nextRowset());
+            $sreply(['sets'=>$sets, 'afectadas'=>$afect, 'ms'=>(int)round((microtime(true)-$t0)*1000)]);
+        }
+
+        // ---- Edicion de filas ----
+        // La fila a tocar SIEMPRE se localiza por su clave primaria; los valores de la PK
+        // llegan tal y como se leyeron (clave 'pk' del POST). Nunca se genera un WHERE por
+        // el resto de columnas.
+        if ($op === 'row_save' || $op === 'row_del') {
+            $cols = sqlsrv_columns($pdo, $schema, $table);
+            if (!$cols) { $sreply(['error'=>'La tabla no existe o no es accesible.']); }
+            $pk = sqlsrv_pk($pdo, $schema, $table);
+            $byName = []; foreach ($cols as $c) { $byName[$c['name']] = $c; }
+            $obj = sqlsrv_qi($schema).'.'.sqlsrv_qi($table);
+            $modo = (string)($_POST['modo'] ?? 'update'); // update | insert
+
+            if ($modo !== 'insert' && empty($pk)) {
+                $sreply(['error'=>'Esta tabla no tiene clave primaria: no se puede editar ni borrar una fila concreta desde aquí.']);
+            }
+
+            // WHERE de la clave primaria, con sus valores como parametros.
+            $where = ''; $wargs = [];
+            if ($modo !== 'insert') {
+                $pkVals = json_decode((string)($_POST['pk'] ?? '{}'), true);
+                if (!is_array($pkVals)) { $sreply(['error'=>'Clave primaria no recibida.']); }
+                $partes = [];
+                foreach ($pk as $k) {
+                    if (!array_key_exists($k, $pkVals)) { $sreply(['error'=>'Falta el valor de la clave "'.$k.'".']); }
+                    $v = $pkVals[$k];
+                    $tipo = $byName[$k]['type'] ?? '';
+                    if ($v === null) { $partes[] = sqlsrv_qi($k).' IS NULL'; }
+                    // Un varbinary en la PK llega en hex: hay que reconvertirlo para comparar.
+                    elseif (sqlsrv_is_binary_type($tipo)) { $partes[] = sqlsrv_qi($k).' = CONVERT(varbinary(max), CAST(? AS varchar(max)), 2)'; $wargs[] = $v; }
+                    // Una PK de texto tambien va hexadecimada: si se enviara tal cual, un valor
+                    // con acentos no encontraria su fila (o peor, encontraria otra).
+                    elseif (sqlsrv_hex_text() && sqlsrv_is_text_type($tipo)) { $partes[] = sqlsrv_qi($k).' = '.sqlsrv_text_placeholder(); $wargs[] = sqlsrv_enc_text($v); }
+                    else { $partes[] = sqlsrv_qi($k).' = ?'; $wargs[] = $v; }
+                }
+                $where = ' WHERE '.implode(' AND ', $partes);
+            }
+
+            if ($op === 'row_del') {
+                $st = $pdo->prepare('DELETE FROM '.$obj.$where);
+                $st->execute($wargs);
+                $n = $st->rowCount();
+                if ($n === 0) { $sreply(['error'=>'No se borró ninguna fila: puede que ya no exista (¿la cambió otra sesión?).']); }
+                if ($n > 1)   { $sreply(['ok'=>true, 'aviso'=>'Se borraron '.$n.' filas (la clave primaria no era única).']); }
+                $sreply(['ok'=>true, 'n'=>$n]);
+            }
+
+            // row_save: 'vals' trae solo las columnas editadas; 'nulls' cuales van a NULL
+            // (imprescindible para poder distinguir NULL de cadena vacia).
+            $vals  = json_decode((string)($_POST['vals'] ?? '{}'), true);
+            $nulls = json_decode((string)($_POST['nulls'] ?? '[]'), true);
+            if (!is_array($vals))  { $vals = []; }
+            if (!is_array($nulls)) { $nulls = []; }
+
+            $sets = []; $args = []; $insCols = []; $insPh = [];
+            foreach ($cols as $c) {
+                $n = $c['name'];
+                // IDENTITY y calculadas las pone el servidor: nunca se escriben.
+                if ($c['identity'] || $c['computed']) continue;
+                $esNull = in_array($n, $nulls, true);
+                if (!$esNull && !array_key_exists($n, $vals)) continue;
+                $ph = '?';
+                $v  = $esNull ? null : (string)$vals[$n];
+                if (!$esNull && sqlsrv_is_binary_type($c['type'])) {
+                    // El explorador muestra los binarios en hex; se reconvierten al guardar.
+                    $v = preg_replace('/^0x/i', '', trim($v));
+                    if ($v !== '' && !preg_match('/^[0-9a-fA-F]*$/', $v)) { $sreply(['error'=>'La columna "'.$n.'" es binaria: usa hexadecimal (p. ej. 0xDEADBEEF).']); }
+                    $ph = 'CONVERT(varbinary(max), CAST(? AS varchar(max)), 2)';
+                } elseif (!$esNull && sqlsrv_hex_text() && sqlsrv_is_text_type($c['type'])) {
+                    // Texto hexadecimado: sin esto, guardar "Peña" dejaria "PeÃ±a" en la tabla.
+                    $ph = sqlsrv_text_placeholder();
+                    $v  = sqlsrv_enc_text($v);
+                }
+                if ($esNull && !$c['nullable']) { $sreply(['error'=>'La columna "'.$n.'" no admite NULL.']); }
+                $sets[] = sqlsrv_qi($n).' = '.$ph;
+                $insCols[] = sqlsrv_qi($n); $insPh[] = $ph;
+                $args[] = $v;
+            }
+            if (!$sets) { $sreply(['error'=>'No hay ningún campo que guardar.']); }
+
+            if ($modo === 'insert') {
+                // OUTPUT INSERTED: pdo_odbc no soporta lastInsertId() (lanza excepcion) y
+                // SCOPE_IDENTITY() en una consulta aparte vuelve vacia (otro ambito).
+                $out = $pk ? ' OUTPUT '.implode(', ', array_map(function($k){ return 'INSERTED.'.sqlsrv_qi($k); }, $pk)) : '';
+                $sqlIns = 'INSERT INTO '.$obj.' ('.implode(', ', $insCols).')'.$out.' VALUES ('.implode(', ', $insPh).')';
+                $st = $pdo->prepare($sqlIns);
+                $st->execute($args);
+                $nuevo = $out ? $st->fetch(PDO::FETCH_ASSOC) : null;
+                $sreply(['ok'=>true, 'nuevo'=>$nuevo ?: null]);
+            }
+
+            $st = $pdo->prepare('UPDATE '.$obj.' SET '.implode(', ', $sets).$where);
+            $st->execute(array_merge($args, $wargs));
+            $n = $st->rowCount();
+            if ($n > 1) { $sreply(['ok'=>true, 'aviso'=>'Se actualizaron '.$n.' filas (la clave primaria no era única).']); }
+            $sreply(['ok'=>true, 'n'=>$n]);
+        }
+
+        $sreply(['error'=>'Operación no reconocida.']);
+    } catch (Throwable $e) {
+        $sreply(['error'=>$e->getMessage()]);
+    }
+}
+
 // ---------------- Endpoints AJAX de la terminal (devuelven JSON, no PRG) ----------------
 $__ta = $_REQUEST['action'] ?? '';
 if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop' || $__ta==='docker_term_run') {
@@ -1242,7 +1917,16 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop' || $__ta===
         // (que puede no existir o estar roto, como en esta misma maquina).
         $pathParts = [];
         $reqPhp = (string)($_POST['php'] ?? '');
-        if (preg_match('/^\d\.\d$/', $reqPhp) && is_dir($PHP_BASE.'/'.$reqPhp)) { $pathParts[] = term_win($PHP_BASE.'/'.$reqPhp); }
+        if (preg_match('/^\d\.\d$/', $reqPhp) && is_dir($PHP_BASE.'/'.$reqPhp)) {
+            $pathParts[] = term_win($PHP_BASE.'/'.$reqPhp);
+            // El propio worker de Apache que atiende este request (panel = PHP 8.4, ver
+            // FcgidInitialEnv PHPRC en httpd-lua.conf) hereda su PHPRC al proceso hijo que
+            // lanza WScript.Shell.Exec -- y PHPRC GANA a "misma carpeta que el .exe" en la
+            // busqueda de php.ini. Sin este set, "php"/composer del proyecto encontraban el
+            // .exe correcto por PATH pero leian igualmente el php.ini/extensiones del PANEL
+            // (8.4), no las de la version del proyecto, aunque el runner pidiera otra.
+            $wr .= "set \"PHPRC=".term_win($PHP_BASE.'/'.$reqPhp)."\"\r\n";
+        }
         $freshPath = term_fresh_machine_path();
         if ($freshPath) { $pathParts[] = $freshPath; }
         if ($pathParts) { $wr .= "set \"PATH=".implode(';', $pathParts).";%PATH%\"\r\n"; }
@@ -2123,26 +2807,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             catch (Throwable $e) { $msg='error:No se pudo eliminar: '.$e->getMessage(); }
         }
     }
+    // Import de un .sql subido (boton "Importar" de una BD). Se hace como job en segundo plano
+    // (igual que db_import_dir, ver mas abajo) en vez de bloquear este worker de Apache con
+    // proc_open+stream_get_contents: un .sql grande podia superar max_execution_time, y de
+    // paso permite reportar progreso real (% de bytes) en vez de solo "correcto"/"fallo" al final.
     elseif ($action === 'db_import') {
         $tab = 'bd';
         $db = $_POST['dbname'] ?? '';
-        $mysqlExe = $ROOT.'/bin/mariadb/bin/mariadb.exe';
         if (!valid_dbname($db)) { $msg='error:Nombre de base de datos no válido.'; }
         elseif (empty($_FILES['sqlfile']) || ($_FILES['sqlfile']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) { $msg='error:No se recibió el archivo .sql.'; }
-        elseif (!is_file($mysqlExe)) { $msg='error:MariaDB no está instalado.'; }
         else {
-            $rootPass = mysql_root_pass($ROOT);
-            $passArg = $rootPass !== '' ? ' --password='.escapeshellarg($rootPass) : '';
-            $cmd = '"'.$mysqlExe.'" --host=127.0.0.1 --port=3306 --user=root'.$passArg.' '.escapeshellarg($db);
-            $descriptors = [0=>['file',$_FILES['sqlfile']['tmp_name'],'r'], 1=>['pipe','w'], 2=>['pipe','w']];
-            $proc = @proc_open($cmd, $descriptors, $pipes);
-            if (!is_resource($proc)) { $msg='error:No se pudo ejecutar mariadb.exe.'; }
+            $id = 'dbimportfile-'.time();
+            @mkdir($ROOT.'/tmp/imports', 0777, true);
+            $dest = $ROOT.'/tmp/imports/'.$id.'.sql';
+            if (!move_uploaded_file($_FILES['sqlfile']['tmp_name'], $dest)) { $msg='error:No se pudo guardar el archivo subido.'; }
             else {
-                $out = stream_get_contents($pipes[1]); fclose($pipes[1]);
-                $err = stream_get_contents($pipes[2]); fclose($pipes[2]);
-                $code = proc_close($proc);
-                if ($code === 0) { $msg='info:Importado en "'.$db.'" correctamente.'; }
-                else { $msg='error:Fallo al importar: '.trim($err ?: $out ?: 'código '.$code); }
+                $job = ['id'=>$id,'type'=>'db_import_file','name'=>$db,'dbname'=>$db,'file'=>str_replace('\\','/',$dest)];
+                @mkdir($ROOT.'/tmp/jobs', 0777, true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $msg='job:Importando archivo en "'.$db.'"… mira el progreso abajo.';
+            }
+        }
+    }
+    // Importa una carpeta con un .sql por tabla (p.ej. mysqldump --tab o un export similar,
+    // sin un unico dump completo) en una BD ya existente. Se hace como job en segundo plano
+    // (lo ejecuta el watcher, no este propio worker de Apache): puede tratarse de decenas de
+    // archivos y cientos de MB en total, muy por encima de max_execution_time/post_max_size.
+    elseif ($action === 'db_import_dir') {
+        $tab = 'bd';
+        $db  = trim($_POST['dbname'] ?? '');
+        $dir = rtrim(str_replace('\\','/', trim($_POST['dir'] ?? '')), '/');
+        if (!valid_dbname($db)) { $msg='error:Nombre de base de datos no válido.'; }
+        elseif (!in_array($db, mysql_databases() ?: [], true)) { $msg='error:Esa base de datos no existe todavía -- créala primero arriba.'; }
+        elseif ($dir === '' || !is_dir($dir)) { $msg='error:Esa carpeta no existe en este servidor.'; }
+        else {
+            $sqlFiles = glob($dir.'/*.sql');
+            if (!$sqlFiles) { $msg='error:No hay archivos .sql en esa carpeta.'; }
+            else {
+                $id = 'dbimport-'.time();
+                $job = ['id'=>$id,'type'=>'db_import_dir','name'=>$db,'dbname'=>$db,'dir'=>$dir];
+                @mkdir($ROOT.'/tmp/jobs', 0777, true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $msg='job:Importando '.count($sqlFiles).' archivos .sql en "'.$db.'"… mira el progreso abajo.';
             }
         }
     }
@@ -2153,7 +2859,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             mysql_pdo()->exec("ALTER USER CURRENT_USER() IDENTIFIED BY ".mysql_pdo()->quote($new));
             if ($new === '') { @unlink($ROOT.'/config/mysql_root.pass'); }
             else { @file_put_contents($ROOT.'/config/mysql_root.pass', $new); }
-            pma_sync_root_pass($ROOT, $new); // que phpMyAdmin siga entrando tras el cambio
+            pma_sync_servers($ROOT); // que phpMyAdmin siga entrando tras el cambio
             $msg = $new===''? 'applied:Contraseña de root eliminada.' : 'applied:Contraseña de root actualizada.';
         } catch (Throwable $e) { $msg='error:No se pudo cambiar la contraseña: '.$e->getMessage(); }
     }
@@ -2175,7 +2881,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $target = $scope==='db' ? ('`'.$db.'`.*') : '*.*';
                 $pdo->exec("GRANT ALL PRIVILEGES ON ".$target." TO '".$u."'@'".$h."'");
                 $pdo->exec('FLUSH PRIVILEGES');
-                $msg='applied:Usuario "'.$u.'@'.$h.'" creado.';
+                // Se guarda para poder ofrecer esta cuenta en el desplegable de conexiones de
+                // phpMyAdmin (pma_sync_servers) sin volver a teclear la contraseña.
+                mysql_user_save_password($ROOT, $u, $h, $p);
+                pma_sync_servers($ROOT);
+                $msg='applied:Usuario "'.$u.'@'.$h.'" creado, con acceso a '.($scope==='db'?('"'.$db.'"'):'todas las bases de datos').'.';
+                // GRANT sobre una BD que aun no existe no da error en MariaDB (el permiso queda
+                // guardado y se aplica solo en cuanto la BD se crea) -- se avisa para que no
+                // parezca que la asociacion "no ha hecho nada" si el nombre estaba mal escrito.
+                if ($scope === 'db' && !in_array($db, mysql_databases() ?: [], true)) {
+                    $msg .= ' Aviso: la base de datos "'.$db.'" todavía no existe -- el acceso se activará en cuanto la crees (revisa que el nombre esté bien escrito).';
+                }
             } catch (Throwable $e) { $msg='error:No se pudo crear el usuario: '.$e->getMessage(); }
         }
     }
@@ -2185,7 +2901,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $h = $_POST['host'] ?? '';
         if (!valid_mysql_user($u) || !valid_mysql_host($h)) { $msg='error:Usuario u host no válido.'; }
         else {
-            try { mysql_pdo()->exec("DROP USER '".$u."'@'".$h."'"); $msg='applied:Usuario "'.$u.'@'.$h.'" eliminado.'; }
+            try {
+                mysql_pdo()->exec("DROP USER '".$u."'@'".$h."'");
+                mysql_user_forget_password($ROOT, $u, $h);
+                pma_sync_servers($ROOT);
+                $msg='applied:Usuario "'.$u.'@'.$h.'" eliminado.';
+            }
             catch (Throwable $e) { $msg='error:No se pudo eliminar: '.$e->getMessage(); }
         }
     }
@@ -2269,6 +2990,91 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             catch (Throwable $e) { $msg='error:No se pudo eliminar (¿es dueño de objetos?): '.$e->getMessage(); }
         }
     }
+    // ---- SQL Server: alta/baja de conexiones guardadas (pestana SQL Server) ----
+    elseif ($action === 'sqlsrv_save') {
+        $tab='sqlsrv';
+        $id    = trim($_POST['id'] ?? '');
+        $label = trim($_POST['label'] ?? '');
+        $host  = trim($_POST['host'] ?? '');
+        $port  = (int)($_POST['port'] ?? 1433);
+        $user  = trim($_POST['user'] ?? '');
+        $pass  = (string)($_POST['pass'] ?? '');
+        $trust = ($_POST['trust'] ?? '') === '1';
+        $editing = $id !== '' && valid_sqlsrv_id($id) && sqlsrv_find($ROOT, $id) !== null;
+        if ($host === '')                       { $msg='error:Indica el host o la IP del servidor.'; }
+        elseif ($port < 1 || $port > 65535)     { $msg='error:Puerto no válido.'; }
+        elseif ($user === '')                   { $msg='error:Indica el usuario.'; }
+        else {
+            $list = sqlsrv_servers($ROOT);
+            // Al editar sin tocar el campo de contraseña se conserva la que ya habia: el
+            // formulario nunca reenvia la contraseña guardada al navegador.
+            if ($editing && $pass === '') {
+                $prev = sqlsrv_find($ROOT, $id);
+                $pass = (string)($prev['pass'] ?? '');
+            }
+            $entry = [
+                'id'    => $editing ? $id : bin2hex(random_bytes(6)),
+                'label' => $label !== '' ? $label : $host,
+                'host'  => $host, 'port' => $port, 'user' => $user, 'pass' => $pass, 'trust' => $trust,
+            ];
+            [$ok, $info] = sqlsrv_test($entry);
+            if ($editing) {
+                foreach ($list as $i => $s) { if (($s['id'] ?? '') === $id) { $list[$i] = $entry; break; } }
+            } else { $list[] = $entry; }
+            sqlsrv_save_servers($ROOT, $list);
+            $verbo = $editing ? 'actualizada' : 'guardada';
+            $msg = $ok
+                ? 'applied:Conexión "'.$entry['label'].'" '.$verbo.'. '.$info
+                : 'info:Conexión "'.$entry['label'].'" '.$verbo.', pero NO se pudo conectar: '.$info;
+        }
+    }
+    elseif ($action === 'sqlsrv_test') {
+        $tab='sqlsrv';
+        $id = trim($_POST['id'] ?? '');
+        $srv = valid_sqlsrv_id($id) ? sqlsrv_find($ROOT, $id) : null;
+        if (!$srv) { $msg='error:Esa conexión ya no existe.'; }
+        else {
+            [$ok, $info] = sqlsrv_test($srv);
+            $msg = $ok ? 'applied:Conexión correcta. '.$info : 'error:No se pudo conectar: '.$info;
+        }
+    }
+    elseif ($action === 'sqlsrv_del') {
+        $tab='sqlsrv';
+        $id = trim($_POST['id'] ?? '');
+        if (!valid_sqlsrv_id($id)) { $msg='error:Conexión no válida.'; }
+        else {
+            $list = array_values(array_filter(sqlsrv_servers($ROOT), function($s) use ($id){ return ($s['id'] ?? '') !== $id; }));
+            sqlsrv_save_servers($ROOT, $list);
+            $msg='applied:Conexión eliminada.';
+        }
+    }
+    // ---- Actualizaciones de la plataforma ----
+    // El panel no puede hacer 'git fetch' (remoto SSH, y aqui corremos como SYSTEM): deja un
+    // archivo-senal y el watcher lo recoge, igual que con HTTPS o la sincronizacion de hosts.
+    elseif ($action === 'update_cfg') {
+        $tab='config';
+        $auto  = ($_POST['auto'] ?? '') === '1';
+        $horas = max(1, min(168, (int)($_POST['cada_horas'] ?? 6)));
+        @mkdir($ROOT.'/config', 0777, true);
+        @file_put_contents($ROOT.'/config/update.json', json_encode(['auto'=>$auto, 'cada_horas'=>$horas]));
+        $msg = 'applied:Actualizaciones automáticas '.($auto?'activadas':'desactivadas').'. Comprobación cada '.$horas.' h.';
+    }
+    elseif ($action === 'update_check') {
+        $tab='config';
+        @mkdir($ROOT.'/tmp', 0777, true);
+        @file_put_contents($ROOT.'/tmp/update-check.flag', '1');
+        $msg = watcher_alive($ROOT)
+            ? 'info:Buscando actualizaciones… se actualizará en unos segundos.'
+            : 'error:El watcher no está activo: no se puede consultar el repositorio. Arráncalo con .\lua.ps1 start';
+    }
+    elseif ($action === 'update_now') {
+        $tab='config';
+        @mkdir($ROOT.'/tmp', 0777, true);
+        @file_put_contents($ROOT.'/tmp/update-now.flag', '1');
+        $msg = watcher_alive($ROOT)
+            ? 'info:Actualizando… Apache se reiniciará solo al terminar.'
+            : 'error:El watcher no está activo: no se puede actualizar. Arráncalo con .\lua.ps1 start';
+    }
     elseif ($action === 'terminal') {
         $tab='config';
         $enable = ($_POST['enable'] ?? '') === '1';
@@ -2305,6 +3111,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // ---------------- GET (render) ----------------
 $cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'lua.test','sites'=>[]];
 $brandName = brand_name($cfg);
+$luaVer    = lua_version($ROOT);
+$updSt     = update_status($ROOT);
+$updCfg    = update_config($ROOT);
+$updDetras = (int)($updSt['detras'] ?? 0);
+$updHay    = $updDetras > 0;
 $brandLogo = brand_logo_path($ROOT);      // ruta del logo propio, o null si usa el de por defecto
 $tld = $cfg['tld'] ?? 'lua.test';
 $sites = $cfg['sites'] ?? [];
@@ -2325,6 +3136,7 @@ $msg = $_GET['msg'] ?? '';
 $curPhp = PHP_VERSION;
 $jobs = read_jobs($ROOT.'/tmp/jobs');
 $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['running','queued'],true)){$anyJobRun=true;break;} }
+$anyDbImportRun = false; foreach($jobs as $jj){ if(in_array(($jj['type']??''),['db_import_dir','db_import_file'],true) && in_array(($jj['state']??''),['running','queued'],true)){$anyDbImportRun=true;break;} }
 $watcherAlive = watcher_alive($ROOT);
 ?>
 <!doctype html>
@@ -2346,6 +3158,7 @@ setTimeout(ping,1500);})();
 </script><?php endif; ?>
 <?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},7000);</script><?php endif; ?>
 <?php if (($tab==='proyectos' || $tab==='config' || $tab==='proyecto') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
+<?php if ($tab==='bd' && ($anyDbImportRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
 <style>
   :root{
@@ -2367,6 +3180,14 @@ setTimeout(ping,1500);})();
   .logo img{width:100%;height:100%;display:block}
   h1{margin:0;font-size:19px;font-weight:700;line-height:1.2}
   .sub{color:var(--mut);font-size:12px;margin-top:1px}
+  /* Version de la plataforma, junto al titulo. Se tine de ambar cuando hay actualizaciones. */
+  .verchip{display:inline-block;vertical-align:middle;margin-left:9px;padding:2px 8px;border-radius:999px;
+           border:1px solid var(--line);background:var(--in);color:var(--mut);
+           font-size:11px;font-weight:600;font-family:ui-monospace,Consolas,monospace;
+           text-decoration:none;letter-spacing:.2px;transition:color .12s,border-color .12s}
+  .verchip:hover{color:var(--ac);border-color:var(--ac)}
+  .verchip.hay{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.12)}
+  .verchip.hay:hover{filter:brightness(1.1)}
   .spacer{flex:1}
   .badges{display:flex;gap:6px;align-items:center;flex-shrink:0}
   .iconbtn{display:flex;align-items:center;justify-content:center;width:34px;height:34px;flex-shrink:0;background:transparent;border:1px solid var(--line);border-radius:8px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
@@ -2401,11 +3222,13 @@ setTimeout(ping,1500);})();
   .btn.danger:hover{filter:brightness(1.08)}
   .btn-git{display:inline-flex;align-items:center;gap:8px;background:#161b22;color:#fff;border:1px solid #30363d;border-radius:5px;padding:6px 13px;font-size:13px;font-family:inherit;line-height:1.4;font-weight:600;cursor:pointer;transition:background-color .12s}
   .btn-git:hover{background:#22272e}
+  .btn-git.sm{padding:4px 10px}
+  .btn-git:disabled{opacity:.55;cursor:default}
 
   .dbrow{display:flex;align-items:center;flex-wrap:wrap;gap:16px;padding:14px 0;border-top:1px solid var(--line)}
   .dbrow:first-of-type{border-top:none}
   .dbrow .dbname{font-weight:600;font-family:ui-monospace,Consolas,monospace;font-size:13px}
-  .dbactions{display:flex;align-items:center;gap:16px;min-width:420px;justify-content:flex-end}
+  .dbactions{display:flex;align-items:center;gap:20px;min-width:560px;justify-content:flex-end}
   .dbimport{display:flex;align-items:center;gap:10px}
   .filepick{position:relative;display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px dashed var(--line);border-radius:5px;color:var(--mut);font-size:12px;cursor:pointer;max-width:190px;min-width:0;transition:color .12s,border-color .12s,background-color .12s}
   .filepick:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.06)}
@@ -2594,6 +3417,63 @@ setTimeout(ping,1500);})();
   a.jstate:hover{filter:brightness(1.2)}
 
   .joblog{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;max-height:72px;overflow:auto;color:var(--mut)}
+  .progressbar{position:relative;height:8px;border-radius:999px;background:var(--in);border:1px solid var(--line);overflow:hidden;margin-top:8px}
+  .progressbar-fill{height:100%;border-radius:999px;background-image:linear-gradient(135deg,var(--brand-start),var(--brand-end));transition:width .3s ease}
+  .progressbar-fill.err{background-image:linear-gradient(135deg,var(--err),var(--err-dark))}
+  .progresspct{font-size:11px;color:var(--mut);margin-top:4px;display:block}
+
+  /* ---------- Explorador de SQL Server ---------- */
+  .sqlx{display:flex;gap:14px;align-items:flex-start}
+  .sqlx-side{flex:0 0 270px;width:270px;position:sticky;top:12px}
+  .sqlx-main{flex:1;min-width:0}
+  .sqlx-side .card,.sqlx-main .card{margin:0}
+  .sqlx-tables{max-height:56vh;overflow:auto;margin:8px -6px 0}
+  .sqlx-t{display:flex;align-items:center;gap:7px;width:100%;text-align:left;background:none;border:0;color:var(--tx);
+          font:inherit;font-size:12.5px;padding:5px 8px;border-radius:5px;cursor:pointer;font-family:ui-monospace,Consolas,monospace}
+  .sqlx-t:hover{background:rgba(110,168,254,.10)}
+  .sqlx-t.on{background:rgba(110,168,254,.16);color:var(--ac);font-weight:600}
+  .sqlx-t .n{margin-left:auto;font-size:10.5px;color:var(--mut);font-family:inherit}
+  .sqlx-t.view .ico{opacity:.55}
+  .sqlx-empty{color:var(--mut);font-size:12px;padding:10px 8px}
+  .sqlx-views{display:flex;gap:16px;border-bottom:1px solid var(--line);margin:-4px -4px 12px;padding:0 4px}
+  .sqlx-views button{background:none;border:0;border-bottom:2px solid transparent;color:var(--mut);font:inherit;
+                     font-size:13px;font-weight:600;padding:8px 2px;margin-bottom:-1px;cursor:pointer}
+  .sqlx-views button:hover{color:var(--tx)}
+  .sqlx-views button.on{color:var(--ac);border-bottom-color:var(--ac)}
+  .sqlgrid{overflow:auto;max-height:60vh;border:1px solid var(--line);border-radius:6px;background:var(--in)}
+  table.sqltbl{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;font-family:ui-monospace,Consolas,monospace}
+  table.sqltbl th,table.sqltbl td{padding:5px 9px;border-bottom:1px solid var(--line);white-space:nowrap;
+                                  max-width:340px;overflow:hidden;text-overflow:ellipsis;vertical-align:top}
+  table.sqltbl thead th{position:sticky;top:0;z-index:1;background:var(--card);border-bottom:1px solid var(--line);
+                        text-align:left;font-weight:600;font-family:inherit;font-size:11.5px;color:var(--mut);cursor:pointer;user-select:none}
+  table.sqltbl thead th:hover{color:var(--tx)}
+  table.sqltbl thead th .pkmark{color:var(--warn);margin-left:4px}
+  table.sqltbl thead th .dirmark{color:var(--ac);margin-left:3px}
+  table.sqltbl tbody tr:hover{background:rgba(110,168,254,.06)}
+  table.sqltbl td.acts{white-space:nowrap;position:sticky;left:0;background:var(--in)}
+  table.sqltbl tbody tr:hover td.acts{background:#eef2f8}
+  @media (prefers-color-scheme:dark){table.sqltbl tbody tr:hover td.acts{background:#1b2027}}
+  :root[data-theme="dark"] table.sqltbl tbody tr:hover td.acts{background:#1b2027}
+  :root[data-theme="light"] table.sqltbl tbody tr:hover td.acts{background:#eef2f8}
+  .sqlnull{color:var(--mut);font-style:italic;opacity:.75}
+  .sqlbin{color:var(--warn)}
+  .sqlrowbtn{background:none;border:1px solid var(--line);border-radius:4px;color:var(--mut);cursor:pointer;
+             padding:1px 6px;font-size:11px;font-family:inherit;line-height:1.5}
+  .sqlrowbtn:hover{color:var(--ac);border-color:var(--ac)}
+  .sqlrowbtn.del:hover{color:var(--err);border-color:var(--err)}
+  .sqlpager{display:flex;align-items:center;gap:10px;margin-top:10px;font-size:12px;color:var(--mut);flex-wrap:wrap}
+  .sqlfield{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+  .sqlfield label{font-size:12px;color:var(--mut)}
+  .sqlfield .rowline{display:flex;align-items:center;gap:8px}
+  .sqlfield input[type=text],.sqlfield textarea{width:100%;font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
+  .sqlfield textarea{min-height:80px;resize:vertical}
+  .sqlfield .meta{font-size:11px;color:var(--mut)}
+  .sqlnullbox{display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--mut);white-space:nowrap;cursor:pointer}
+  #sqlEditorHost .CodeMirror{height:190px;border:1px solid var(--line);border-radius:6px;font-size:13px}
+  .sqlmsg{font-size:12px;padding:8px 11px;border-radius:6px;border:1px solid;margin-bottom:10px}
+  .sqlmsg.err{background:rgba(248,81,73,.12);border-color:var(--err);color:var(--err)}
+  .sqlmsg.ok{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
+  .sqlmsg.warn{background:rgba(210,153,34,.12);border-color:var(--warn);color:var(--warn)}
   .logview{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;font-family:ui-monospace,Consolas,monospace;font-size:13px;white-space:pre-wrap;max-height:62vh;overflow:auto;color:var(--mut)}
   .logview .log-fatal{color:var(--err);font-weight:700}
   .logview .log-warning{color:var(--warn);font-weight:600}
@@ -2694,7 +3574,8 @@ setTimeout(ping,1500);})();
   <header>
     <div class="logo"><img src="<?= $brandLogo ? '?brandlogo&t='.filemtime($brandLogo) : 'assets/logo.svg' ?>" alt="<?= e($brandName) ?>"></div>
     <div>
-      <h1><?= e($brandName) ?></h1>
+      <h1><?= e($brandName) ?><?php if ($luaVer !== ''): ?><a class="verchip<?= $updHay ? ' hay' : '' ?>" href="?tab=config#actualizaciones"
+        title="<?= $updHay ? e($updDetras.' actualización(es) disponible(s) — pulsa para ver') : 'Versión de la plataforma' ?>"><?= e($luaVer) ?><?php if ($updHay): ?> &bull; <?= (int)$updDetras ?> nueva(s)<?php endif; ?></a><?php endif; ?></h1>
       <div class="sub">Servidor PHP local &middot; <?= count($sitesView) ?> proyecto(s) &middot; PHP: <?= e(implode(', ',$vers)) ?></div>
     </div>
     <div class="spacer"></div>
@@ -2755,6 +3636,7 @@ setTimeout(ping,1500);})();
       <a href="?tab=proyectos" class="<?= ($tab==='proyectos'||$tab==='proyecto')?'on':'' ?>">Proyectos</a>
       <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
       <a href="?tab=bd" class="<?= $tab==='bd'?'on':'' ?>">Bases de datos</a>
+      <a href="?tab=sqlsrv" class="<?= $tab==='sqlsrv'?'on':'' ?>">SQL Server</a>
       <?php if (docker_installed()): ?>
         <a href="?tab=docker" class="<?= $tab==='docker'?'on':'' ?>">Docker</a>
       <?php endif; ?>
@@ -3134,6 +4016,7 @@ setTimeout(ping,1500);})();
         <div id="runnerBtns" class="row" style="gap:6px 16px;margin-bottom:10px;flex-wrap:wrap"></div>
         <div class="row" style="gap:6px;margin-bottom:10px">
           <input type="text" id="runnerCustomCmd" placeholder="Comando personalizado, p.ej. npm run dev" style="flex:1" maxlength="200">
+          <button type="button" class="btn-git sm" id="runnerRunBtn" title="Ejecutar una vez, sin guardarlo">Ejecutar</button>
           <button type="button" class="btn ghost sm" id="runnerAddBtn" title="Guardar como acceso rápido y ejecutarlo">+ Guardar</button>
         </div>
         <div id="runnerOut" class="termout" style="height:280px;border:1px solid var(--line);border-radius:6px;background:var(--in)"></div>
@@ -3147,7 +4030,8 @@ setTimeout(ping,1500);})();
         var modal=document.getElementById('runnerModal'), title=document.getElementById('runnerTitle'),
             btnsEl=document.getElementById('runnerBtns'), out=document.getElementById('runnerOut'),
             stopBtn=document.getElementById('runnerStop'), clearBtn=document.getElementById('runnerClear'),
-            addBtn=document.getElementById('runnerAddBtn'), customInput=document.getElementById('runnerCustomCmd');
+            addBtn=document.getElementById('runnerAddBtn'), runOnceBtn=document.getElementById('runnerRunBtn'),
+            customInput=document.getElementById('runnerCustomCmd');
         // runs: comandos en marcha por proyecto (clave = ruta). Sobreviven a cerrar el
         // modal -- el comando sigue en marcha en segundo plano (proceso propio de Windows,
         // WScript.Shell.Run, independiente de esta página) y el play de la card se marca
@@ -3282,6 +4166,13 @@ setTimeout(ping,1500);})();
             if(j.presets){ savedPresets=j.presets; renderBtns(); }
           });
         }
+        // Ejecuta el comando del cuadro tal cual, sin pasar por run_preset_add: para
+        // comandos puntuales que no hace falta guardar como acceso rapido.
+        runOnceBtn.onclick=function(){
+          var cmd=customInput.value.trim();
+          if(!cmd || !curPath || runs[curPath]) return;
+          startRun(curPath, curName, curPhpVer, cmd);
+        };
         addBtn.onclick=function(){
           var cmd=customInput.value.trim();
           if(!cmd || (curPath && runs[curPath])) return;
@@ -3958,6 +4849,75 @@ setTimeout(ping,1500);})();
 
   <?php elseif ($tab==='config'): /* ---------- PESTAÑA CONFIGURACIÓN DEL SERVIDOR ---------- */ ?>
 
+    <?php
+      $updErr    = $updSt['error'] ?? null;
+      $updSucio  = !empty($updSt['sucio']);
+      $updDelant = (int)($updSt['delante'] ?? 0);
+      $updCuando = !empty($updSt['comprobado']) ? @strtotime($updSt['comprobado']) : 0;
+    ?>
+    <div class="card" id="actualizaciones">
+      <div class="row" style="flex-wrap:wrap;gap:8px">
+        <div style="min-width:260px">
+          <div style="font-weight:600">Actualizaciones de la plataforma</div>
+          <div class="muted" style="margin-top:4px">
+            Versión instalada: <code><?= $luaVer !== '' ? e($luaVer) : 'desconocida' ?></code>
+            <?php if ($updCuando): ?> &middot; comprobado <?= e(date('d/m/Y H:i', $updCuando)) ?><?php endif; ?>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <form method="post" style="display:inline"><input type="hidden" name="action" value="update_check">
+          <button class="btn ghost sm" type="submit">Buscar ahora</button></form>
+        <?php if ($updHay && !$updSucio && $updDelant === 0): ?>
+          <form method="post" style="display:inline"><input type="hidden" name="action" value="update_now">
+            <button class="btn sm" type="submit">Actualizar a la última</button></form>
+        <?php endif; ?>
+      </div>
+
+      <?php if ($updSt === null): ?>
+        <div class="muted" style="margin-top:10px;font-size:12.5px">Aún no se ha comprobado. El watcher lo hace solo al arrancar y cada <?= (int)$updCfg['cada_horas'] ?> h.</div>
+      <?php elseif ($updErr): ?>
+        <div class="sqlmsg err" style="margin-top:10px">No se pudo consultar el repositorio: <?= e((string)$updErr) ?></div>
+        <div class="muted" style="font-size:12px">El <code>fetch</code> lo hace el watcher con tus claves SSH. Si falla, comprueba que <code>git fetch</code> funciona a mano en esta carpeta.</div>
+      <?php elseif ($updHay): ?>
+        <div class="sqlmsg warn" style="margin-top:10px">Hay <?= (int)$updDetras ?> actualización(es) disponible(s) en <code><?= e((string)($updSt['remoto'] ?? 'origin')) ?></code>.</div>
+        <?php if (!empty($updSt['mensaje'])): ?><pre class="joblog" style="margin-top:0"><?= e((string)$updSt['mensaje']) ?></pre><?php endif; ?>
+      <?php else: ?>
+        <div class="sqlmsg ok" style="margin-top:10px">Estás en la última versión.</div>
+      <?php endif; ?>
+
+      <?php if ($updSucio): ?>
+        <div class="sqlmsg warn" style="margin-top:8px">Hay cambios locales sin confirmar en la carpeta de la plataforma. <b>No se actualizará automáticamente</b> para no pisarlos: confírmalos o descártalos primero.</div>
+      <?php endif; ?>
+      <?php if ($updDelant > 0): ?>
+        <div class="sqlmsg warn" style="margin-top:8px">Tu copia va <?= (int)$updDelant ?> commit(s) por delante del remoto. La actualización automática se salta este caso para no decidir por ti cómo integrarlos.</div>
+      <?php endif; ?>
+
+      <form method="post" class="inline" style="margin-top:14px">
+        <input type="hidden" name="action" value="update_cfg">
+        <div>
+          <label>Actualizaciones automáticas</label>
+          <select name="auto">
+            <option value="0" <?= $updCfg['auto'] ? '' : 'selected' ?>>Solo avisar</option>
+            <option value="1" <?= $updCfg['auto'] ? 'selected' : '' ?>>Instalar automáticamente</option>
+          </select>
+        </div>
+        <div style="max-width:150px">
+          <label>Comprobar cada</label>
+          <select name="cada_horas">
+            <?php foreach ([1,3,6,12,24,72,168] as $h): ?>
+              <option value="<?= $h ?>" <?= (int)$updCfg['cada_horas']===$h ? 'selected' : '' ?>><?= $h < 24 ? $h.' h' : ($h/24).' día(s)' ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <button class="btn ghost" type="submit">Guardar</button>
+      </form>
+      <div class="muted" style="margin-top:10px;font-size:12px">
+        Se actualiza con <code>git merge --ff-only</code> desde <code>origin</code>: nunca genera conflictos ni reescribe tu historial.
+        Tu configuración de esta máquina (<code>sites.json</code>, contraseñas, conexiones, <code>www\</code>) no está versionada, así que no se toca.
+        Al terminar se regeneran los <code>php.ini</code> y los vhosts, y se reinicia Apache.
+      </div>
+    </div>
+
     <div class="cfg3">
 
       <div class="card">
@@ -4177,6 +5137,7 @@ setTimeout(ping,1500);})();
       $mongoOn = is_file($ROOT.'/config/mongodb.on');
       $rootHasPass = mysql_root_pass($ROOT) !== '';
       $mysqlUsers = $mariaOn ? mysql_users() : null;
+      $mysqlScopePdo = $mysqlUsers ? (function(){ try { return mysql_pdo(); } catch (Throwable $e) { return null; } })() : null;
       // Motor mostrado: ?engine=pg|mysql. Por defecto MySQL, salvo que solo Postgres este activo.
       $reqEngine = $_GET['engine'] ?? '';
       $dbEngine = $reqEngine==='pg' ? 'pg' : ($reqEngine==='mysql' ? 'mysql' : (($pgOn && !$mariaOn) ? 'pg' : 'mysql')); ?>
@@ -4383,7 +5344,14 @@ setTimeout(ping,1500);})();
         <a class="btn ghost" href="/adminer.php?server=127.0.0.1&username=root" target="_blank">Adminer &#8599;</a>
       </div>
 
-      <?php $dbList = mysql_databases(); ?>
+      <?php $dbList = mysql_databases();
+      // Ultimo job de import de archivo por BD (read_jobs ya viene ordenado por mas reciente).
+      $fileJobsByDb = [];
+      foreach ($jobs as $jj) {
+          if (($jj['type']??'')!=='db_import_file') continue;
+          $jjDb = $jj['dbname'] ?? $jj['name'] ?? '';
+          if ($jjDb !== '' && !isset($fileJobsByDb[$jjDb])) $fileJobsByDb[$jjDb] = $jj;
+      } ?>
       <div class="card">
         <div class="row" style="margin-bottom:12px">
           <h2 style="margin:0;font-size:15px">Bases de datos</h2>
@@ -4417,7 +5385,37 @@ setTimeout(ping,1500);})();
               <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
             </div>
           </div>
+          <?php if (isset($fileJobsByDb[$db])): ?>
+            <div style="margin:0 0 4px">
+              <?= render_import_job_card($ROOT, $fileJobsByDb[$db]) ?>
+            </div>
+          <?php endif; ?>
         <?php endforeach; endif; ?>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:600">Importar carpeta de dumps</div>
+        <div class="muted" style="margin-top:6px">Para exports con un <code>.sql</code> por tabla (en vez de un único dump completo): indica la carpeta en este servidor y la base de datos destino, y se importan todos en orden. Se ejecuta en segundo plano (puede tardar con carpetas grandes).</div>
+        <form method="post" class="inline" style="margin-top:12px" onsubmit="return luaAskImportDir(event, this)">
+          <input type="hidden" name="action" value="db_import_dir">
+          <div>
+            <label>Base de datos</label>
+            <select name="dbname" required>
+              <option value="" disabled selected>elige…</option>
+              <?php foreach ($dbList ?: [] as $dbOpt): ?><option value="<?= e($dbOpt) ?>"><?= e($dbOpt) ?></option><?php endforeach; ?>
+            </select>
+          </div>
+          <div style="flex:1;min-width:280px">
+            <label>Carpeta con los .sql</label>
+            <div class="row" style="gap:6px">
+              <input type="text" name="dir" id="dbImportDirInput" placeholder="C:\ruta\a\la\carpeta" required style="flex:1">
+              <button type="button" class="btn ghost sm" id="dbImportDirPick" onclick="luaPickFolder(this,'dbImportDirInput')" <?= $watcherAlive?'':'disabled title="El watcher no está activo"' ?>>Elegir…</button>
+            </div>
+          </div>
+          <button class="btn" type="submit">Importar carpeta</button>
+        </form>
+        <?php $dirJobs = array_values(array_filter($jobs, function($j){ return ($j['type']??'')==='db_import_dir'; })); ?>
+        <?php foreach (array_slice($dirJobs,0,5) as $j): echo render_import_job_card($ROOT, $j); endforeach; ?>
       </div>
 
       <div class="card">
@@ -4463,7 +5461,10 @@ setTimeout(ping,1500);})();
           </div>
           <div id="userdbrow" style="display:none">
             <label>Base de datos</label>
-            <input name="dbname" placeholder="micliente">
+            <input name="dbname" placeholder="micliente" list="mysqlDbList">
+            <datalist id="mysqlDbList">
+              <?php foreach ($dbList ?: [] as $dbOpt): ?><option value="<?= e($dbOpt) ?>"><?php endforeach; ?>
+            </datalist>
           </div>
           <button class="btn" type="submit">+ Crear usuario</button>
         </form>
@@ -4472,9 +5473,18 @@ setTimeout(ping,1500);})();
           <div class="muted">No se pudo conectar con MySQL para listar usuarios (¿acaba de activarse? espera unos segundos y recarga).</div>
         <?php elseif (!$mysqlUsers): ?>
           <div class="muted">No hay usuarios de aplicación todavía. Crea el primero arriba.</div>
-        <?php else: foreach ($mysqlUsers as $u): ?>
+        <?php else: foreach ($mysqlUsers as $u):
+          $scope = $mysqlScopePdo ? mysql_user_scope($mysqlScopePdo, $u['user'], $u['host']) : null; ?>
           <div class="dbrow">
             <div class="dbname"><?= e($u['user']) ?><span class="muted">@<?= e($u['host']) ?></span></div>
+            <?php if ($scope !== null): ?>
+              <span class="muted" style="font-size:12px">
+                <?php if ($scope['all']): ?>acceso a todas las BD
+                <?php elseif ($scope['dbs']): ?>acceso a: <?= e(implode(', ', $scope['dbs'])) ?>
+                <?php else: ?>sin acceso a ninguna BD todavía
+                <?php endif; ?>
+              </span>
+            <?php endif; ?>
             <div class="spacer"></div>
             <?php if (strcasecmp($u['user'],'root') !== 0): ?>
               <button type="button" class="btn danger sm" onclick="luaAskDeleteMysqlUser('<?= e($u['user']) ?>','<?= e($u['host']) ?>')">Eliminar</button>
@@ -4603,6 +5613,655 @@ setTimeout(ping,1500);})();
         }
         function luaEscImportDb(e){ if(e.key==='Escape') luaCloseImportDb(); }
       </script>
+
+      <!-- Modal de confirmacion de importar carpeta de dumps (puede sobrescribir tablas existentes) -->
+      <div id="importDirModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseImportDir()">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="importDirTitle">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            </svg>
+          </div>
+          <h3 id="importDirTitle">¿Importar carpeta?</h3>
+          <p class="modal-tx">Se importarán todos los <code>.sql</code> de <code id="importDirPath"></code> en <strong id="importDirDb"></strong>, en segundo plano. Si incluyen tablas con el mismo nombre, <strong>se sobrescribirán</strong>.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" id="importDirCancelBtn" onclick="luaCloseImportDir()">Cancelar</button>
+            <button type="button" class="btn danger" id="importDirConfirmBtn" onclick="luaConfirmImportDir()">Sí, importar</button>
+          </div>
+        </div>
+      </div>
+      <script>
+        var luaImportDirForm = null;
+        function luaAskImportDir(ev, form){
+          var db = form.dbname.value, dir = form.dir.value;
+          if (!db || !dir) return true; // deja que el 'required' nativo se encargue
+          ev.preventDefault();
+          luaImportDirForm = form;
+          document.getElementById('importDirDb').textContent = db;
+          document.getElementById('importDirPath').textContent = dir;
+          document.getElementById('importDirModal').hidden = false;
+          document.addEventListener('keydown', luaEscImportDir);
+          return false;
+        }
+        function luaConfirmImportDir(){
+          if (!luaImportDirForm) { luaCloseImportDir(); return; }
+          var btn = document.getElementById('importDirConfirmBtn');
+          document.getElementById('importDirCancelBtn').disabled = true;
+          btn.disabled = true;
+          btn.innerHTML = '<span class="btn-spin"></span>Importando&hellip;';
+          document.removeEventListener('keydown', luaEscImportDir);
+          luaImportDirForm.requestSubmit();
+          setTimeout(function(){
+            btn.disabled = false; btn.innerHTML = 'Sí, importar';
+            document.getElementById('importDirCancelBtn').disabled = false;
+            luaCloseImportDir();
+          }, 20000);
+        }
+        function luaCloseImportDir(){
+          document.getElementById('importDirModal').hidden = true;
+          document.removeEventListener('keydown', luaEscImportDir);
+        }
+        function luaEscImportDir(e){ if(e.key==='Escape') luaCloseImportDir(); }
+      </script>
+
+    <?php endif; ?>
+
+  <?php elseif ($tab==='sqlsrv'): /* ---------- PESTAÑA SQL SERVER ---------- */
+      $sqlServers = sqlsrv_servers($ROOT);
+      $sqlSel  = (string)($_GET['conn'] ?? '');
+      $sqlSrv  = valid_sqlsrv_id($sqlSel) ? sqlsrv_find($ROOT, $sqlSel) : null;
+      if (!$sqlSrv && $sqlServers) { $sqlSrv = $sqlServers[0]; }
+      $sqlEditSrv = valid_sqlsrv_id((string)($_GET['edit'] ?? '')) ? sqlsrv_find($ROOT, $_GET['edit']) : null;
+      $sqlForm = $sqlEditSrv !== null || isset($_GET['nueva']) || !$sqlServers;
+      $sqlDrv  = sqlsrv_driver_kind() === 'sqlsrv' ? 'pdo_sqlsrv' : 'pdo_odbc · '.sqlsrv_odbc_driver();
+      $sqlOk   = extension_loaded('pdo_odbc') || extension_loaded('pdo_sqlsrv'); ?>
+
+    <?php if (!$sqlOk): ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:6px">Falta el driver de SQL Server</div>
+        <div class="muted">Ni <code>pdo_sqlsrv</code> ni <code>pdo_odbc</code> están cargados en el PHP del panel
+          (<?= e(PHP_VERSION) ?>). Añade <code>pdo_odbc</code> en <a href="?tab=php">Versiones PHP</a> y reinicia el servidor.</div>
+      </div>
+    <?php else: ?>
+
+      <div class="card row" style="flex-wrap:wrap;gap:8px">
+        <div style="min-width:220px">
+          <div style="font-weight:600">Servidores SQL Server</div>
+          <div class="muted" style="margin-top:4px">Conecta con un SQL Server existente (local o de red). Driver: <code><?= e($sqlDrv) ?></code></div>
+        </div>
+        <div class="spacer"></div>
+        <?php foreach ($sqlServers as $s): ?>
+          <a class="btn <?= ($sqlSrv && $s['id']===$sqlSrv['id'] && !$sqlForm) ? '' : 'ghost' ?> sm"
+             href="?tab=sqlsrv&conn=<?= e(rawurlencode($s['id'])) ?>"><?= e($s['label']) ?></a>
+        <?php endforeach; ?>
+        <a class="btn ghost sm" href="?tab=sqlsrv&nueva=1">+ Añadir conexión</a>
+      </div>
+
+      <?php if ($sqlForm): ?>
+        <div class="card">
+          <div style="font-weight:600;margin-bottom:12px"><?= $sqlEditSrv ? 'Editar conexión' : 'Nueva conexión' ?></div>
+          <form method="post" class="inline">
+            <input type="hidden" name="action" value="sqlsrv_save">
+            <?php if ($sqlEditSrv): ?><input type="hidden" name="id" value="<?= e($sqlEditSrv['id']) ?>"><?php endif; ?>
+            <div><label>Nombre</label><input type="text" name="label" placeholder="Producción" value="<?= e($sqlEditSrv['label'] ?? '') ?>"></div>
+            <div><label>Host o IP</label><input type="text" name="host" placeholder="127.0.0.1" value="<?= e($sqlEditSrv['host'] ?? '') ?>" required></div>
+            <div style="max-width:110px"><label>Puerto</label><input type="text" name="port" value="<?= e((string)($sqlEditSrv['port'] ?? 1433)) ?>" required></div>
+            <div><label>Usuario</label><input type="text" name="user" placeholder="sa" value="<?= e($sqlEditSrv['user'] ?? '') ?>" required></div>
+            <div><label>Contraseña</label>
+              <input type="password" name="pass" autocomplete="new-password" placeholder="<?= $sqlEditSrv ? 'dejar vacío para no cambiarla' : '' ?>" <?= $sqlEditSrv ? '' : 'required' ?>>
+            </div>
+            <div><label>Certificado</label>
+              <select name="trust">
+                <option value="1" <?= (!$sqlEditSrv || !empty($sqlEditSrv['trust'])) ? 'selected' : '' ?>>Confiar sin validar</option>
+                <option value="0" <?= ($sqlEditSrv && empty($sqlEditSrv['trust'])) ? 'selected' : '' ?>>Validar el certificado</option>
+              </select>
+            </div>
+            <button class="btn" type="submit">Guardar y probar</button>
+            <?php if ($sqlEditSrv): ?><a class="btn ghost" href="?tab=sqlsrv&conn=<?= e(rawurlencode($sqlEditSrv['id'])) ?>">Cancelar</a><?php endif; ?>
+          </form>
+          <div class="muted" style="margin-top:10px;font-size:12px">
+            La contraseña se guarda en claro en <code>config\sqlsrv-servers.json</code> (fuera de git), igual que
+            <code>mysql_root.pass</code>. El panel solo escucha en <code>127.0.0.1</code>.
+            <?php if (sqlsrv_driver_kind() !== 'sqlsrv'): ?> Con <code>pdo_odbc</code>, "Validar el certificado" requiere que el certificado del servidor sea de confianza para Windows.<?php endif; ?>
+          </div>
+        </div>
+      <?php endif; ?>
+
+      <?php if ($sqlSrv && !$sqlForm): ?>
+        <div class="card row" style="gap:8px;flex-wrap:wrap">
+          <div class="muted" style="font-size:12.5px">
+            <b style="color:var(--tx)"><?= e($sqlSrv['label']) ?></b> &middot;
+            <code><?= e($sqlSrv['host']) ?>:<?= e((string)$sqlSrv['port']) ?></code> &middot; usuario <code><?= e($sqlSrv['user']) ?></code>
+          </div>
+          <div class="spacer"></div>
+          <form method="post" style="display:inline"><input type="hidden" name="action" value="sqlsrv_test">
+            <input type="hidden" name="id" value="<?= e($sqlSrv['id']) ?>">
+            <button class="btn ghost sm" type="submit">Probar conexión</button></form>
+          <a class="btn ghost sm" href="?tab=sqlsrv&edit=<?= e(rawurlencode($sqlSrv['id'])) ?>">Editar</a>
+          <button type="button" class="btn danger sm" onclick="luaAskDelConn('<?= e($sqlSrv['id']) ?>','<?= e(addslashes($sqlSrv['label'])) ?>')">Eliminar</button>
+        </div>
+
+        <div class="sqlx" id="sqlx" data-conn="<?= e($sqlSrv['id']) ?>">
+          <div class="sqlx-side">
+            <div class="card">
+              <label style="font-size:12px;color:var(--mut)">Base de datos</label>
+              <select id="sqDb" style="width:100%;margin-top:4px"><option value="">cargando…</option></select>
+              <input type="search" id="sqFilter" placeholder="Filtrar tablas…" style="width:100%;margin-top:8px;font-size:12.5px">
+              <div class="sqlx-tables" id="sqTables"><div class="sqlx-empty">Elige una base de datos.</div></div>
+            </div>
+          </div>
+
+          <div class="sqlx-main">
+            <div class="card">
+              <div class="sqlx-views">
+                <button type="button" data-view="datos" class="on">Datos</button>
+                <button type="button" data-view="estructura">Estructura</button>
+                <button type="button" data-view="sql">SQL</button>
+              </div>
+              <div id="sqMsg"></div>
+              <div id="sqPanelDatos">
+                <div class="sqlx-empty" id="sqDatosVacio">Elige una tabla en la barra lateral.</div>
+                <div id="sqDatosWrap" hidden>
+                  <div class="row" style="gap:8px;margin-bottom:10px;flex-wrap:wrap">
+                    <span id="sqTitulo" style="font-weight:600;font-family:ui-monospace,Consolas,monospace;font-size:13px"></span>
+                    <div class="spacer"></div>
+                    <button type="button" class="btn ghost sm" id="sqNuevaFila">+ Nueva fila</button>
+                    <button type="button" class="btn ghost sm" id="sqRecargar">Recargar</button>
+                  </div>
+                  <div class="sqlgrid"><table class="sqltbl" id="sqTabla"><thead></thead><tbody></tbody></table></div>
+                  <div class="sqlpager">
+                    <button type="button" class="btn ghost sm" id="sqPrev">&larr; Anterior</button>
+                    <button type="button" class="btn ghost sm" id="sqNext">Siguiente &rarr;</button>
+                    <span id="sqInfo"></span>
+                    <div class="spacer"></div>
+                    <label style="font-size:12px">Filas
+                      <select id="sqPer" style="margin-left:4px">
+                        <option>25</option><option selected>50</option><option>100</option><option>250</option>
+                      </select>
+                    </label>
+                  </div>
+                </div>
+              </div>
+              <div id="sqPanelEstructura" hidden><div class="sqlx-empty">Elige una tabla en la barra lateral.</div></div>
+              <div id="sqPanelSql" hidden>
+                <div id="sqlEditorHost"><textarea id="sqEditor"></textarea></div>
+                <div class="row" style="gap:8px;margin-top:10px;flex-wrap:wrap">
+                  <button type="button" class="btn" id="sqRun">Ejecutar</button>
+                  <span class="muted" style="font-size:12px">Ctrl+Enter</span>
+                  <div class="spacer"></div>
+                  <select id="sqHist" style="max-width:320px;font-size:12px"><option value="">Historial…</option></select>
+                </div>
+                <?php if (sqlsrv_driver_kind() !== 'sqlsrv'): ?>
+                  <div class="muted" style="font-size:11.5px;margin-top:8px">
+                    Con <code>pdo_odbc</code>, el texto que devuelve una consulta libre pasa por la conversión ANSI del driver:
+                    se recupera todo lo que sea Windows-1252 (acentos, ñ, €), pero un carácter fuera de esa tabla llegaría como <code>?</code>.
+                    La pestaña <b>Datos</b> no tiene esa limitación: ahí el texto viaja en binario y es exacto.
+                  </div>
+                <?php endif; ?>
+                <div id="sqResultados" style="margin-top:12px"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Modal: editar / insertar fila -->
+        <div id="sqRowModal" class="modal-overlay" hidden onclick="if(event.target===this)sqCloseRow()">
+          <div class="modal-box" role="dialog" aria-modal="true" style="max-width:680px;text-align:left">
+            <div class="row" style="margin-bottom:12px">
+              <h3 id="sqRowTitle" style="margin:0;font-size:16px">Editar fila</h3>
+              <div class="spacer"></div>
+              <button type="button" class="lockbtn" onclick="sqCloseRow()" title="Cerrar" aria-label="Cerrar">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              </button>
+            </div>
+            <div id="sqRowMsg"></div>
+            <div id="sqRowFields" style="max-height:56vh;overflow:auto"></div>
+            <div class="modal-actions" style="margin-top:14px">
+              <button type="button" class="btn ghost" onclick="sqCloseRow()">Cancelar</button>
+              <button type="button" class="btn" id="sqRowSave">Guardar</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Modal: confirmar borrado de fila -->
+        <div id="sqDelModal" class="modal-overlay" hidden onclick="if(event.target===this)sqCloseDel()">
+          <div class="modal-box" role="dialog" aria-modal="true">
+            <div class="modal-ic">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>
+              </svg>
+            </div>
+            <h3>¿Borrar esta fila?</h3>
+            <p class="modal-tx">Se eliminará permanentemente la fila <strong id="sqDelWhere"></strong>. No se puede deshacer.</p>
+            <div class="modal-actions">
+              <button type="button" class="btn ghost" onclick="sqCloseDel()">Cancelar</button>
+              <button type="button" class="btn danger" id="sqDelOk">Sí, borrar</button>
+            </div>
+          </div>
+        </div>
+      <?php endif; ?>
+
+      <!-- Modal: confirmar borrado de conexion -->
+      <div id="sqConnModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDelConn()">
+        <div class="modal-box" role="dialog" aria-modal="true">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            </svg>
+          </div>
+          <h3>¿Eliminar la conexión?</h3>
+          <p class="modal-tx">Se quitará <strong id="sqConnName"></strong> de la lista del panel. <b>No se toca nada en el servidor</b>: solo se borran los datos de conexión guardados aquí.</p>
+          <form method="post" class="modal-actions">
+            <input type="hidden" name="action" value="sqlsrv_del">
+            <input type="hidden" name="id" id="sqConnId">
+            <button type="button" class="btn ghost" onclick="luaCloseDelConn()">Cancelar</button>
+            <button type="submit" class="btn danger">Sí, eliminar</button>
+          </form>
+        </div>
+      </div>
+      <script>
+        function luaAskDelConn(id, label){
+          document.getElementById('sqConnName').textContent = label;
+          document.getElementById('sqConnId').value = id;
+          document.getElementById('sqConnModal').hidden = false;
+          document.addEventListener('keydown', luaEscDelConn);
+        }
+        function luaCloseDelConn(){
+          document.getElementById('sqConnModal').hidden = true;
+          document.removeEventListener('keydown', luaEscDelConn);
+        }
+        function luaEscDelConn(e){ if(e.key==='Escape') luaCloseDelConn(); }
+      </script>
+
+      <?php if ($sqlSrv && !$sqlForm): ?>
+      <link rel="stylesheet" href="assets/codemirror/lib/codemirror.css">
+      <script src="assets/codemirror/lib/codemirror.js"></script>
+      <script src="assets/codemirror/addon/edit/matchbrackets.js"></script>
+      <script src="assets/codemirror/mode/sql/sql.js"></script>
+      <script>
+      (function(){
+        var root = document.getElementById('sqlx');
+        if (!root) return;
+        var S = { conn: root.dataset.conn, db:'', schema:'', table:'', kind:'', label:'',
+                  page:1, per:50, sort:'', dir:'asc', cols:[], pk:[], editable:false, rows:[] };
+        var elDb=document.getElementById('sqDb'), elTables=document.getElementById('sqTables'),
+            elFilter=document.getElementById('sqFilter'), elMsg=document.getElementById('sqMsg'),
+            elTabla=document.getElementById('sqTabla'), elInfo=document.getElementById('sqInfo'),
+            elTitulo=document.getElementById('sqTitulo'), elWrap=document.getElementById('sqDatosWrap'),
+            elVacio=document.getElementById('sqDatosVacio');
+        var todasTablas = [];
+
+        function api(params, body){
+          var qs = new URLSearchParams(Object.assign({ajax:'sqlsrv', conn:S.conn}, params));
+          var opt = body ? {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:new URLSearchParams(body)} : {};
+          return fetch('?'+qs.toString(), opt).then(function(r){ return r.json(); });
+        }
+        // Los mensajes siempre por textContent: traen texto del servidor SQL (y de las tablas
+        // del usuario), que puede contener < > y comillas.
+        function msg(txt, tipo){
+          elMsg.innerHTML='';
+          if(!txt) return;
+          var d=document.createElement('div'); d.className='sqlmsg '+(tipo||'err'); d.textContent=txt;
+          elMsg.appendChild(d);
+        }
+        function celda(v, meta){
+          var td=document.createElement('td');
+          if(v===null){ var s=document.createElement('span'); s.className='sqlnull'; s.textContent='NULL'; td.appendChild(s); return td; }
+          if(meta && meta.bin){ var b=document.createElement('span'); b.className='sqlbin'; b.textContent='0x'+v; td.appendChild(b); td.title='0x'+v; return td; }
+          var t=String(v);
+          td.textContent = t.length>300 ? t.slice(0,300)+'…' : t;
+          if(t.length>60) td.title=t;
+          return td;
+        }
+
+        // ---- barra lateral ----
+        function cargarDbs(){
+          api({op:'dbs'}).then(function(j){
+            elDb.innerHTML='';
+            if(j.error){ msg(j.error); elDb.innerHTML='<option value="">(error)</option>'; return; }
+            var o=document.createElement('option'); o.value=''; o.textContent='elige…'; elDb.appendChild(o);
+            (j.dbs||[]).forEach(function(d){
+              var op=document.createElement('option'); op.value=d.name;
+              op.textContent = d.name + (d.sys ? '  (sistema)' : '');
+              elDb.appendChild(op);
+            });
+            var guardada = sessionStorage.getItem('sqdb_'+S.conn);
+            if(guardada && (j.dbs||[]).some(function(d){return d.name===guardada;})){ elDb.value=guardada; cargarTablas(); }
+          }).catch(function(){ msg('No se pudo contactar con el panel.'); });
+        }
+        function cargarTablas(){
+          S.db = elDb.value; S.table=''; S.schema='';
+          sessionStorage.setItem('sqdb_'+S.conn, S.db);
+          elWrap.hidden=true; elVacio.hidden=false;
+          if(!S.db){ elTables.innerHTML='<div class="sqlx-empty">Elige una base de datos.</div>'; return; }
+          elTables.innerHTML='<div class="sqlx-empty">cargando…</div>';
+          api({op:'tables', db:S.db}).then(function(j){
+            if(j.error){ elTables.innerHTML=''; msg(j.error); return; }
+            todasTablas = j.tables||[];
+            pintarTablas();
+          });
+        }
+        function pintarTablas(){
+          var f=(elFilter.value||'').toLowerCase();
+          elTables.innerHTML='';
+          var vis = todasTablas.filter(function(t){ return !f || (t.schema+'.'+t.name).toLowerCase().indexOf(f)>=0; });
+          if(!vis.length){ elTables.innerHTML='<div class="sqlx-empty">Sin coincidencias.</div>'; return; }
+          vis.forEach(function(t){
+            var b=document.createElement('button');
+            b.type='button'; b.className='sqlx-t'+(t.kind==='view'?' view':'');
+            if(S.table===t.name && S.schema===t.schema) b.classList.add('on');
+            var ic=document.createElement('span'); ic.className='ico'; ic.textContent = t.kind==='view' ? '◫' : '▤';
+            b.appendChild(ic);
+            var nm=document.createElement('span');
+            nm.textContent = (t.schema==='dbo'? '' : t.schema+'.') + t.name;
+            b.appendChild(nm);
+            var n=document.createElement('span'); n.className='n';
+            n.textContent = t.kind==='view' ? 'vista' : (t.rows>=0 ? t.rows.toLocaleString('es-ES') : '');
+            b.appendChild(n);
+            b.onclick=function(){ abrirTabla(t); };
+            elTables.appendChild(b);
+          });
+        }
+        function abrirTabla(t){
+          S.schema=t.schema; S.table=t.name; S.kind=t.kind; S.page=1; S.sort=''; S.dir='asc';
+          S.label=(t.schema==='dbo'?'':t.schema+'.')+t.name;
+          pintarTablas();
+          if(vistaActual==='estructura') cargarEstructura(); else { mostrarVista('datos'); cargarFilas(); }
+        }
+
+        // ---- datos ----
+        function cargarFilas(){
+          if(!S.table) return;
+          msg('');
+          elVacio.hidden=true; elWrap.hidden=false;
+          elTitulo.textContent=S.label;
+          api({op:'rows', db:S.db, schema:S.schema, table:S.table, kind:S.kind,
+               page:S.page, per:S.per, sort:S.sort, dir:S.dir}).then(function(j){
+            if(j.error){ msg(j.error); return; }
+            S.cols=j.cols; S.pk=j.pk||[]; S.editable=!!j.editable; S.rows=j.rows||[];
+            S.sort=j.sort; S.dir=j.dir;
+            if(j.motivo) msg(j.motivo, 'warn');
+            pintarFilas(j);
+            document.getElementById('sqNuevaFila').style.display = S.editable ? '' : 'none';
+          });
+        }
+        function pintarFilas(j){
+          var thead=elTabla.tHead, tb=elTabla.tBodies[0];
+          thead.innerHTML=''; tb.innerHTML='';
+          var tr=document.createElement('tr');
+          if(S.editable){ var thA=document.createElement('th'); thA.textContent=''; thA.style.cursor='default'; tr.appendChild(thA); }
+          S.cols.forEach(function(c){
+            var th=document.createElement('th'); th.title=c.type;
+            th.appendChild(document.createTextNode(c.name));
+            if(S.pk.indexOf(c.name)>=0){ var k=document.createElement('span'); k.className='pkmark'; k.textContent='PK'; th.appendChild(k); }
+            if(c.name===S.sort){ var d=document.createElement('span'); d.className='dirmark'; d.textContent = S.dir==='asc'?'▲':'▼'; th.appendChild(d); }
+            th.onclick=function(){ if(S.sort===c.name){ S.dir = S.dir==='asc'?'desc':'asc'; } else { S.sort=c.name; S.dir='asc'; } S.page=1; cargarFilas(); };
+            tr.appendChild(th);
+          });
+          thead.appendChild(tr);
+          S.rows.forEach(function(fila, idx){
+            var r=document.createElement('tr');
+            if(S.editable){
+              var td=document.createElement('td'); td.className='acts';
+              var be=document.createElement('button'); be.type='button'; be.className='sqlrowbtn'; be.textContent='Editar';
+              be.onclick=function(){ abrirFila(idx); };
+              var bd=document.createElement('button'); bd.type='button'; bd.className='sqlrowbtn del'; bd.textContent='Borrar';
+              bd.style.marginLeft='4px';
+              bd.onclick=function(){ pedirBorrado(idx); };
+              td.appendChild(be); td.appendChild(bd); r.appendChild(td);
+            }
+            fila.forEach(function(v,i){ r.appendChild(celda(v, S.cols[i])); });
+            tb.appendChild(r);
+          });
+          var desde=(j.page-1)*j.per+1, hasta=Math.min(j.page*j.per, j.total);
+          elInfo.textContent = j.total ? (desde+'–'+hasta+' de '+(j.aprox?'~':'')+j.total.toLocaleString('es-ES')) : 'sin filas';
+          document.getElementById('sqPrev').disabled = j.page<=1;
+          document.getElementById('sqNext').disabled = hasta>=j.total;
+        }
+
+        // ---- estructura ----
+        function cargarEstructura(){
+          var p=document.getElementById('sqPanelEstructura');
+          if(!S.table){ p.innerHTML='<div class="sqlx-empty">Elige una tabla en la barra lateral.</div>'; return; }
+          p.innerHTML='<div class="sqlx-empty">cargando…</div>';
+          api({op:'struct', db:S.db, schema:S.schema, table:S.table}).then(function(j){
+            p.innerHTML='';
+            if(j.error){ msg(j.error); return; }
+            var h=document.createElement('div');
+            h.style.cssText='font-weight:600;font-family:ui-monospace,Consolas,monospace;font-size:13px;margin-bottom:10px';
+            h.textContent=S.label; p.appendChild(h);
+            var g=document.createElement('div'); g.className='sqlgrid';
+            var t=document.createElement('table'); t.className='sqltbl';
+            var th=document.createElement('thead'); var tr=document.createElement('tr');
+            ['Columna','Tipo','Nulos','Por defecto','Notas'].forEach(function(x){
+              var c=document.createElement('th'); c.textContent=x; c.style.cursor='default'; tr.appendChild(c);
+            });
+            th.appendChild(tr); t.appendChild(th);
+            var tb=document.createElement('tbody');
+            (j.cols||[]).forEach(function(c){
+              var r=document.createElement('tr');
+              function td(txt, cls){ var d=document.createElement('td'); if(cls) d.className=cls; d.textContent=txt; r.appendChild(d); return d; }
+              var d0=td(c.name); if((j.pk||[]).indexOf(c.name)>=0){ var k=document.createElement('span'); k.className='pkmark'; k.textContent=' PK'; d0.appendChild(k); }
+              td(c.type);
+              td(c.nullable ? 'sí' : 'no');
+              if(c.default===null||c.default===undefined) td('—','sqlnull'); else td(c.default);
+              var notas=[]; if(c.identity) notas.push('IDENTITY'); if(c.computed) notas.push('calculada');
+              td(notas.join(', ') || '—');
+              tb.appendChild(r);
+            });
+            t.appendChild(tb); g.appendChild(t); p.appendChild(g);
+            var idx=j.indexes||[];
+            var ht=document.createElement('div');
+            ht.style.cssText='font-weight:600;font-size:13px;margin:16px 0 8px';
+            ht.textContent='Índices ('+idx.length+')'; p.appendChild(ht);
+            if(!idx.length){ var e0=document.createElement('div'); e0.className='sqlx-empty'; e0.textContent='Esta tabla no tiene índices.'; p.appendChild(e0); return; }
+            var g2=document.createElement('div'); g2.className='sqlgrid';
+            var t2=document.createElement('table'); t2.className='sqltbl';
+            var th2=document.createElement('thead'); var tr2=document.createElement('tr');
+            ['Índice','Columnas','Único','Tipo'].forEach(function(x){ var c=document.createElement('th'); c.textContent=x; c.style.cursor='default'; tr2.appendChild(c); });
+            th2.appendChild(tr2); t2.appendChild(th2);
+            var tb2=document.createElement('tbody');
+            idx.forEach(function(i){
+              var r=document.createElement('tr');
+              function td(txt){ var d=document.createElement('td'); d.textContent=txt; r.appendChild(d); }
+              td(i.name + (i.pk?'  (clave primaria)':''));
+              td((i.cols||[]).join(', '));
+              td(i.unique?'sí':'no');
+              td(i.type);
+              tb2.appendChild(r);
+            });
+            t2.appendChild(tb2); g2.appendChild(t2); p.appendChild(g2);
+          });
+        }
+
+        // ---- edicion de filas ----
+        var filaEditada = null;
+        function pkDe(idx){
+          var o={};
+          S.pk.forEach(function(k){
+            var i = S.cols.findIndex(function(c){ return c.name===k; });
+            o[k] = i>=0 ? S.rows[idx][i] : null;
+          });
+          return o;
+        }
+        function abrirFila(idx){
+          filaEditada = (idx===null) ? null : {idx:idx, pk:pkDe(idx)};
+          document.getElementById('sqRowTitle').textContent = (idx===null?'Nueva fila en ':'Editar fila de ')+S.label;
+          document.getElementById('sqRowMsg').innerHTML='';
+          var cont=document.getElementById('sqRowFields'); cont.innerHTML='';
+          S.cols.forEach(function(c,i){
+            var val = idx===null ? null : S.rows[idx][i];
+            var f=document.createElement('div'); f.className='sqlfield';
+            var lab=document.createElement('label');
+            lab.textContent=c.name+'  ·  '+c.type+(c.nullable?'':'  · obligatorio');
+            f.appendChild(lab);
+            if(c.identity || c.computed){
+              var ro=document.createElement('div'); ro.className='meta';
+              ro.textContent = (c.identity?'IDENTITY':'Calculada')+': lo genera el servidor'+(val!==null&&idx!==null?'  (actual: '+val+')':'');
+              f.appendChild(ro); cont.appendChild(f); return;
+            }
+            var line=document.createElement('div'); line.className='rowline';
+            var largo = /max|text|xml/i.test(c.type) || (val!==null && String(val).length>120);
+            var input = document.createElement(largo?'textarea':'input');
+            if(!largo) input.type='text';
+            input.dataset.col=c.name;
+            input.value = val===null ? '' : String(val);
+            line.appendChild(input);
+            if(c.nullable){
+              var w=document.createElement('label'); w.className='sqlnullbox';
+              var cb=document.createElement('input'); cb.type='checkbox'; cb.dataset.nullFor=c.name;
+              cb.checked = (val===null);
+              input.disabled = cb.checked;
+              cb.onchange=function(){ input.disabled=cb.checked; if(cb.checked) input.value=''; };
+              w.appendChild(cb); w.appendChild(document.createTextNode('NULL'));
+              line.appendChild(w);
+            }
+            f.appendChild(line);
+            if(c.bin){ var m=document.createElement('div'); m.className='meta'; m.textContent='Binario: en hexadecimal (p. ej. 0xDEADBEEF)'; f.appendChild(m); }
+            cont.appendChild(f);
+          });
+          document.getElementById('sqRowModal').hidden=false;
+          document.addEventListener('keydown', escRow);
+        }
+        window.sqCloseRow=function(){ document.getElementById('sqRowModal').hidden=true; document.removeEventListener('keydown', escRow); };
+        function escRow(e){ if(e.key==='Escape') sqCloseRow(); }
+        document.getElementById('sqRowSave').onclick=function(){
+          var btn=this; var vals={}, nulls=[];
+          document.querySelectorAll('#sqRowFields [data-col]').forEach(function(inp){
+            var cb=document.querySelector('#sqRowFields [data-null-for="'+CSS.escape(inp.dataset.col)+'"]');
+            if(cb && cb.checked) nulls.push(inp.dataset.col); else vals[inp.dataset.col]=inp.value;
+          });
+          btn.disabled=true;
+          var body={op:'row_save', modo: filaEditada?'update':'insert', vals:JSON.stringify(vals), nulls:JSON.stringify(nulls)};
+          if(filaEditada) body.pk=JSON.stringify(filaEditada.pk);
+          api({op:'row_save', db:S.db, schema:S.schema, table:S.table}, body).then(function(j){
+            btn.disabled=false;
+            if(j.error){
+              var m=document.getElementById('sqRowMsg'); m.innerHTML='';
+              var d=document.createElement('div'); d.className='sqlmsg err'; d.textContent=j.error; m.appendChild(d);
+              return;
+            }
+            sqCloseRow();
+            cargarFilas();
+            if(j.aviso) msg(j.aviso,'warn'); else msg(filaEditada?'Fila actualizada.':'Fila insertada.','ok');
+          }).catch(function(){ btn.disabled=false; });
+        };
+        document.getElementById('sqNuevaFila').onclick=function(){ abrirFila(null); };
+
+        var borrando=null;
+        function pedirBorrado(idx){
+          borrando=pkDe(idx);
+          document.getElementById('sqDelWhere').textContent = Object.keys(borrando).map(function(k){ return k+'='+(borrando[k]===null?'NULL':borrando[k]); }).join(', ');
+          document.getElementById('sqDelModal').hidden=false;
+          document.addEventListener('keydown', escDel);
+        }
+        window.sqCloseDel=function(){ document.getElementById('sqDelModal').hidden=true; document.removeEventListener('keydown', escDel); };
+        function escDel(e){ if(e.key==='Escape') sqCloseDel(); }
+        document.getElementById('sqDelOk').onclick=function(){
+          if(!borrando) return;
+          var btn=this; btn.disabled=true;
+          api({op:'row_del', db:S.db, schema:S.schema, table:S.table},
+              {op:'row_del', pk:JSON.stringify(borrando)}).then(function(j){
+            btn.disabled=false; sqCloseDel();
+            if(j.error){ msg(j.error); return; }
+            cargarFilas();
+            msg(j.aviso || 'Fila borrada.', j.aviso?'warn':'ok');
+          }).catch(function(){ btn.disabled=false; });
+        };
+
+        // ---- consola SQL ----
+        var cm=null, HKEY='sqlsrv_hist_'+S.conn;
+        function initEditor(){
+          if(cm) return;
+          cm = CodeMirror.fromTextArea(document.getElementById('sqEditor'), {
+            mode:'text/x-mssql', theme:'lua', lineNumbers:true, matchBrackets:true, lineWrapping:true
+          });
+          cm.setValue('SELECT TOP 100 * FROM ');
+          cm.on('keydown', function(inst, e){
+            if((e.ctrlKey||e.metaKey) && e.key==='Enter'){ e.preventDefault(); ejecutar(); }
+          });
+          pintarHistorial();
+        }
+        function historial(){ try{ return JSON.parse(localStorage.getItem(HKEY)||'[]'); }catch(e){ return []; } }
+        function pintarHistorial(){
+          var sel=document.getElementById('sqHist'); sel.innerHTML='';
+          var o=document.createElement('option'); o.value=''; o.textContent='Historial…'; sel.appendChild(o);
+          historial().forEach(function(q){
+            var op=document.createElement('option'); op.value=q;
+            op.textContent = q.length>70 ? q.slice(0,70)+'…' : q;
+            sel.appendChild(op);
+          });
+          sel.onchange=function(){ if(sel.value){ cm.setValue(sel.value); sel.value=''; cm.focus(); } };
+        }
+        function guardarHist(q){
+          var h=historial().filter(function(x){ return x!==q; });
+          h.unshift(q); h=h.slice(0,25);
+          try{ localStorage.setItem(HKEY, JSON.stringify(h)); }catch(e){}
+          pintarHistorial();
+        }
+        function ejecutar(){
+          var sql=cm.getValue().trim();
+          if(!sql) return;
+          var out=document.getElementById('sqResultados');
+          out.innerHTML=''; msg('');
+          var wait=document.createElement('div'); wait.className='sqlx-empty'; wait.textContent='ejecutando…'; out.appendChild(wait);
+          api({op:'query', db:S.db}, {op:'query', sql:sql}).then(function(j){
+            out.innerHTML='';
+            if(j.error){ msg(j.error); return; }
+            guardarHist(sql);
+            var res=document.createElement('div'); res.className='sqlmsg ok';
+            res.textContent = (j.sets.length? j.sets.length+' conjunto(s) de resultados. ' : '')
+                            + (j.afectadas? j.afectadas+' fila(s) afectada(s). ' : '')
+                            + j.ms+' ms';
+            out.appendChild(res);
+            (j.sets||[]).forEach(function(set){
+              if(set.truncado){
+                var w=document.createElement('div'); w.className='sqlmsg warn';
+                w.textContent='Mostrando solo las primeras 1000 filas.'; out.appendChild(w);
+              }
+              var g=document.createElement('div'); g.className='sqlgrid'; g.style.marginBottom='12px';
+              var t=document.createElement('table'); t.className='sqltbl';
+              var th=document.createElement('thead'), tr=document.createElement('tr');
+              set.cols.forEach(function(c){ var x=document.createElement('th'); x.textContent=c; x.style.cursor='default'; tr.appendChild(x); });
+              th.appendChild(tr); t.appendChild(th);
+              var tb=document.createElement('tbody');
+              set.rows.forEach(function(f){
+                var r=document.createElement('tr');
+                f.forEach(function(v){ r.appendChild(celda(v,null)); });
+                tb.appendChild(r);
+              });
+              t.appendChild(tb); g.appendChild(t); out.appendChild(g);
+            });
+          }).catch(function(){ out.innerHTML=''; msg('No se pudo contactar con el panel.'); });
+        }
+        document.getElementById('sqRun').onclick=ejecutar;
+
+        // ---- pestanas internas ----
+        var vistaActual='datos';
+        function mostrarVista(v){
+          vistaActual=v;
+          document.querySelectorAll('.sqlx-views button').forEach(function(b){ b.classList.toggle('on', b.dataset.view===v); });
+          document.getElementById('sqPanelDatos').hidden      = v!=='datos';
+          document.getElementById('sqPanelEstructura').hidden = v!=='estructura';
+          document.getElementById('sqPanelSql').hidden        = v!=='sql';
+          if(v==='sql'){ initEditor(); setTimeout(function(){ cm.refresh(); cm.focus(); }, 10); }
+          if(v==='estructura') cargarEstructura();
+          if(v==='datos' && S.table) cargarFilas();
+        }
+        document.querySelectorAll('.sqlx-views button').forEach(function(b){
+          b.onclick=function(){ mostrarVista(b.dataset.view); };
+        });
+
+        elDb.onchange=cargarTablas;
+        elFilter.oninput=pintarTablas;
+        document.getElementById('sqRecargar').onclick=cargarFilas;
+        document.getElementById('sqPrev').onclick=function(){ if(S.page>1){ S.page--; cargarFilas(); } };
+        document.getElementById('sqNext').onclick=function(){ S.page++; cargarFilas(); };
+        document.getElementById('sqPer').onchange=function(){ S.per=parseInt(this.value,10)||50; S.page=1; cargarFilas(); };
+        cargarDbs();
+      })();
+      </script>
+      <?php endif; ?>
 
     <?php endif; ?>
 
@@ -5162,6 +6821,33 @@ setTimeout(ping,1500);})();
       var f = input.files && input.files[0];
       nameEl.textContent = f ? f.name : 'Elegir .sql…';
       label.classList.toggle('has-file', !!f);
+    }
+    // Dialogo nativo "Elegir carpeta": pide al watcher que lo abra (ver ajax=pickfolder_start/
+    // poll en el backend) y espera el resultado con polling. Puede tardar ~1s en aparecer
+    // (el watcher revisa la peticion cada segundo), y se espera hasta 5 minutos por si el
+    // usuario tarda en navegar hasta la carpeta correcta.
+    function luaPickFolder(btn, inputId){
+      var input = document.getElementById(inputId);
+      var orig = btn.textContent;
+      btn.disabled = true; btn.textContent = 'Abriendo…';
+      function fail(msg){ btn.disabled = false; btn.textContent = orig; if (msg) alert(msg); }
+      fetch('?ajax=pickfolder_start').then(function(r){ return r.json(); }).then(function(data){
+        if (!data || data.error) { fail(data && data.error ? data.error : 'No se pudo pedir el selector de carpetas.'); return; }
+        var tries = 0, maxTries = 430; // ~5 min a 700ms
+        var iv = setInterval(function(){
+          tries++;
+          fetch('?ajax=pickfolder_poll&id='+encodeURIComponent(data.id)).then(function(r){ return r.json(); }).then(function(d){
+            if (d.status === 'pending') {
+              if (tries >= maxTries) { clearInterval(iv); fail('El watcher no respondió a tiempo.'); }
+              return;
+            }
+            clearInterval(iv);
+            btn.disabled = false; btn.textContent = orig;
+            if (d.status === 'done' && d.path) { input.value = d.path; }
+            else if (d.status === 'error') { alert('Error al abrir el selector: ' + (d.msg || 'desconocido')); }
+          }).catch(function(){ clearInterval(iv); fail('Se perdió la conexión con el panel.'); });
+        }, 700);
+      }).catch(function(){ fail('No se pudo contactar con el panel.'); });
     }
   </script>
 

@@ -1,0 +1,17 @@
+/* LuaServer Design System — Spacing Tokens */
+:root {
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 9px;
+  --space-6: 10px;
+  --space-7: 11px;
+  --space-8: 12px;
+  --space-9: 14px;
+  --space-10: 16px;
+  --space-11: 18px;
+  --space-12: 20px;
+  --space-16: 26px;
+  --space-20: 34px;
+}
