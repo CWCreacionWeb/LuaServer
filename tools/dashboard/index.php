@@ -25,7 +25,14 @@ $CURATED = [
   'max_execution_time'  => ['label' => 'Tiempo máx. ejecución (s)','type' => 'text', 'ph' => '120'],
   'max_input_vars'      => ['label' => 'Máx. variables de entrada','type' => 'text', 'ph' => '5000'],
   'display_errors'      => ['label' => 'Mostrar errores',         'type' => 'onoff', 'ph' => ''],
-  'error_reporting'     => ['label' => 'Nivel de errores',        'type' => 'text',  'ph' => 'E_ALL'],
+  'error_reporting'     => ['label' => 'Nivel de errores',        'type' => 'select', 'ph' => '', 'options' => [
+      'E_ALL'                                  => 'Todo (E_ALL)',
+      'E_ALL & ~E_DEPRECATED & ~E_NOTICE'      => 'Todo menos avisos y deprecaciones (recomendado)',
+      'E_ALL & ~E_DEPRECATED'                  => 'Todo menos deprecaciones',
+      'E_ERROR | E_WARNING | E_PARSE'          => 'Solo errores y warnings',
+      'E_ERROR | E_PARSE'                      => 'Solo errores fatales',
+      '0'                                      => 'Ninguno',
+  ]],
 ];
 
 // URLs de las DLL de Xdebug por version de PHP (Windows NTS x64). Se rellenan tras verificar.
@@ -510,8 +517,10 @@ function render_site_card($name, $info){
     $hasCover = (bool)cover_path($ROOT,$name);
     $hasComposer = is_file($pdir.'/composer.json');
     $hasNpm = is_file($pdir.'/package.json');
+    $hasArtisan = is_file($pdir.'/artisan');
     $pType = is_array($info) ? ($info['type'] ?? null) : null;
     $pTypeLabel = project_type_label($pType);
+    $dbName = is_array($info) ? (string)($info['db'] ?? '') : '';
     ?>
           <div class="sitecard<?= $locked?' is-locked':'' ?><?= $pinned?' is-pinned':'' ?>">
             <form method="post" enctype="multipart/form-data" class="coverform" id="cover-<?= e($name) ?>">
@@ -561,8 +570,8 @@ function render_site_card($name, $info){
                 <a class="lockbtn" href="?tab=proyecto&name=<?= e(rawurlencode($name)) ?>" title="Ver detalles del proyecto" aria-label="Ver detalles del proyecto">
                   <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 1.3-.7 1.9-1.4 2.4-.6.5-1.1.9-1.1 1.6"/><line x1="12" y1="17" x2="12" y2="17.01"/></svg>
                 </a>
-                <?php if ($termOn && ($hasComposer || $hasNpm)): ?>
-                  <button type="button" class="runbtn lua-runbtn" title="Ejecutar Composer/NPM" aria-label="Ejecutar Composer/NPM" data-name="<?= e($name) ?>" data-path="<?= e(term_win($pdir)) ?>" data-composer="<?= $hasComposer?'1':'0' ?>" data-npm="<?= $hasNpm?'1':'0' ?>" data-php="<?= e($ver) ?>">
+                <?php if ($termOn && ($hasComposer || $hasNpm || $hasArtisan)): ?>
+                  <button type="button" class="runbtn lua-runbtn" title="Ejecutar Composer/NPM/Artisan" aria-label="Ejecutar Composer/NPM/Artisan" data-name="<?= e($name) ?>" data-path="<?= e(term_win($pdir)) ?>" data-composer="<?= $hasComposer?'1':'0' ?>" data-npm="<?= $hasNpm?'1':'0' ?>" data-artisan="<?= $hasArtisan?'1':'0' ?>" data-php="<?= e($ver) ?>">
                     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                   </button>
                 <?php endif; ?>
@@ -578,7 +587,7 @@ function render_site_card($name, $info){
                   </button>
                 </form>
                 <?php if (!$locked): ?>
-                  <button type="button" class="trashbtn" title="Eliminar" aria-label="Eliminar" onclick="luaAskDelete('<?= e($name) ?>')">
+                  <button type="button" class="trashbtn" title="Eliminar" aria-label="Eliminar" onclick="luaAskDelete('<?= e($name) ?>', <?= $extPath!==null?'true':'false' ?>, <?= $dbName!==''?'true':'false' ?>, '<?= e($dbName) ?>')">
                     <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
                   </button>
                 <?php endif; ?>
@@ -2188,14 +2197,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         elseif (!in_array($type,$validTypes,true)) { $msg='error:Tipo de proyecto no válido.'; }
         elseif ($type==='git' && !preg_match('#^(https?://|git@)#',$url)) { $msg='error:Introduce una URL de Git válida.'; }
         elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
+        elseif ($type==='wordpress' && !is_file($ROOT.'/config/mariadb.on')) { $msg='error:Activa MariaDB en Configuración del servidor antes de crear un proyecto WordPress.'; }
         else {
-            $id = $name.'-'.time();
             $withdb = ($_POST['withdb'] ?? '') === '1';
-            $job = ['id'=>$id,'name'=>$name,'php'=>$php,'type'=>$type,'url'=>$url,'withdb'=>$withdb];
-            @mkdir($ROOT.'/tmp/jobs', 0777, true);
-            file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
-            $labels=['blank'=>'PHP en blanco','laravel'=>'Laravel','wordpress'=>'WordPress','symfony'=>'Symfony','slim'=>'Slim','git'=>'clon de Git'];
-            $msg='job:Creando "'.$name.'" ('.$labels[$type].')… mira el progreso abajo.';
+            $job = ['id'=>null,'name'=>$name,'php'=>$php,'type'=>$type,'url'=>$url,'withdb'=>$withdb];
+            $ready = true;
+            // WordPress: la "instalacion guiada" crea la BD y un usuario de MySQL propio (aislado
+            // a esa BD, no root) con los valores EXACTOS del formulario -- no un nombre autogenerado
+            // -- y lo hace ya, de forma sincrona (mismo patron que las acciones db_create/
+            // mysql_user_create de la pestana Bases de datos), para que un fallo (BD/usuario ya
+            // existente, contrasena no valida...) se vea al instante en vez de a mitad de un job en
+            // segundo plano. El job en si (mas abajo) solo se encarga de lo lento: descargar
+            // WordPress y, con wp-cli, escribir wp-config.php e instalar el sitio en esa BD ya lista.
+            if ($type === 'wordpress') {
+                $wpDb    = trim($_POST['wp_dbname'] ?? '');
+                $wpUser  = trim($_POST['wp_dbuser'] ?? '');
+                $wpPass  = (string)($_POST['wp_dbpass'] ?? '');
+                $wpTitle = trim($_POST['wp_title'] ?? '');
+                $wpAU    = trim($_POST['wp_adminuser'] ?? '');
+                $wpAP    = (string)($_POST['wp_adminpass'] ?? '');
+                $wpAE    = trim($_POST['wp_adminemail'] ?? '');
+                $noQuotes = function($s){ return strpos($s,'"')===false && strpos($s,"\n")===false; };
+                if (!valid_dbname($wpDb)) { $msg='error:Nombre de base de datos no válido (letras, números, _).'; $ready=false; }
+                elseif (!valid_mysql_user($wpUser)) { $msg='error:Usuario de base de datos no válido (letras, números, _).'; $ready=false; }
+                elseif ($wpPass==='' || !$noQuotes($wpPass)) { $msg='error:Contraseña de base de datos no válida (no puede ir vacía ni llevar comillas dobles).'; $ready=false; }
+                elseif ($wpTitle==='' || !$noQuotes($wpTitle)) { $msg='error:Introduce un título de sitio válido (sin comillas dobles).'; $ready=false; }
+                elseif (!preg_match('/^[\w.\-]{1,60}$/', $wpAU)) { $msg='error:Usuario admin no válido.'; $ready=false; }
+                elseif ($wpAP==='' || !$noQuotes($wpAP)) { $msg='error:Contraseña de admin no válida (no puede ir vacía ni llevar comillas dobles).'; $ready=false; }
+                elseif (!filter_var($wpAE, FILTER_VALIDATE_EMAIL)) { $msg='error:Introduce un email de admin válido.'; $ready=false; }
+                else {
+                    try {
+                        $pdo = mysql_pdo();
+                        $pdo->exec('CREATE DATABASE `'.$wpDb.'` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+                        $pdo->exec("CREATE USER '".$wpUser."'@'127.0.0.1' IDENTIFIED BY ".$pdo->quote($wpPass));
+                        $pdo->exec("GRANT ALL PRIVILEGES ON `".$wpDb."`.* TO '".$wpUser."'@'127.0.0.1'");
+                        $pdo->exec('FLUSH PRIVILEGES');
+                        // Igual que mysql_user_create: se guarda para que el desplegable de
+                        // conexiones de phpMyAdmin la ofrezca sin volver a teclearla.
+                        mysql_user_save_password($ROOT, $wpUser, '127.0.0.1', $wpPass);
+                        pma_sync_servers($ROOT);
+                        $job['wpDbName']=$wpDb; $job['wpDbUser']=$wpUser; $job['wpDbPass']=$wpPass;
+                        $job['wpTitle']=$wpTitle; $job['wpAdminUser']=$wpAU; $job['wpAdminPass']=$wpAP; $job['wpAdminEmail']=$wpAE;
+                    } catch (Throwable $e) { $msg='error:No se pudo preparar la base de datos: '.$e->getMessage(); $ready=false; }
+                }
+            }
+            if ($ready) {
+                $id = $name.'-'.time();
+                $job['id'] = $id;
+                @mkdir($ROOT.'/tmp/jobs', 0777, true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $labels=['blank'=>'PHP en blanco','laravel'=>'Laravel','wordpress'=>'WordPress','symfony'=>'Symfony','slim'=>'Slim','git'=>'clon de Git'];
+                $msg='job:Creando "'.$name.'" ('.$labels[$type].')… mira el progreso abajo.';
+            }
         }
     }
     elseif ($action === 'add_external') {
@@ -2328,6 +2381,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     elseif ($action === 'clearlog') {
         $lf = safe_logname($_POST['log'] ?? '');
         if ($lf && is_file($ROOT.'/logs/apache/'.$lf)) { @file_put_contents($ROOT.'/logs/apache/'.$lf, ''); $msg='info:Log '.$lf.' vaciado.'; }
+        $back = (string)($_POST['back'] ?? '');
+        if ($back !== '' && strpos($back, '?tab=proyecto&name=') === 0) { header('Location: '.$back.'&msg='.urlencode($msg)); exit; }
         $tab='logs';
         header('Location: ?tab=logs&log='.urlencode($lf)); exit;
     }
@@ -2370,8 +2425,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         elseif (project_locked(project_dir($WWW, $cfg['sites'][$siteKey], $siteKey))) { $msg='error:"'.$siteKey.'" está bloqueado (tiene un archivo .lua). Desbloquéalo antes de eliminarlo.'; }
         else {
             $name = $siteKey;
+            $info = $cfg['sites'][$name];
+            // Externo = la carpeta ya existia fuera de www\ antes de registrarla (ver
+            // add_external): nunca se toca en disco, solo se desregistra -- es la carpeta de
+            // un proyecto/repo que le importa al usuario independientemente de lua-server.
+            $isExternal = is_array($info) && !empty($info['path']);
+            $dir = project_dir($WWW, $info, $name);
+            $dbName = is_array($info) ? (string)($info['db'] ?? '') : '';
+            $dbUser = is_array($info) ? (string)($info['dbuser'] ?? '') : '';
             unset($cfg['sites'][$name]); write_json($CFG_FILE,$cfg); lua_apply();
-            $msg='applied:Proyecto "'.$name.'" eliminado (la carpeta del proyecto se conserva).';
+            $extra = [];
+            if (!$isExternal && is_dir($dir)) {
+                $extra[] = rrmdir($dir) ? 'carpeta borrada' : 'aviso: no se pudo borrar toda la carpeta (revisa permisos)';
+            }
+            // Solo se borra la BD/usuario si quedaron anotados en sites.json al crear el
+            // proyecto (Set-SiteDb en lua.ps1) -- nunca por coincidencia de nombre, para no
+            // arriesgarse a borrar la BD de otro proyecto con un nombre parecido.
+            if ($dbName !== '' && valid_dbname($dbName)) {
+                try {
+                    $pdo = mysql_pdo();
+                    $pdo->exec('DROP DATABASE IF EXISTS `'.$dbName.'`');
+                    if ($dbUser !== '' && valid_mysql_user($dbUser)) {
+                        $pdo->exec("DROP USER IF EXISTS '".$dbUser."'@'127.0.0.1'");
+                        mysql_user_forget_password($ROOT, $dbUser, '127.0.0.1');
+                        pma_sync_servers($ROOT);
+                    }
+                    $extra[] = 'BD "'.$dbName.'" eliminada';
+                } catch (Throwable $e) { $extra[] = 'aviso: no se pudo eliminar la BD "'.$dbName.'" ('.$e->getMessage().')'; }
+            }
+            $tail = $isExternal
+                ? ' (carpeta externa: se conserva en disco'.($extra?'; '.implode('; ',$extra):'').')'
+                : ($extra ? ' ('.implode('; ',$extra).')' : ' (la carpeta ya no existía)');
+            $msg='applied:Proyecto "'.$name.'" eliminado'.$tail.'.';
         }
     }
     elseif ($action === 'integrate') {
@@ -3104,7 +3189,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').($redirName?'&name='.urlencode($redirName):'').(isset($tab_engine)?'&engine='.urlencode($tab_engine):'').'&msg='.urlencode($msg));
+    // Si "Crear proyecto"/"Registrar proyecto externo" fallo (mensaje de error), reabrir el
+    // modal al recargar -- si no, el usuario pierde de vista el formulario que acaba de
+    // rellenar y tiene que volver a abrirlo el mismo desde cero.
+    $reopenModal = in_array($action, ['create','add_external'], true) && strpos((string)$msg, 'error:') === 0;
+    header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').($redirName?'&name='.urlencode($redirName):'').(isset($tab_engine)?'&engine='.urlencode($tab_engine):'').($reopenModal?'&reopen=newproject':'').'&msg='.urlencode($msg));
     exit;
 }
 
@@ -3133,6 +3222,7 @@ $unreg = unregistered_projects($WWW, $sites);
 $tab = $_GET['tab'] ?? 'proyectos';
 $msg = $_GET['msg'] ?? '';
 [$mtype,$mtext] = array_pad(explode(':',$msg,2),2,'');
+$reopenNewProject = ($_GET['reopen'] ?? '') === 'newproject';
 $curPhp = PHP_VERSION;
 $jobs = read_jobs($ROOT.'/tmp/jobs');
 $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['running','queued'],true)){$anyJobRun=true;break;} }
@@ -3268,6 +3358,14 @@ setTimeout(ping,1500);})();
   .lockform{margin:0}
   .lockbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
   .lockbtn:hover{color:var(--ac);border-color:var(--ac)}
+  .lockbtn.on{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.12)}
+  /* Modal "fijado a la derecha": pasa de dialogo centrado a panel a pantalla completa
+     pegado al borde derecho, con el resto de la pagina interactuable (overlay sin fondo
+     ni bloqueo de clics) -- pensado para dejarlo abierto mientras se sigue trabajando. */
+  .modal-overlay.docked{background:transparent;justify-content:flex-end;align-items:stretch;padding:0;pointer-events:none}
+  .modal-overlay.docked .modal-box{pointer-events:auto}
+  .modal-box.docked{width:440px!important;max-width:440px!important;height:100vh!important;max-height:100vh!important;margin:0!important;border-radius:0!important;box-shadow:-12px 0 34px rgba(0,0,0,.4);display:flex;flex-direction:column}
+  .modal-box.docked .termout{flex:1 1 auto;height:auto!important}
   .sitecard.is-locked .lockbtn{color:var(--warn);border-color:var(--warn);background:rgba(210,153,34,.12)}
   .trashbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:1px solid transparent;border-radius:5px;color:#fff;cursor:pointer;background:linear-gradient(135deg,#ff8a80,var(--err));transition:filter .12s,transform .12s}
   .trashbtn:hover{filter:brightness(1.12)}
@@ -3286,6 +3384,8 @@ setTimeout(ping,1500);})();
   .runlink-wrap{display:inline-flex;align-items:center;gap:2px}
   .runlink-del{background:none;border:none;color:var(--mut);font-size:14px;line-height:1;cursor:pointer;padding:3px 5px;border-radius:4px;transition:color .12s,background-color .12s}
   .runlink-del:hover{color:var(--err);background:rgba(248,81,73,.10)}
+  .runlink-danger{color:var(--err)}
+  .runlink-danger:hover{color:var(--err)}
   .runbtn{display:flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0 0 0 1px;background:var(--card);border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,background-color .12s}
   .runbtn:hover{color:var(--ac);border-color:var(--ac)}
   .runbtn.running{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.14)}
@@ -3658,51 +3758,20 @@ setTimeout(ping,1500);})();
 
   <?php if ($tab==='proyectos'): ?>
 
-    <?php $mariaOn = is_file($ROOT.'/config/mariadb.on'); [$mariaCls,$mariaLbl] = svc_status($mariaOn, 3306); $termOn = is_file($ROOT.'/config/terminal.on'); $runPresets = run_presets_load($ROOT); ?>
-    <div class="topgrid">
-      <div class="card" style="grid-column:span 2">
-        <form method="post">
-          <input type="hidden" name="action" value="create">
-          <div class="inline">
-            <div>
-              <label>Nombre del proyecto</label>
-              <input name="name" placeholder="micliente" pattern="[a-z0-9][a-z0-9_-]*" required>
-            </div>
-            <div>
-              <label>Tipo</label>
-              <select name="type" onchange="document.getElementById('gitrow').style.display=(this.value==='git')?'block':'none'">
-                <option value="blank">PHP en blanco</option>
-                <option value="laravel">Laravel</option>
-                <option value="wordpress">WordPress</option>
-                <option value="symfony">Symfony</option>
-                <option value="slim">Slim</option>
-                <option value="git">Desde Git…</option>
-              </select>
-            </div>
-            <div>
-              <label>Versión de PHP</label>
-              <select name="php">
-                <?php foreach ($vers as $v): ?>
-                  <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
-                <?php endforeach; ?>
-              </select>
-            </div>
-            <button class="btn" type="submit">+ Crear</button>
-          </div>
-          <div id="gitrow" style="display:none;margin-top:12px">
-            <label>URL del repositorio Git</label>
-            <input name="url" placeholder="https://github.com/usuario/repo.git" style="width:100%">
-          </div>
-          <?php if ($mariaOn): ?>
-            <label style="display:flex;align-items:center;gap:6px;margin-top:12px;font-weight:400;cursor:pointer">
-              <input type="checkbox" name="withdb" value="1" checked style="width:auto">
-              Crear base de datos MySQL a juego (mismo nombre)
-            </label>
-          <?php endif; ?>
-        </form>
-        <div class="muted" style="margin-top:10px">Laravel/Symfony/Slim usan Composer; WordPress se descarga; Git clona el repo (y ejecuta <code>composer install</code> si hay <code>composer.json</code>). Se hace en segundo plano.<?= $mariaOn?' En Laravel, la conexión se escribe sola en el <code>.env</code>.':'' ?></div>
-      </div>
+    <?php
+      $mariaOn = is_file($ROOT.'/config/mariadb.on'); [$mariaCls,$mariaLbl] = svc_status($mariaOn, 3306); $termOn = is_file($ROOT.'/config/terminal.on');
+      // Valores por defecto de las contrasenas del wizard de WordPress: se generan en cada
+      // carga del formulario (no se guardan en ningun sitio hasta que el usuario le da a
+      // "Crear") para que ya se vea algo razonable sin escribir nada, pero siguen siendo
+      // 100% editables -- la BD se crea con lo que haya en el campo al enviar, sea el valor
+      // generado o uno propio.
+      $wpDefDbPass = bin2hex(random_bytes(6)); $wpDefAdminPass = bin2hex(random_bytes(6));
+    ?>
+    <div class="row" style="margin-bottom:14px">
+      <button type="button" class="btn" onclick="luaOpenNewProject()">+ Nuevo proyecto</button>
+    </div>
 
+    <div class="topgrid">
       <div class="card" style="display:flex;flex-direction:column">
         <div class="row" style="gap:6px">
           <div style="font-weight:600">Servidor MySQL (MariaDB) <span class="jstate <?= $mariaCls ?>" style="margin-left:6px"><?= $mariaLbl ?></span></div>
@@ -3730,36 +3799,154 @@ setTimeout(ping,1500);})();
       </div>
     </div>
 
-    <details class="card extform">
-      <summary>Registrar proyecto existente en otra carpeta del disco <span class="muted">(p.ej. <code>C:\proyectos\ersmportal</code> con dominio propio)</span></summary>
-      <form method="post" style="margin-top:14px">
-        <input type="hidden" name="action" value="add_external">
-        <div class="inline">
-          <div>
-            <label>Nombre (identificador)</label>
-            <input name="name" placeholder="ersmportal" pattern="[a-z0-9][a-z0-9_-]*" required>
-          </div>
-          <div style="flex:1;min-width:280px">
-            <label>Ruta de la carpeta en disco</label>
-            <input name="path" placeholder="C:\proyectos\ersmportal" style="width:100%" required>
-          </div>
-          <div>
-            <label>Dominio</label>
-            <input name="domain" placeholder="portal.ersm.test">
-          </div>
-          <div>
-            <label>PHP</label>
-            <select name="php">
-              <?php foreach ($vers as $v): ?>
-                <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
-              <?php endforeach; ?>
-            </select>
-          </div>
-          <button class="btn" type="submit">Registrar</button>
+    <!-- Modal: alta de proyecto, en dos partes -- arriba crear uno nuevo (con la instalacion
+         guiada de WordPress), abajo (colapsado) registrar uno ya existente en otra carpeta. -->
+    <div id="newProjectModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseNewProject()">
+      <div class="modal-box" role="dialog" aria-modal="true" style="max-width:680px;max-height:85vh;overflow-y:auto;text-align:left">
+        <div class="row" style="margin-bottom:14px">
+          <h3 style="margin:0;font-size:16px">Nuevo proyecto</h3>
+          <div class="spacer"></div>
+          <button type="button" class="lockbtn" onclick="luaCloseNewProject()" title="Cerrar" aria-label="Cerrar">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
         </div>
-        <div class="muted" style="margin-top:10px">No copia ni mueve nada: apunta el vhost a esa carpeta (usa <code>public/</code> si existe, para Laravel/Symfony). Si pones un dominio propio, luego pulsa <b>Sincronizar dominios</b> en Configuración del servidor para registrarlo en Windows.</div>
-      </form>
-    </details>
+
+        <form method="post">
+          <input type="hidden" name="action" value="create">
+          <div class="inline">
+            <div>
+              <label>Nombre del proyecto</label>
+              <input name="name" id="newprojname" placeholder="micliente" pattern="[a-z0-9][a-z0-9_-]*" required>
+            </div>
+            <div>
+              <label>Tipo</label>
+              <select name="type" id="newprojtype" onchange="luaNewProjTypeChange(this.value)">
+                <option value="blank">PHP en blanco</option>
+                <option value="laravel">Laravel</option>
+                <option value="wordpress">WordPress</option>
+                <option value="symfony">Symfony</option>
+                <option value="slim">Slim</option>
+                <option value="git">Desde Git…</option>
+              </select>
+            </div>
+            <div>
+              <label>Versión de PHP</label>
+              <select name="php">
+                <?php foreach ($vers as $v): ?>
+                  <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+                <?php endforeach; ?>
+              </select>
+            </div>
+          </div>
+          <div id="gitrow" style="display:none;margin-top:12px">
+            <label>URL del repositorio Git</label>
+            <input name="url" placeholder="https://github.com/usuario/repo.git" style="width:100%">
+          </div>
+          <?php if ($mariaOn): ?>
+            <label id="withdbrow" style="display:flex;align-items:center;gap:6px;margin-top:12px;font-weight:400;cursor:pointer">
+              <input type="checkbox" name="withdb" value="1" checked style="width:auto">
+              Crear base de datos MySQL a juego (mismo nombre)
+            </label>
+          <?php endif; ?>
+
+          <?php if ($mariaOn): ?>
+            <div id="wprow" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+              <div class="muted" style="font-size:12px;margin-bottom:10px">Instalación guiada: la base de datos, el usuario de MySQL y el sitio se crean solos con estos datos exactos -- no hace falta pasar por la pantalla de instalación de WordPress.</div>
+              <div style="font-weight:600;margin-bottom:8px;font-size:13px">Paso 2 — Base de datos</div>
+              <div class="inline">
+                <div><label>Nombre de la BD</label><input name="wp_dbname" id="wpdbname" placeholder="micliente" pattern="[a-zA-Z0-9_]{1,64}"></div>
+                <div><label>Usuario de la BD</label><input name="wp_dbuser" id="wpdbuser" placeholder="wp_micliente" pattern="[a-zA-Z0-9_]{1,32}"></div>
+                <div><label>Contraseña de la BD</label><input type="text" name="wp_dbpass" value="<?= e($wpDefDbPass) ?>" autocomplete="off"></div>
+              </div>
+              <div style="font-weight:600;margin:14px 0 8px;font-size:13px">Paso 3 — Sitio</div>
+              <div class="inline">
+                <div><label>Título del sitio</label><input name="wp_title" id="wptitle" placeholder="Mi sitio WordPress"></div>
+                <div><label>Usuario admin</label><input name="wp_adminuser" value="admin"></div>
+                <div><label>Contraseña admin</label><input type="text" name="wp_adminpass" value="<?= e($wpDefAdminPass) ?>" autocomplete="off"></div>
+                <div><label>Email admin</label><input type="email" name="wp_adminemail" placeholder="tu@email.com"></div>
+              </div>
+            </div>
+          <?php else: ?>
+            <div id="wprow" class="muted" style="display:none;margin-top:12px;font-size:12px">Activa MariaDB en <a href="?tab=config">Configuración del servidor</a> para poder crear proyectos WordPress: la instalación guiada necesita crear su base de datos.</div>
+          <?php endif; ?>
+          <div class="row" style="margin-top:16px">
+            <div class="spacer"></div>
+            <button class="btn" type="submit">+ Crear</button>
+          </div>
+        </form>
+        <div class="muted" style="margin-top:10px">Laravel/Symfony/Slim usan Composer; WordPress hace una instalación guiada completa (BD + usuario MySQL + sitio, listo para entrar a <code>/wp-admin</code>); Git clona el repo (y ejecuta <code>composer install</code> si hay <code>composer.json</code>). Se hace en segundo plano.<?= $mariaOn?' En Laravel, la conexión se escribe sola en el <code>.env</code>.':'' ?></div>
+
+        <details class="extform" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--line)">
+          <summary>Registrar proyecto existente en otra carpeta del disco <span class="muted">(p.ej. <code>C:\proyectos\micliente</code> con dominio propio)</span></summary>
+          <form method="post" style="margin-top:14px">
+            <input type="hidden" name="action" value="add_external">
+            <div class="inline">
+              <div>
+                <label>Nombre (identificador)</label>
+                <input name="name" placeholder="micliente" pattern="[a-z0-9][a-z0-9_-]*" required>
+              </div>
+              <div style="flex:1;min-width:280px">
+                <label>Ruta de la carpeta en disco</label>
+                <input name="path" placeholder="C:\proyectos\micliente" style="width:100%" required>
+              </div>
+              <div>
+                <label>Dominio</label>
+                <input name="domain" placeholder="portal.ersm.test">
+              </div>
+              <div>
+                <label>PHP</label>
+                <select name="php">
+                  <?php foreach ($vers as $v): ?>
+                    <option value="<?= e($v) ?>" <?= $v===$defaultPhp?'selected':'' ?>>PHP <?= e($v) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </div>
+              <button class="btn" type="submit">Registrar</button>
+            </div>
+            <div class="muted" style="margin-top:10px">No copia ni mueve nada: apunta el vhost a esa carpeta (usa <code>public/</code> si existe, para Laravel/Symfony). Si pones un dominio propio, luego pulsa <b>Sincronizar dominios</b> en Configuración del servidor para registrarlo en Windows.</div>
+          </form>
+        </details>
+      </div>
+    </div>
+    <script>
+      function luaOpenNewProject(){
+        document.getElementById('newProjectModal').hidden = false;
+        document.addEventListener('keydown', luaEscNewProject);
+      }
+      function luaCloseNewProject(){
+        document.getElementById('newProjectModal').hidden = true;
+        document.removeEventListener('keydown', luaEscNewProject);
+      }
+      function luaEscNewProject(e){ if(e.key==='Escape') luaCloseNewProject(); }
+      function luaNewProjTypeChange(t){
+        var isGit = (t === 'git'), isWp = (t === 'wordpress');
+        var gitrow = document.getElementById('gitrow'); if (gitrow) gitrow.style.display = isGit ? 'block' : 'none';
+        var wprow = document.getElementById('wprow'); if (wprow) wprow.style.display = isWp ? 'block' : 'none';
+        var withdbrow = document.getElementById('withdbrow'); if (withdbrow) withdbrow.style.display = isWp ? 'none' : 'flex';
+        document.querySelectorAll('#wprow input[name^="wp_"]').forEach(function(el){
+          if (isWp) el.setAttribute('required','required'); else el.removeAttribute('required');
+        });
+      }
+      (function(){
+        // Autocompleta nombre de BD/usuario/titulo a partir del nombre del proyecto, pero
+        // solo mientras el usuario no haya tocado esos campos a mano (dataset.touched):
+        // una vez editados, dejan de seguir al nombre del proyecto.
+        var nameEl = document.getElementById('newprojname');
+        var dbn = document.getElementById('wpdbname'), dbu = document.getElementById('wpdbuser'), ttl = document.getElementById('wptitle');
+        if (!nameEl) return;
+        [dbn, dbu, ttl].forEach(function(el){ if (el) el.addEventListener('input', function(){ this.dataset.touched='1'; }); });
+        nameEl.addEventListener('input', function(){
+          var v = this.value.trim();
+          var slug = v.replace(/[^a-zA-Z0-9_]/g, '_');
+          if (dbn && !dbn.dataset.touched) dbn.value = slug;
+          if (dbu && !dbu.dataset.touched) dbu.value = slug ? ('wp_' + slug).slice(0, 32) : '';
+          if (ttl && !ttl.dataset.touched) ttl.value = v;
+        });
+      })();
+      <?php if ($reopenNewProject): ?>
+      luaOpenNewProject();
+      <?php endif; ?>
+    </script>
 
     <?php if ($jobs): ?>
       <div class="row" style="margin:22px 0 10px">
@@ -3944,8 +4131,7 @@ setTimeout(ping,1500);})();
           </svg>
         </div>
         <h3 id="delTitle">¿Eliminar proyecto?</h3>
-        <p class="modal-tx">Se quitará <strong id="delName"></strong> del panel y se recargará Apache.
-          La carpeta <code>www\<span id="delFolder"></span></code> y todos sus archivos <strong>se conservan</strong> en disco.</p>
+        <p class="modal-tx">Se quitará <strong id="delName"></strong> del panel y se recargará Apache. <span id="delConsequence"></span></p>
         <form method="post" class="modal-actions">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="name" id="delNameInput">
@@ -3955,9 +4141,19 @@ setTimeout(ping,1500);})();
       </div>
     </div>
     <script>
-      function luaAskDelete(name){
+      // isExternal/hasDb/dbName vienen de datos ya validados por valid_name()/valid_dbname()
+      // (solo letras/numeros/_/-), nunca texto libre -- por eso es seguro construir este HTML
+      // por concatenacion simple, sin pasar por textContent.
+      function luaAskDelete(name, isExternal, hasDb, dbName){
         document.getElementById('delName').textContent = name;
-        document.getElementById('delFolder').textContent = name;
+        var cons = document.getElementById('delConsequence');
+        if (isExternal) {
+          cons.innerHTML = 'Es una carpeta externa (fuera de <code>www\\</code>): <strong>no se toca en disco</strong>.'
+            + (hasDb ? ' Se eliminará la base de datos "'+dbName+'".' : '');
+        } else {
+          cons.innerHTML = 'Se borrará también <strong>la carpeta del proyecto</strong> (<code>www\\'+name+'</code>) y todo su contenido, de forma <strong>permanente</strong>.'
+            + (hasDb ? ' También se eliminará la base de datos "'+dbName+'" y su usuario de MySQL.' : '');
+        }
         document.getElementById('delNameInput').value = name;
         document.getElementById('delModal').hidden = false;
         document.addEventListener('keydown', luaEscDelete);
@@ -4002,244 +4198,6 @@ setTimeout(ping,1500);})();
       function luaEscDeleteUnreg(e){ if(e.key==='Escape') luaCloseDeleteUnreg(); }
     </script>
 
-    <!-- Modal: runner de Composer/NPM por proyecto (reutiliza los endpoints de la Terminal) -->
-    <div id="runnerModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseRunner()">
-      <div class="modal-box" role="dialog" aria-modal="true" style="max-width:640px;text-align:left">
-        <div class="row" style="margin-bottom:10px">
-          <h3 id="runnerTitle" style="margin:0;font-size:16px">Ejecutar</h3>
-          <div class="spacer"></div>
-          <a href="javascript:void(0)" id="runnerStop" class="runlink off">Detener</a>
-          <button type="button" class="lockbtn" onclick="luaCloseRunner()" title="Cerrar" aria-label="Cerrar">
-            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-          </button>
-        </div>
-        <div id="runnerBtns" class="row" style="gap:6px 16px;margin-bottom:10px;flex-wrap:wrap"></div>
-        <div class="row" style="gap:6px;margin-bottom:10px">
-          <input type="text" id="runnerCustomCmd" placeholder="Comando personalizado, p.ej. npm run dev" style="flex:1" maxlength="200">
-          <button type="button" class="btn-git sm" id="runnerRunBtn" title="Ejecutar una vez, sin guardarlo">Ejecutar</button>
-          <button type="button" class="btn ghost sm" id="runnerAddBtn" title="Guardar como acceso rápido y ejecutarlo">+ Guardar</button>
-        </div>
-        <div id="runnerOut" class="termout" style="height:280px;border:1px solid var(--line);border-radius:6px;background:var(--in)"></div>
-        <div class="row" style="margin-top:6px;justify-content:flex-end">
-          <a href="javascript:void(0)" id="runnerClear" class="runlink">Limpiar consola</a>
-        </div>
-      </div>
-    </div>
-    <script>
-      (function(){
-        var modal=document.getElementById('runnerModal'), title=document.getElementById('runnerTitle'),
-            btnsEl=document.getElementById('runnerBtns'), out=document.getElementById('runnerOut'),
-            stopBtn=document.getElementById('runnerStop'), clearBtn=document.getElementById('runnerClear'),
-            addBtn=document.getElementById('runnerAddBtn'), runOnceBtn=document.getElementById('runnerRunBtn'),
-            customInput=document.getElementById('runnerCustomCmd');
-        // runs: comandos en marcha por proyecto (clave = ruta). Sobreviven a cerrar el
-        // modal -- el comando sigue en marcha en segundo plano (proceso propio de Windows,
-        // WScript.Shell.Run, independiente de esta página) y el play de la card se marca
-        // en verde mientras dure.
-        var runs={}, curPath=null, curName=null, curPhpVer=null, curBuiltins=[];
-        var savedPresets=<?= json_encode($runPresets, JSON_UNESCAPED_SLASHES) ?>;
-        var LS_KEY='lua_runner_jobs';
-
-        function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-        var ANSI={30:'k',31:'r',32:'g',33:'y',34:'b',35:'m',36:'c',37:'w',90:'K',91:'R',92:'G',93:'Y',94:'B',95:'M',96:'C',97:'W'};
-        function ansiToHtml(s){
-          var res='', open=false, cls='', bold=false;
-          var re=/\x1b\[([0-9;]*)m/g, last=0, m;
-          function span(t){ if(!t)return; if(open){res+='<span class="a-'+cls+(bold?' a-bold':'')+'">'+esc(t)+'</span>';} else {res+=esc(t);} }
-          while((m=re.exec(s))!==null){
-            span(s.slice(last,m.index)); last=re.lastIndex;
-            var codes=m[1].split(';').filter(x=>x!=='').map(Number); if(codes.length===0)codes=[0];
-            codes.forEach(function(c){ if(c===0){open=false;cls='';bold=false;} else if(c===1){bold=true;} else if(ANSI[c]){cls=ANSI[c];open=true;} });
-          }
-          span(s.slice(last));
-          return res;
-        }
-        function setButtons(disabled){ Array.from(btnsEl.querySelectorAll('button')).forEach(function(b){ b.disabled=disabled; }); }
-        function findBtn(p){ return Array.from(document.querySelectorAll('.lua-runbtn')).find(function(b){ return b.dataset.path===p; }) || null; }
-        function markBtn(p, on){ var b=findBtn(p); if(b) b.classList.toggle('running', !!on); }
-        function saveJobs(){
-          var o={};
-          Object.keys(runs).forEach(function(p){ var r=runs[p]; if(r.runid) o[p]={sid:r.sid,runid:r.runid,name:r.name,phpVer:r.phpVer,cmd:r.cmd}; });
-          try{ localStorage.setItem(LS_KEY, JSON.stringify(o)); }catch(e){}
-        }
-        function renderOut(p){ if(curPath===p && !modal.hidden){ out.innerHTML=runs[p].html; out.scrollTop=out.scrollHeight; } }
-
-        // Icono de terminal (estatico, sin datos de usuario -> innerHTML es seguro aqui).
-        var TERM_ICON='<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>';
-        // El texto del comando se anade aparte con createTextNode (nunca con innerHTML):
-        // los comandos guardados son texto libre del usuario y podrian llevar '<'/'>'/comillas
-        // que romperian el HTML (o un atributo onclick="..." armado a mano) si se insertaran tal cual.
-        function runlink(text, onClick, title){
-          var b=document.createElement('button');
-          b.type='button'; b.className='runlink'; if(title) b.title=title;
-          b.innerHTML=TERM_ICON; b.appendChild(document.createTextNode(text));
-          b.onclick=onClick;
-          return b;
-        }
-        function renderBtns(){
-          btnsEl.innerHTML='';
-          curBuiltins.forEach(function(p){
-            btnsEl.appendChild(runlink(p[0], function(){ luaRunPreset(p[1]); }));
-          });
-          savedPresets.forEach(function(cmd){
-            var wrap=document.createElement('span');
-            wrap.className='runlink-wrap';
-            wrap.appendChild(runlink(cmd, function(){ luaRunPreset(cmd); }, 'Ejecutar'));
-            var d=document.createElement('button');
-            d.type='button'; d.className='runlink-del'; d.textContent='×'; d.title='Eliminar acceso rapido';
-            d.onclick=function(){ luaDelPreset(cmd); };
-            wrap.appendChild(d);
-            btnsEl.appendChild(wrap);
-          });
-        }
-
-        function finishRun(p){
-          delete runs[p];
-          saveJobs();
-          markBtn(p, false);
-          if(curPath===p){ stopBtn.classList.add('off'); setButtons(false); }
-        }
-        function pollRun(p){
-          var r=runs[p]; if(!r) return;
-          fetch('?action=term_poll&sid='+r.sid+'&runid='+r.runid+'&off='+r.off)
-          .then(function(resp){ return resp.json(); })
-          .then(function(j){
-            r=runs[p]; if(!r) return;
-            if(j.error){ r.html+='<span class="a-r">'+esc(j.error)+'</span>\n'; renderOut(p); finishRun(p); return; }
-            if(j.data){ r.html+=ansiToHtml(j.data); r.off=j.off; }
-            if(j.done){
-              if(r.html && !r.html.endsWith('\n')) r.html+='\n';
-              r.html+='<span class="'+(j.code?'a-r':'a-g')+'">[salida '+(j.code||0)+']</span>\n';
-              renderOut(p); finishRun(p);
-            } else { renderOut(p); setTimeout(function(){ pollRun(p); }, 500); }
-          }).catch(function(){
-            r=runs[p]; if(!r) return;
-            r.fails=(r.fails||0)+1;
-            if(r.fails>=5){ r.html+='<span class="a-r">[error de red]</span>\n'; renderOut(p); finishRun(p); return; }
-            setTimeout(function(){ pollRun(p); }, 700);
-          });
-        }
-        function startRun(p, name, phpVer, cmd){
-          if(runs[p]) return;
-          var sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
-          runs[p]={sid:sid, runid:null, name:name, phpVer:phpVer, cmd:cmd, off:0,
-            html:'<span class="a-prompt">&gt; </span>'+esc(cmd)+'\n'};
-          markBtn(p, true);
-          if(curPath===p){ setButtons(true); stopBtn.classList.remove('off'); }
-          renderOut(p);
-          var full='cd /d "'+p+'" && '+cmd;
-          fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'action=term_run&sid='+sid+'&php='+encodeURIComponent(phpVer||'')+'&cmd='+encodeURIComponent(full)})
-          .then(function(resp){ return resp.json(); })
-          .then(function(j){
-            var r=runs[p]; if(!r) return;
-            if(j.error){ r.html+='<span class="a-r">'+esc(j.error)+'</span>\n'; renderOut(p); finishRun(p); return; }
-            r.runid=j.runid; saveJobs(); pollRun(p);
-          }).catch(function(){
-            var r=runs[p]; if(!r) return;
-            r.html+='<span class="a-r">[no se pudo lanzar]</span>\n'; renderOut(p); finishRun(p);
-          });
-        }
-
-        window.luaRunPreset=function(cmd){
-          if(!curPath || runs[curPath]) return;
-          startRun(curPath, curName, curPhpVer, cmd);
-        };
-        stopBtn.onclick=function(){
-          var r=curPath && runs[curPath];
-          if(!r || !r.runid) return;
-          stopBtn.classList.add('off');
-          fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'action=term_stop&sid='+r.sid+'&runid='+r.runid}).then(function(){});
-        };
-        // Solo vacia el papel visible (y el acumulado en memoria, para que el proximo
-        // poll no lo vuelva a pintar entero): no toca el comando que siga en marcha.
-        clearBtn.onclick=function(){
-          out.innerHTML='';
-          if(curPath && runs[curPath]) runs[curPath].html='';
-        };
-
-        function luaDelPreset(cmd){
-          fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'action=run_preset_del&cmd='+encodeURIComponent(cmd)})
-          .then(r=>r.json()).then(function(j){
-            if(j.presets){ savedPresets=j.presets; renderBtns(); }
-          });
-        }
-        // Ejecuta el comando del cuadro tal cual, sin pasar por run_preset_add: para
-        // comandos puntuales que no hace falta guardar como acceso rapido.
-        runOnceBtn.onclick=function(){
-          var cmd=customInput.value.trim();
-          if(!cmd || !curPath || runs[curPath]) return;
-          startRun(curPath, curName, curPhpVer, cmd);
-        };
-        addBtn.onclick=function(){
-          var cmd=customInput.value.trim();
-          if(!cmd || (curPath && runs[curPath])) return;
-          addBtn.disabled=true;
-          fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
-            body:'action=run_preset_add&cmd='+encodeURIComponent(cmd)})
-          .then(r=>r.json()).then(function(j){
-            addBtn.disabled=false;
-            if(j.error){ out.insertAdjacentHTML('beforeend','<span class="a-r">'+esc(j.error)+'</span>\n'); return; }
-            savedPresets=j.presets; customInput.value=''; renderBtns();
-            luaRunPreset(cmd);
-          }).catch(function(){ addBtn.disabled=false; });
-        };
-        customInput.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); addBtn.click(); } });
-
-        window.luaOpenRunner=function(name, projectPath, hasComposer, hasNpm, phpVersion){
-          curPath=projectPath; curName=name; curPhpVer=phpVersion||null;
-          title.textContent='Ejecutar en '+name;
-          customInput.value='';
-          curBuiltins=[];
-          if(hasComposer){ curBuiltins.push(['composer install','composer install'],['composer update','composer update']); }
-          if(hasNpm){ curBuiltins.push(['npm install','npm install'],['npm run build','npm run build']); }
-          renderBtns();
-          var r=runs[curPath];
-          if(r){ out.innerHTML=r.html; out.scrollTop=out.scrollHeight; setButtons(true); stopBtn.classList.remove('off'); }
-          else { out.innerHTML=''; setButtons(false); stopBtn.classList.add('off'); }
-          modal.hidden=false;
-          document.addEventListener('keydown', luaEscRunner);
-        };
-        // Delegado (no onclick inline): la ruta del proyecto lleva backslashes, y un
-        // atributo onclick="...'C:\personal\...'" se compila como CODIGO JS, donde \p, \L,
-        // \w, \a etc. son secuencias de escape que el navegador consume en silencio (la
-        // barra desaparece) — "C:\personal\LuaServer" acababa llegando como
-        // "C:personalLuaServer" y el "cd /d" fallaba siempre. Con data-* (texto plano, sin
-        // parseo JS) el path llega intacto.
-        document.addEventListener('click', function(e){
-          var btn = e.target.closest('.lua-runbtn');
-          if (!btn) return;
-          luaOpenRunner(btn.dataset.name, btn.dataset.path, btn.dataset.composer==='1', btn.dataset.npm==='1', btn.dataset.php);
-        });
-        // Cerrar el modal ya NO mata el comando: sigue en marcha en segundo plano (el
-        // play de la card queda en verde) y se puede reabrir luego para verlo o pararlo.
-        window.luaCloseRunner=function(){
-          modal.hidden=true;
-          document.removeEventListener('keydown', luaEscRunner);
-        };
-        function luaEscRunner(e){ if(e.key==='Escape') luaCloseRunner(); }
-
-        // Reengancha, al cargar la página, los comandos que quedaron corriendo en segundo
-        // plano de una carga anterior (recarga, cambio de pestaña...): el proceso de
-        // Windows es independiente de esta página (WScript.Shell.Run), solo hace falta
-        // recuperar el sid/runid guardados para retomar el polling.
-        (function reconnect(){
-          var saved={};
-          try{ saved=JSON.parse(localStorage.getItem(LS_KEY)||'{}')||{}; }catch(e){}
-          Object.keys(saved).forEach(function(p){
-            var j=saved[p];
-            if(!j||!j.sid||!j.runid) return;
-            runs[p]={sid:j.sid, runid:j.runid, name:j.name, phpVer:j.phpVer, cmd:j.cmd, off:0,
-              html:'<span class="a-prompt">&gt; </span>'+esc(j.cmd||'')+'\n'};
-            markBtn(p, true);
-            pollRun(p);
-          });
-        })();
-      })();
-    </script>
-
   <?php elseif ($tab==='proyecto'): /* ---------- FICHA DE PROYECTO ---------- */
       $pName = (string)($_GET['name'] ?? '');
       // Acepta un name= con distinto casing/espacios que la clave real de sites.json
@@ -4263,6 +4221,8 @@ setTimeout(ping,1500);})();
         $pCoverFile = cover_path($ROOT, $pName);
         $pHasComposer = is_file($pDir.'/composer.json');
         $pHasNpm = is_file($pDir.'/package.json');
+        $pHasArtisan = is_file($pDir.'/artisan');
+        $termOn = is_file($ROOT.'/config/terminal.on');
         $pGit = is_dir($pDir) ? git_info($pDir) : null;
         $pErrLog = tail_file($ROOT.'/logs/apache/'.$pName.'-error.log', 200);
         $pType = is_array($pInfo) ? ($pInfo['type'] ?? null) : null;
@@ -4279,6 +4239,11 @@ setTimeout(ping,1500);})();
             <?php if ($pExtPath): ?><span class="exttag" title="Proyecto externo: <?= e($pExtPath) ?>">ext</span><?php endif; ?>
             <span class="jstate <?= $pLocked?'warn':'ok' ?>"><?= $pLocked?'Bloqueado':'Desbloqueado' ?></span>
             <span class="jstate run">PHP <?= e($pVer) ?></span>
+            <?php if ($termOn && ($pHasComposer || $pHasNpm || $pHasArtisan)): ?>
+              <button type="button" class="runbtn lua-runbtn" title="Ejecutar Composer/NPM/Artisan" aria-label="Ejecutar Composer/NPM/Artisan" data-name="<?= e($pName) ?>" data-path="<?= e(term_win($pDir)) ?>" data-composer="<?= $pHasComposer?'1':'0' ?>" data-npm="<?= $pHasNpm?'1':'0' ?>" data-artisan="<?= $pHasArtisan?'1':'0' ?>" data-php="<?= e($pVer) ?>">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              </button>
+            <?php endif; ?>
           </div>
           <a class="url" href="http://<?= e($pDom) ?>" target="_blank" style="display:inline-block;margin-top:6px">http://<?= e($pDom) ?> &#8599;</a>
           <form method="post" class="inline" style="margin-top:6px;gap:6px">
@@ -4291,6 +4256,7 @@ setTimeout(ping,1500);})();
           <div class="row" style="margin-top:10px;gap:6px">
             <?php if ($pHasComposer): ?><span class="tag">composer.json</span><?php endif; ?>
             <?php if ($pHasNpm): ?><span class="tag">package.json</span><?php endif; ?>
+            <?php if ($pHasArtisan): ?><span class="tag">artisan</span><?php endif; ?>
             <?php if ($pGit): ?><span class="tag">git &middot; <?= e($pGit['branch']) ?></span><?php endif; ?>
           </div>
         </div>
@@ -4341,6 +4307,9 @@ setTimeout(ping,1500);})();
             <span class="muted" style="font-size:12px"><?= e($pName) ?>-error.log</span>
             <div class="spacer"></div>
             <a class="btn ghost sm" href="?tab=logs&log=<?= urlencode($pName.'-error.log') ?>">Ver completo</a>
+            <?php if ($pErrLog!==''): ?>
+              <button type="button" class="btn ghost sm" onclick="luaAskClearProjLog()">Vaciar</button>
+            <?php endif; ?>
           </div>
           <?php if ($pErrLog===''): ?>
             <div class="muted">Sin errores recientes.</div>
@@ -4349,6 +4318,38 @@ setTimeout(ping,1500);})();
           <?php endif; ?>
         </div>
       </div>
+
+      <!-- Modal de confirmacion de vaciado del log de errores de este proyecto -->
+      <div id="clearProjLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseClearProjLog()">
+        <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="clearProjLogTitle">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+            </svg>
+          </div>
+          <h3 id="clearProjLogTitle">¿Vaciar el log?</h3>
+          <p class="modal-tx">Se borrará todo el contenido de <strong><?= e($pName) ?>-error.log</strong>. Esto no se puede deshacer.</p>
+          <form method="post" class="modal-actions">
+            <input type="hidden" name="action" value="clearlog">
+            <input type="hidden" name="log" value="<?= e($pName.'-error.log') ?>">
+            <input type="hidden" name="back" value="?tab=proyecto&name=<?= e(rawurlencode($pName)) ?>">
+            <button type="button" class="btn ghost" onclick="luaCloseClearProjLog()">Cancelar</button>
+            <button type="submit" class="btn danger">Sí, vaciar</button>
+          </form>
+        </div>
+      </div>
+      <script>
+        function luaAskClearProjLog(){
+          document.getElementById('clearProjLogModal').hidden = false;
+          document.addEventListener('keydown', luaEscClearProjLog);
+        }
+        function luaCloseClearProjLog(){
+          document.getElementById('clearProjLogModal').hidden = true;
+          document.removeEventListener('keydown', luaEscClearProjLog);
+        }
+        function luaEscClearProjLog(e){ if(e.key==='Escape') luaCloseClearProjLog(); }
+      </script>
 
       <div class="pgrid2">
       <div class="card">
@@ -4631,6 +4632,20 @@ setTimeout(ping,1500);})();
                     <select name="ini[<?= e($k) ?>]" style="width:100%">
                       <option value="On"  <?= strcasecmp($cur,'On')===0?'selected':''  ?>>On</option>
                       <option value="Off" <?= strcasecmp($cur,'Off')===0?'selected':'' ?>>Off</option>
+                    </select>
+                  <?php elseif ($meta['type']==='select'):
+                    $curNorm = preg_replace('/\s+/', '', $cur);
+                    $known = false;
+                    foreach ($meta['options'] as $optVal=>$optLabel) { if ($curNorm !== '' && preg_replace('/\s+/', '', $optVal) === $curNorm) { $known = true; break; } } ?>
+                    <select name="ini[<?= e($k) ?>]" style="width:100%">
+                      <option value="">(por defecto de PHP)</option>
+                      <?php foreach ($meta['options'] as $optVal=>$optLabel):
+                        $match = $curNorm !== '' && preg_replace('/\s+/', '', $optVal) === $curNorm; ?>
+                        <option value="<?= e($optVal) ?>" <?= $match?'selected':'' ?>><?= e($optLabel) ?></option>
+                      <?php endforeach; ?>
+                      <?php if ($cur !== '' && !$known): ?>
+                        <option value="<?= e($cur) ?>" selected>Personalizado: <?= e($cur) ?></option>
+                      <?php endif; ?>
                     </select>
                   <?php else: ?>
                     <input name="ini[<?= e($k) ?>]" value="<?= e($cur) ?>" placeholder="<?= e($meta['ph']) ?>" style="width:100%">
@@ -6367,6 +6382,9 @@ setTimeout(ping,1500);})();
             <h3 id="dockerTermTitle" style="margin:0;font-size:16px">Terminal</h3>
             <div class="spacer"></div>
             <button type="button" class="btn ghost sm" id="dockerTermStop" disabled>Detener</button>
+            <button type="button" class="lockbtn" id="dockerTermDockBtn" title="Fijar a la derecha" aria-label="Fijar a la derecha">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+            </button>
             <button type="button" class="btn ghost sm" onclick="luaCloseDockerTerm()">Cerrar</button>
           </div>
           <div id="dockerTermOut" class="termout" style="height:320px;border:1px solid var(--line);border-radius:6px;background:var(--in)"></div>
@@ -6380,8 +6398,19 @@ setTimeout(ping,1500);})();
         (function(){
           var modal=document.getElementById('dockerTermModal'), title=document.getElementById('dockerTermTitle'),
               out=document.getElementById('dockerTermOut'), inp=document.getElementById('dockerTermCmd'),
-              stopBtn=document.getElementById('dockerTermStop');
+              stopBtn=document.getElementById('dockerTermStop'),
+              dockBtn=document.getElementById('dockerTermDockBtn'), box=modal.querySelector('.modal-box');
           var sid=null, containerId=null, running=false, curRun=null;
+          var DOCK_KEY='lua_dock_dockerterm';
+          function setDocked(on){
+            modal.classList.toggle('docked', on);
+            box.classList.toggle('docked', on);
+            dockBtn.classList.toggle('on', on);
+            try{ localStorage.setItem(DOCK_KEY, on?'1':'0'); }catch(e){}
+          }
+          dockBtn.onclick=function(){ setDocked(!box.classList.contains('docked')); };
+          var dockSaved='0'; try{ dockSaved=localStorage.getItem(DOCK_KEY)||'0'; }catch(e){}
+          setDocked(dockSaved==='1');
           function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
           var ANSI={30:'k',31:'r',32:'g',33:'y',34:'b',35:'m',36:'c',37:'w',90:'K',91:'R',92:'G',93:'Y',94:'B',95:'M',96:'C',97:'W'};
           function ansiToHtml(s){
@@ -6651,8 +6680,8 @@ setTimeout(ping,1500);})();
           <li>No es una terminal interactiva completa (PTY): programas a pantalla completa como <code>vim</code> o <code>nano</code> no funcionan.</li>
           <li>Historial con las flechas ↑/↓ y <code>Ctrl+L</code> para limpiar.</li>
         </ul>
-        <h4>Ejecutar Composer / NPM en un proyecto</h4>
-        <p>En cada card con <code>composer.json</code> o <code>package.json</code> aparece un botón de <strong>play</strong> que abre un modal para lanzar comandos sobre ese proyecto (<code>composer install</code>, <code>npm run dev</code>…). Puedes escribir <strong>comandos personalizados y guardarlos</strong> como accesos rápidos reutilizables. El runner usa el PHP propio del proyecto automáticamente.</p>
+        <h4>Ejecutar Composer / NPM / Artisan en un proyecto</h4>
+        <p>En cada card con <code>composer.json</code>, <code>package.json</code> o <code>artisan</code> aparece un botón de <strong>play</strong> (también en la ficha del proyecto) que abre un modal para lanzar comandos sobre ese proyecto (<code>composer install</code>, <code>npm run dev</code>, <code>php artisan migrate</code>…). Puedes escribir <strong>comandos personalizados y guardarlos</strong> como accesos rápidos reutilizables. El runner usa el PHP propio del proyecto automáticamente. Los comandos destructivos (como <code>migrate:fresh</code>) se marcan en rojo y piden confirmación antes de ejecutarse.</p>
       </section>
 
       <section id="lan">
@@ -6811,6 +6840,278 @@ setTimeout(ping,1500);})();
   <?php endif; ?>
 
   </div>
+
+  <?php $luaRunnerOn = is_file($ROOT.'/config/terminal.on'); if ($luaRunnerOn && in_array($tab, ['proyectos','proyecto'], true)): $runPresets = run_presets_load($ROOT); ?>
+  <!-- Modal: runner de Composer/NPM/Artisan por proyecto (reutiliza los endpoints de la Terminal).
+       Compartido entre la lista de proyectos y la ficha de un proyecto: un solo modal, un solo
+       listener delegado, sin importar desde que pestana se abrio. -->
+  <div id="runnerModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseRunner()">
+    <div class="modal-box" role="dialog" aria-modal="true" style="max-width:640px;text-align:left">
+      <div class="row" style="margin-bottom:10px">
+        <h3 id="runnerTitle" style="margin:0;font-size:16px">Ejecutar</h3>
+        <div class="spacer"></div>
+        <a href="javascript:void(0)" id="runnerStop" class="runlink off">Detener</a>
+        <button type="button" class="lockbtn" id="runnerDockBtn" title="Fijar a la derecha" aria-label="Fijar a la derecha">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+        </button>
+        <button type="button" class="lockbtn" onclick="luaCloseRunner()" title="Cerrar" aria-label="Cerrar">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div id="runnerBtns" class="row" style="gap:6px 16px;margin-bottom:10px;flex-wrap:wrap"></div>
+      <div class="row" style="gap:6px;margin-bottom:10px">
+        <input type="text" id="runnerCustomCmd" placeholder="Comando personalizado, p.ej. npm run dev" style="flex:1" maxlength="200">
+        <button type="button" class="btn-git sm" id="runnerRunBtn" title="Ejecutar una vez, sin guardarlo">Ejecutar</button>
+        <button type="button" class="btn ghost sm" id="runnerAddBtn" title="Guardar como acceso rápido y ejecutarlo">+ Guardar</button>
+      </div>
+      <div id="runnerOut" class="termout" style="height:280px;border:1px solid var(--line);border-radius:6px;background:var(--in)"></div>
+      <div class="row" style="margin-top:6px;justify-content:flex-end">
+        <a href="javascript:void(0)" id="runnerClear" class="runlink">Limpiar consola</a>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function(){
+      var modal=document.getElementById('runnerModal'), title=document.getElementById('runnerTitle'),
+          btnsEl=document.getElementById('runnerBtns'), out=document.getElementById('runnerOut'),
+          stopBtn=document.getElementById('runnerStop'), clearBtn=document.getElementById('runnerClear'),
+          addBtn=document.getElementById('runnerAddBtn'), runOnceBtn=document.getElementById('runnerRunBtn'),
+          customInput=document.getElementById('runnerCustomCmd'),
+          dockBtn=document.getElementById('runnerDockBtn'), box=modal.querySelector('.modal-box');
+      // runs: comandos en marcha por proyecto (clave = ruta). Sobreviven a cerrar el
+      // modal -- el comando sigue en marcha en segundo plano (proceso propio de Windows,
+      // WScript.Shell.Run, independiente de esta página) y el play de la card se marca
+      // en verde mientras dure.
+      var runs={}, curPath=null, curName=null, curPhpVer=null, curBuiltins=[];
+      var savedPresets=<?= json_encode($runPresets, JSON_UNESCAPED_SLASHES) ?>;
+      var LS_KEY='lua_runner_jobs';
+      var DOCK_KEY='lua_dock_runner';
+      // "Fijar a la derecha": recuerda la preferencia entre aperturas (localStorage), no
+      // solo mientras el modal esta abierto -- si el usuario lo fijo la ultima vez, lo
+      // vuelve a abrir fijado.
+      function setDocked(on){
+        modal.classList.toggle('docked', on);
+        box.classList.toggle('docked', on);
+        dockBtn.classList.toggle('on', on);
+        try{ localStorage.setItem(DOCK_KEY, on?'1':'0'); }catch(e){}
+      }
+      dockBtn.onclick=function(){ setDocked(!box.classList.contains('docked')); };
+      var dockSaved='0'; try{ dockSaved=localStorage.getItem(DOCK_KEY)||'0'; }catch(e){}
+      setDocked(dockSaved==='1');
+
+      function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+      var ANSI={30:'k',31:'r',32:'g',33:'y',34:'b',35:'m',36:'c',37:'w',90:'K',91:'R',92:'G',93:'Y',94:'B',95:'M',96:'C',97:'W'};
+      function ansiToHtml(s){
+        var res='', open=false, cls='', bold=false;
+        var re=/\x1b\[([0-9;]*)m/g, last=0, m;
+        function span(t){ if(!t)return; if(open){res+='<span class="a-'+cls+(bold?' a-bold':'')+'">'+esc(t)+'</span>';} else {res+=esc(t);} }
+        while((m=re.exec(s))!==null){
+          span(s.slice(last,m.index)); last=re.lastIndex;
+          var codes=m[1].split(';').filter(x=>x!=='').map(Number); if(codes.length===0)codes=[0];
+          codes.forEach(function(c){ if(c===0){open=false;cls='';bold=false;} else if(c===1){bold=true;} else if(ANSI[c]){cls=ANSI[c];open=true;} });
+        }
+        span(s.slice(last));
+        return res;
+      }
+      function setButtons(disabled){ Array.from(btnsEl.querySelectorAll('button')).forEach(function(b){ b.disabled=disabled; }); }
+      function findBtn(p){ return Array.from(document.querySelectorAll('.lua-runbtn')).find(function(b){ return b.dataset.path===p; }) || null; }
+      function markBtn(p, on){ var b=findBtn(p); if(b) b.classList.toggle('running', !!on); }
+      function saveJobs(){
+        var o={};
+        Object.keys(runs).forEach(function(p){ var r=runs[p]; if(r.runid) o[p]={sid:r.sid,runid:r.runid,name:r.name,phpVer:r.phpVer,cmd:r.cmd}; });
+        try{ localStorage.setItem(LS_KEY, JSON.stringify(o)); }catch(e){}
+      }
+      function renderOut(p){ if(curPath===p && !modal.hidden){ out.innerHTML=runs[p].html; out.scrollTop=out.scrollHeight; } }
+
+      // Icono de terminal (estatico, sin datos de usuario -> innerHTML es seguro aqui).
+      var TERM_ICON='<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>';
+      // El texto del comando se anade aparte con createTextNode (nunca con innerHTML):
+      // los comandos guardados son texto libre del usuario y podrian llevar '<'/'>'/comillas
+      // que romperian el HTML (o un atributo onclick="..." armado a mano) si se insertaran tal cual.
+      function runlink(text, onClick, title, danger){
+        var b=document.createElement('button');
+        b.type='button'; b.className='runlink'+(danger?' runlink-danger':''); if(title) b.title=title;
+        b.innerHTML=TERM_ICON; b.appendChild(document.createTextNode(text));
+        b.onclick=onClick;
+        return b;
+      }
+      function renderBtns(){
+        btnsEl.innerHTML='';
+        curBuiltins.forEach(function(p){
+          var danger=!!p[2];
+          btnsEl.appendChild(runlink(p[0], function(){
+            if(danger && !confirm('¿Seguro que quieres ejecutar "'+p[1]+'" en '+curName+'? No se puede deshacer.')) return;
+            luaRunPreset(p[1]);
+          }, danger?'Accion destructiva':undefined, danger));
+        });
+        savedPresets.forEach(function(cmd){
+          var wrap=document.createElement('span');
+          wrap.className='runlink-wrap';
+          wrap.appendChild(runlink(cmd, function(){ luaRunPreset(cmd); }, 'Ejecutar'));
+          var d=document.createElement('button');
+          d.type='button'; d.className='runlink-del'; d.textContent='×'; d.title='Eliminar acceso rapido';
+          d.onclick=function(){ luaDelPreset(cmd); };
+          wrap.appendChild(d);
+          btnsEl.appendChild(wrap);
+        });
+      }
+
+      function finishRun(p){
+        delete runs[p];
+        saveJobs();
+        markBtn(p, false);
+        if(curPath===p){ stopBtn.classList.add('off'); setButtons(false); }
+      }
+      function pollRun(p){
+        var r=runs[p]; if(!r) return;
+        fetch('?action=term_poll&sid='+r.sid+'&runid='+r.runid+'&off='+r.off)
+        .then(function(resp){ return resp.json(); })
+        .then(function(j){
+          r=runs[p]; if(!r) return;
+          if(j.error){ r.html+='<span class="a-r">'+esc(j.error)+'</span>\n'; renderOut(p); finishRun(p); return; }
+          if(j.data){ r.html+=ansiToHtml(j.data); r.off=j.off; }
+          if(j.done){
+            if(r.html && !r.html.endsWith('\n')) r.html+='\n';
+            r.html+='<span class="'+(j.code?'a-r':'a-g')+'">[salida '+(j.code||0)+']</span>\n';
+            renderOut(p); finishRun(p);
+          } else { renderOut(p); setTimeout(function(){ pollRun(p); }, 500); }
+        }).catch(function(){
+          r=runs[p]; if(!r) return;
+          r.fails=(r.fails||0)+1;
+          if(r.fails>=5){ r.html+='<span class="a-r">[error de red]</span>\n'; renderOut(p); finishRun(p); return; }
+          setTimeout(function(){ pollRun(p); }, 700);
+        });
+      }
+      function startRun(p, name, phpVer, cmd){
+        if(runs[p]) return;
+        var sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
+        runs[p]={sid:sid, runid:null, name:name, phpVer:phpVer, cmd:cmd, off:0,
+          html:'<span class="a-prompt">&gt; </span>'+esc(cmd)+'\n'};
+        markBtn(p, true);
+        if(curPath===p){ setButtons(true); stopBtn.classList.remove('off'); }
+        renderOut(p);
+        var full='cd /d "'+p+'" && '+cmd;
+        fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+          body:'action=term_run&sid='+sid+'&php='+encodeURIComponent(phpVer||'')+'&cmd='+encodeURIComponent(full)})
+        .then(function(resp){ return resp.json(); })
+        .then(function(j){
+          var r=runs[p]; if(!r) return;
+          if(j.error){ r.html+='<span class="a-r">'+esc(j.error)+'</span>\n'; renderOut(p); finishRun(p); return; }
+          r.runid=j.runid; saveJobs(); pollRun(p);
+        }).catch(function(){
+          var r=runs[p]; if(!r) return;
+          r.html+='<span class="a-r">[no se pudo lanzar]</span>\n'; renderOut(p); finishRun(p);
+        });
+      }
+
+      window.luaRunPreset=function(cmd){
+        if(!curPath || runs[curPath]) return;
+        startRun(curPath, curName, curPhpVer, cmd);
+      };
+      stopBtn.onclick=function(){
+        var r=curPath && runs[curPath];
+        if(!r || !r.runid) return;
+        stopBtn.classList.add('off');
+        fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+          body:'action=term_stop&sid='+r.sid+'&runid='+r.runid}).then(function(){});
+      };
+      // Solo vacia el papel visible (y el acumulado en memoria, para que el proximo
+      // poll no lo vuelva a pintar entero): no toca el comando que siga en marcha.
+      clearBtn.onclick=function(){
+        out.innerHTML='';
+        if(curPath && runs[curPath]) runs[curPath].html='';
+      };
+
+      function luaDelPreset(cmd){
+        fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+          body:'action=run_preset_del&cmd='+encodeURIComponent(cmd)})
+        .then(r=>r.json()).then(function(j){
+          if(j.presets){ savedPresets=j.presets; renderBtns(); }
+        });
+      }
+      // Ejecuta el comando del cuadro tal cual, sin pasar por run_preset_add: para
+      // comandos puntuales que no hace falta guardar como acceso rapido.
+      runOnceBtn.onclick=function(){
+        var cmd=customInput.value.trim();
+        if(!cmd || !curPath || runs[curPath]) return;
+        startRun(curPath, curName, curPhpVer, cmd);
+      };
+      addBtn.onclick=function(){
+        var cmd=customInput.value.trim();
+        if(!cmd || (curPath && runs[curPath])) return;
+        addBtn.disabled=true;
+        fetch('?',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+          body:'action=run_preset_add&cmd='+encodeURIComponent(cmd)})
+        .then(r=>r.json()).then(function(j){
+          addBtn.disabled=false;
+          if(j.error){ out.insertAdjacentHTML('beforeend','<span class="a-r">'+esc(j.error)+'</span>\n'); return; }
+          savedPresets=j.presets; customInput.value=''; renderBtns();
+          luaRunPreset(cmd);
+        }).catch(function(){ addBtn.disabled=false; });
+      };
+      customInput.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); addBtn.click(); } });
+
+      window.luaOpenRunner=function(name, projectPath, hasComposer, hasNpm, phpVersion, hasArtisan){
+        curPath=projectPath; curName=name; curPhpVer=phpVersion||null;
+        title.textContent='Ejecutar en '+name;
+        customInput.value='';
+        curBuiltins=[];
+        if(hasComposer){ curBuiltins.push(['composer install','composer install'],['composer update','composer update']); }
+        if(hasNpm){ curBuiltins.push(['npm install','npm install'],['npm run build','npm run build']); }
+        if(hasArtisan){
+          curBuiltins.push(
+            ['artisan migrate','php artisan migrate'],
+            ['artisan migrate:fresh --seed','php artisan migrate:fresh --seed', true],
+            ['artisan optimize:clear','php artisan optimize:clear'],
+            ['artisan route:list','php artisan route:list'],
+            ['artisan queue:work','php artisan queue:work']
+          );
+        }
+        renderBtns();
+        var r=runs[curPath];
+        if(r){ out.innerHTML=r.html; out.scrollTop=out.scrollHeight; setButtons(true); stopBtn.classList.remove('off'); }
+        else { out.innerHTML=''; setButtons(false); stopBtn.classList.add('off'); }
+        modal.hidden=false;
+        document.addEventListener('keydown', luaEscRunner);
+      };
+      // Delegado (no onclick inline): la ruta del proyecto lleva backslashes, y un
+      // atributo onclick="...'C:\personal\...'" se compila como CODIGO JS, donde \p, \L,
+      // \w, \a etc. son secuencias de escape que el navegador consume en silencio (la
+      // barra desaparece) — "C:\personal\LuaServer" acababa llegando como
+      // "C:personalLuaServer" y el "cd /d" fallaba siempre. Con data-* (texto plano, sin
+      // parseo JS) el path llega intacto.
+      document.addEventListener('click', function(e){
+        var btn = e.target.closest('.lua-runbtn');
+        if (!btn) return;
+        luaOpenRunner(btn.dataset.name, btn.dataset.path, btn.dataset.composer==='1', btn.dataset.npm==='1', btn.dataset.php, btn.dataset.artisan==='1');
+      });
+      // Cerrar el modal ya NO mata el comando: sigue en marcha en segundo plano (el
+      // play de la card queda en verde) y se puede reabrir luego para verlo o pararlo.
+      window.luaCloseRunner=function(){
+        modal.hidden=true;
+        document.removeEventListener('keydown', luaEscRunner);
+      };
+      function luaEscRunner(e){ if(e.key==='Escape') luaCloseRunner(); }
+
+      // Reengancha, al cargar la página, los comandos que quedaron corriendo en segundo
+      // plano de una carga anterior (recarga, cambio de pestaña...): el proceso de
+      // Windows es independiente de esta página (WScript.Shell.Run), solo hace falta
+      // recuperar el sid/runid guardados para retomar el polling.
+      (function reconnect(){
+        var saved={};
+        try{ saved=JSON.parse(localStorage.getItem(LS_KEY)||'{}')||{}; }catch(e){}
+        Object.keys(saved).forEach(function(p){
+          var j=saved[p];
+          if(!j||!j.sid||!j.runid) return;
+          runs[p]={sid:j.sid, runid:j.runid, name:j.name, phpVer:j.phpVer, cmd:j.cmd, off:0,
+            html:'<span class="a-prompt">&gt; </span>'+esc(j.cmd||'')+'\n'};
+          markBtn(p, true);
+          pollRun(p);
+        });
+      })();
+    })();
+  </script>
+  <?php endif; ?>
 
   <script>
     // Control de "elegir archivo" a medida (import de backups .sql): actualiza el nombre

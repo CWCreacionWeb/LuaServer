@@ -95,6 +95,8 @@ $MongoExpress        = Join-Path $Root "bin\mongo-express"
 $MongoExpressApp     = Join-Path $MongoExpress "node_modules\mongo-express\app.js"
 $MongoExpressPidFile = Join-Path $TmpDir "mongo-express.pid"
 $MongoExpressPort    = 8081
+# --- WP-CLI (automatiza el alta guiada de WordPress: wp-config.php + wp core install) ---
+$WpCli = Join-Path $Bin "wp-cli\wp-cli.phar"
 # --- Exponer en la red local (abrir puerto en el Firewall de Windows) ---
 $LanExposeFlag = Join-Path $Root "config\lanexpose.on"
 $LanIpFile     = Join-Path $Root "config\lan-ip.txt"
@@ -1010,6 +1012,19 @@ function Add-SiteToConfig($name, $php) {
     else { $cfg.sites.$name.php = $php }
     Save-Config $cfg
 }
+# Deja constancia en sites.json de que este proyecto tiene una BD (y opcionalmente un usuario
+# de MySQL propio) creados POR LA PLATAFORMA al darlo de alta -- es lo unico que permite que
+# "Eliminar proyecto" (accion 'delete' en index.php) pueda borrar tambien la BD/usuario sin
+# arriesgarse a acertar por casualidad el nombre de una BD de otro proyecto: solo se borra lo
+# que quedo anotado aqui en el momento de crearla, nunca por coincidencia de nombre.
+function Set-SiteDb($name, $dbname, $dbuser) {
+    $cfg = Get-Config
+    if (-not ($cfg.sites.PSObject.Properties.Name -contains $name)) { return }
+    if (-not ($cfg.sites.$name -is [System.Management.Automation.PSCustomObject])) { $cfg.sites.$name = [pscustomobject]@{ php = $cfg.sites.$name } }
+    $cfg.sites.$name | Add-Member -NotePropertyName 'db' -NotePropertyValue $dbname -Force
+    if ($dbuser) { $cfg.sites.$name | Add-Member -NotePropertyName 'dbuser' -NotePropertyValue $dbuser -Force }
+    Save-Config $cfg
+}
 # Pone/reemplaza una variable en un .env (formato KEY=valor). Si no existe, la anade al final.
 function Set-EnvVar($envFile, $key, $value) {
     if (-not (Test-Path $envFile)) { return }
@@ -1068,6 +1083,19 @@ function Download-WordPress($dir, $log) {
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue; Remove-Item $zip -Force -ErrorAction SilentlyContinue
     "WordPress descomprimido." | Add-Content $log
 }
+# Descarga wp-cli.phar la primera vez que hace falta (no forma parte del catalogo de
+# instalacion inicial -- mismo patron de "descarga en cuanto se necesita" que Node.js para
+# mongo-express, ver el case "mongodb" de Run-Job). Devuelve $true si al acabar existe.
+function Ensure-WpCli($log) {
+    if (Test-Path $WpCli) { return $true }
+    New-Item -ItemType Directory -Force -Path (Split-Path $WpCli) | Out-Null
+    "Descargando WP-CLI..." | Add-Content $log
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try { Invoke-WebRequest "https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar" -OutFile $WpCli -UseBasicParsing -TimeoutSec 300 } catch {}
+    if ((-not (Test-Path $WpCli)) -or ((Get-Item $WpCli).Length -lt 100000)) { Remove-Item $WpCli -Force -ErrorAction SilentlyContinue; return $false }
+    "WP-CLI descargado." | Add-Content $log
+    return $true
+}
 function Run-Job($id, $job) {
     $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"; $withdb=[bool]$job.withdb; $extName="$($job.extName)"
     $logDir = Join-Path $Root "logs\jobs"; New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -1085,7 +1113,30 @@ function Run-Job($id, $job) {
             "laravel"   { & $phpExe $composer create-project laravel/laravel "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
             "symfony"   { & $phpExe $composer create-project symfony/skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
             "slim"      { & $phpExe $composer create-project slim/slim-skeleton "$dir" --no-interaction 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="Composer fallo (ver log)" } }
-            "wordpress" { Download-WordPress $dir $log }
+            "wordpress" {
+                Download-WordPress $dir $log
+                # $job.wpDbName solo viene si el panel ya creo la BD/usuario de MySQL (siempre lo
+                # hace hoy para "wordpress", ver action=create en index.php) -- comprobado por si
+                # algun dia vuelve a existir un alta de WordPress "en blanco" sin wizard.
+                if ($job.wpDbName) {
+                    $wpDbName = "$($job.wpDbName)"; $wpDbUser = "$($job.wpDbUser)"; $wpDbPass = "$($job.wpDbPass)"
+                    $wpTitle = "$($job.wpTitle)"; $wpAdminUser = "$($job.wpAdminUser)"; $wpAdminPass = "$($job.wpAdminPass)"; $wpAdminEmail = "$($job.wpAdminEmail)"
+                    if (-not (Ensure-WpCli $log)) { $ok=$false; $err="No se pudo descargar WP-CLI (ver log)" }
+                    else {
+                        "Escribiendo wp-config.php..." | Add-Content $log
+                        $cfgArgs = @('config','create',"--path=$dir","--dbname=$wpDbName","--dbuser=$wpDbUser","--dbpass=$wpDbPass",'--dbhost=127.0.0.1','--skip-check','--force')
+                        & $phpExe $WpCli @cfgArgs 2>&1 | Add-Content $log
+                        if ($LASTEXITCODE -ne 0) { $ok=$false; $err="wp config create fallo (ver log)" }
+                        else {
+                            $wpUrl = "http://$name.$(Get-Tld)"
+                            "Instalando WordPress ($wpUrl)..." | Add-Content $log
+                            $instArgs = @('core','install',"--path=$dir","--url=$wpUrl","--title=$wpTitle","--admin_user=$wpAdminUser","--admin_password=$wpAdminPass","--admin_email=$wpAdminEmail",'--skip-email')
+                            & $phpExe $WpCli @instArgs 2>&1 | Add-Content $log
+                            if ($LASTEXITCODE -ne 0) { $ok=$false; $err="wp core install fallo (ver log)" }
+                        }
+                    }
+                }
+            }
             "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
             "xdebug"    { $dest = Join-Path $PhpBase "$php\ext\php_xdebug.dll"; "Descargando Xdebug: $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 20000)) { $ok=$false; $err="No se descargo la DLL de Xdebug"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Xdebug descargado ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
             "phpext"    { $dest = Join-Path $PhpBase "$php\ext\php_$extName.dll"; "Descargando extension '$extName': $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 1024)) { $ok=$false; $err="No se descargo el .dll (revisa la URL)"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Extension '$extName' descargada ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
@@ -1334,12 +1385,19 @@ function Run-Job($id, $job) {
             # que este mismo bucle de watch recoge en su siguiente vuelta).
             Set-Content -Path (Join-Path $TmpDir "hosts.flag") -Value ([string](Get-Date).Ticks) -Encoding ascii
             $dbNote = ""
-            if ($withdb -and $type -ne 'git') {
+            # "wordpress" no entra aqui: su BD/usuario los crea ya el panel (action=create en
+            # index.php) con los valores exactos del wizard, no un nombre autogenerado con root.
+            if ($withdb -and $type -ne 'git' -and $type -ne 'wordpress') {
                 $dbname = ($name -replace '[^a-zA-Z0-9_]','_')
-                if (New-ProjectDb $dbname $dir $type) { $dbNote = " [BD: $dbname]" }
+                if (New-ProjectDb $dbname $dir $type) { $dbNote = " [BD: $dbname]"; Set-SiteDb $name $dbname $null }
                 else { $dbNote = " [aviso: no se pudo crear la BD, MySQL sigue apagado o no instalado]" }
             }
-            Set-JobStatus $id $name $type "done" "Listo -> http://$name.$(Get-Tld)$dbNote"
+            if ($type -eq 'wordpress' -and $job.wpDbName) {
+                Set-SiteDb $name "$($job.wpDbName)" "$($job.wpDbUser)"
+                Set-JobStatus $id $name $type "done" "WordPress listo -> http://$name.$(Get-Tld) [BD: $($job.wpDbName)] -- admin: $($job.wpAdminUser) / $($job.wpAdminPass)"
+            } else {
+                Set-JobStatus $id $name $type "done" "Listo -> http://$name.$(Get-Tld)$dbNote"
+            }
         }
         "== DONE ==" | Add-Content $log
     } else {
