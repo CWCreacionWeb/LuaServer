@@ -87,8 +87,22 @@ No merece la pena seguir intentando arreglar `localhost` en sí; usar
   usar la herramienta **PowerShell** para eso.
 - La **Browser pane** (`mcp__Claude_Browser__*`) también es un entorno
   aislado sin acceso al `localhost` real de esta máquina.
-- Para probar de verdad en el navegador del usuario: usar
-  **`mcp__claude-in-chrome__*`** (su Chrome real, vía extensión).
+- **`mcp__claude-in-chrome__*` tampoco es fiable para esto** (corregido en
+  la sesión del 2026-07-27; antes esta nota decía justo lo contrario). Aun
+  reportando `isLocal: true`, su salida de red puede ir por un proxy que no
+  llega a esta máquina: `http://127.0.0.1/` devolvió el `timeout.html` de
+  **Portainer** (el mismo artefacto que el Bash tool) y
+  `https://portal.ersm.test/` un **502 de `nginx/1.30.4`** — cuando el
+  Apache real se anuncia como `Apache/2.4.68 (Win64) mod_fcgid/...` y
+  respondía 200 a la vez desde PowerShell.
+- **Cómo distinguirlo en 2 segundos:** mirar la cabecera `Server` de la
+  respuesta. Si no pone `Apache/…​ mod_fcgid/…`, no estás hablando con este
+  servidor, da igual lo que parezca la URL.
+- Conclusión práctica: para medir lo que ve el navegador real **hay que
+  pedírselo al usuario** (p. ej. un snippet para su consola de DevTools).
+  Desde aquí, lo máximo fiable es `curl.exe`/`Invoke-WebRequest` vía la
+  herramienta **PowerShell** — que sí corre en el host real, pero no es un
+  navegador y por tanto no reproduce lo que hace Chrome.
 
 ## ⚠️ Trampa nº4: nunca clicar por coordenadas en el navegador real
 
@@ -141,6 +155,155 @@ Además, ese runner ahora manda la versión de PHP del proyecto (`bin\php\<ver>`
 al principio del `PATH` de cada comando, para que `composer`/`php` usen
 **el PHP propio de lua-server** en vez de depender de un PHP global del
 sistema (que en esta máquina ni siquiera existe pese a estar en el PATH).
+
+## ⚠️ Trampa nº6: `pdo_odbc` destroza el texto en AMBOS sentidos
+
+La pestaña **SQL Server** habla con el servidor por `pdo_odbc` (+ *ODBC Driver 17 for SQL
+Server*), porque es lo único que viene ya con PHP en Windows — solo hay que activar
+`pdo_odbc` en `config\php\extra-extensions.json`. Pero ese driver **convierte el texto al
+codepage ANSI del sistema (Windows-1252 aquí), al leer y al escribir**:
+
+- Al **leer**: un `NVARCHAR` con `中` llega a PHP como `?`. El carácter se pierde *antes* de
+  que PHP lo vea, así que no hay forma de recuperarlo después. Medido: `ñ`→`0xF1`,
+  `€`→`0x80`, `中`→`0x3F`.
+- Al **escribir**: mandar `'ñ'` como parámetro hace que SQL Server reciba **dos** caracteres
+  (los bytes UTF-8 sueltos, códigos 195 y 177).
+
+En un editor de filas eso es **corrupción silenciosa**: lees `?`, guardas, y el dato original
+queda destruido. Solución implementada (sin depender de otro driver): **mover el texto como
+binario**, que viaja en hexadecimal ASCII puro e inmune a cualquier codepage.
+
+- Leer: `CONVERT(varbinary(max), CONVERT(nvarchar(max), [col])) AS [col]` → en PHP
+  `hex2bin` + `mb_convert_encoding(..., 'UTF-8', 'UTF-16LE')`.
+- Escribir: se manda el hex y `CONVERT(nvarchar(max), CONVERT(varbinary(max), CAST(? AS varchar(max)), 2))`.
+  **El `CAST(? AS varchar(max))` es imprescindible**: el parámetro llega como `nvarchar` y
+  `CONVERT(...,2)` NO interpreta hexadecimal sobre `nvarchar` (se limita a reinterpretar sus
+  bytes, y acabas guardando el propio texto del hex).
+
+Verificado sin pérdidas con acentos, `€`, chino, emoji (pares suplentes), saltos de línea,
+comillas y textos de 40.000 caracteres. Todo esto se desactiva solo si algún día se instala
+`pdo_sqlsrv` (ver `sqlsrv_hex_text()`), que maneja UTF-8 de forma nativa.
+
+Otros detalles del mismo driver, ya resueltos, que conviene no volver a descubrir:
+
+- **`lastInsertId()` lanza excepción** (no soportado). Para recuperar la clave nueva se usa
+  `INSERT ... OUTPUT INSERTED.<pk>`; `SCOPE_IDENTITY()` en una consulta aparte vuelve vacía
+  porque es otro ámbito.
+- **Las columnas `xml` devuelven `NULL`** aunque tengan valor: hay que pedirlas con `CONVERT`
+  explícito. Por eso el explorador nunca hace `SELECT *`, construye la lista de columnas.
+  `geography`/`geometry`/`hierarchyid` necesitan `.ToString()`.
+- **"La conexión está ocupada con los resultados de otro comando"**: un cursor sin agotar
+  bloquea la siguiente consulta. Se resuelve con `MARS_Connection=yes` en el DSN y
+  `closeCursor()` tras cada lectura parcial (`fetchColumn()` deja el cursor abierto).
+- Ojo al probar codificaciones: pasar un literal `N'ñ'` **dentro del SQL** no demuestra nada
+  (te devuelve los bytes que tú mismo enviaste). Hay que leer datos realmente almacenados, o
+  generarlos en el servidor con `NCHAR(...)`.
+- Y un despiste de T-SQL puro: `REPLICATE(N'x', 5000)` devuelve **4.000** caracteres, no
+  5.000, salvo que el primer argumento ya sea `MAX` (`REPLICATE(CAST(N'x' AS nvarchar(max)), 5000)`).
+
+## ⚠️ Trampa nº7: "la pagina llega cortada" que NO era el servidor (`</script>` en los datos)
+
+Investigado a fondo el 2026-07-27. Se perdieron horas persiguiendo un truncado de
+respuesta en Apache/mod_fcgid que **nunca existio**: el fallo estaba en la app
+(`ersmportal`), no en este servidor. Queda escrito con el metodo que lo resolvio.
+
+**Sintoma:** la vista mas grande de esa app
+(`/seguimiento/cuadro-mando-movilidad`, ~130 KB de HTML+JS inline, PHP 7.1) no
+arrancaba su JS. En consola: `Uncaught SyntaxError: Unexpected end of input`. El
+`<script>` inline estaba, efectivamente, **sin terminar**.
+
+**La paradoja que lo resuelve todo:** la respuesta HTTP llegaba **completa**
+(cerraba `</html>`, DOM 132784 ≈ FETCH 132744 bytes, los 152 backticks del fuente
+presentes en el documento) y **aun asi** el `<script>` estaba incompleto. Las dos
+cosas a la vez solo pasan si el **parser de HTML cierra el elemento `<script>`
+antes de tiempo**.
+
+La contabilidad de backticks lo demuestra sin lugar a dudas:
+
+| | dentro del `<script>` | fuera |
+|---|---|---|
+| Fuente `.blade.php` (L420–L1960) | **152** | 0 |
+| Renderizado en el navegador | **137** | **15** |
+
+15 backticks que en el fuente estan dentro del script aparecen **fuera** en el DOM:
+el parser corto el elemento a mitad y el resto del JS se derramo al documento como
+texto HTML. Lo que quedo dentro del script tenia una plantilla sin cerrar → el
+`SyntaxError`.
+
+**Causa (confirmada):** el paquete **`genealabs/laravel-caffeine`** (keepalive de
+sesion) inyecta su `<script>` haciendo `str_replace('</body>', ...)` sobre el HTML
+final — y `str_replace` sustituye **todas** las ocurrencias, no la ultima. Esa vista
+construye un informe HTML descargable dentro de una template literal de JS
+(`const html = ` + backtick + `...</body></html>` + backtick + `;` → `new Blob([html])`),
+asi que en la salida hay **dos** `</body>`: el del informe (dentro del JS, L1766) y el
+real del documento (L1961). Caffeine inyecto en los dos, y el `</script>` que metio en
+el de dentro cerro el `<script>` real abierto en la L420.
+
+**Arreglo (en la app, no aqui):** escapar la barra dentro de la template literal,
+`</body>` → `<\/body>`. En JS es exactamente la misma cadena (`\/` es un no-op), o sea
+que el informe descargado no cambia ni un byte, pero el `str_replace` de PHP ya no
+casa. Alternativas: excluir la ruta del middleware de caffeine, o quitar el paquete.
+Escaneadas las 3500 vistas blade del proyecto, **solo esa** tiene el patron.
+
+**Como diagnosticar esto en 30 segundos** (consola del navegador, sobre la pagina real):
+
+```js
+// 1. ¿El script esta completo? Compila sin ejecutar:
+new Function(document.querySelectorAll('script:not([src])')[0].textContent)
+
+// 2. ¿Y la RESPUESTA esta completa? Compara documento contra fetch de la misma URL.
+//    Si la respuesta cierra </html> pero el script no compila -> NO es el servidor,
+//    es el parser cerrando el <script>. Busca el `</script` intruso:
+(async () => {
+  const t = await (await fetch(location.href, {credentials:'include'})).text();
+  const h = []; let i = -1;
+  while ((i = t.indexOf('</script', i + 1)) !== -1) h.push(JSON.stringify(t.slice(i-150, i+30)));
+  return h;   // cualquiera que no sea un cierre legitimo es el culpable
+})()
+```
+
+**La leccion de metodo, que es lo que de verdad costo caro:** "respuesta completa +
+script incompleto" apunta **siempre** al parser de HTML, nunca a la red ni al
+servidor. Comprobar esas dos cosas por separado **antes** de tocar nada de Apache
+habria resuelto esto en minutos.
+
+**Callejones sin salida recorridos, para no repetirlos:**
+
+- **La paridad de backticks no demuestra nada por si sola.** La pista inicial fue
+  "el fuente tiene 152 (par) y lo servido 137 (impar), luego viene cortado". Pero se
+  comparaba **un solo `<script>`** contra el **fichero entero** — peras con manzanas.
+  Y un backtick suelto en una cadena o un comentario descuadra la paridad sin que
+  falte un byte. Aqui resulto haber un problema real, pero **por otro motivo**: la
+  cifra correcta a comparar era dentro-del-script vs fuera-del-script (137+15).
+- **`FcgidOutputBufferSize`**: `httpd-lua.conf` no lo fijaba y corria con el default
+  de mod_fcgid (**64 KB**). Se subio a 16 MB. **No arreglo este bug** (no habia bug
+  de servidor), se deja como endurecimiento preventivo de coste/riesgo cero: 64 KB
+  es bajo para paginas grandes y hay reportes reales de mod_fcgid en Windows con
+  renders a medias.
+- **opcache**: sigue correctamente desactivado en PHP 7.1 (ver seccion PHP < 7.2).
+  No era una reaparicion de aquel bug.
+- **Reproduccion sintetica**: sitio de prueba aislado bajo PHP 7.1 (mismo Apache,
+  mismo mod_fcgid) con acentos UTF-8, backticks, cientos de `echo`, `flush()`,
+  `session_start()`, HTTP y HTTPS, de 50 KB a ~7 MB — **50+ intentos, ni un corte**.
+  Nunca iba a reproducirse: al test le faltaba un `</script>` dentro de una plantilla.
+  Cuando un sintoma no se reproduce ni forzandolo, sospechar del **modelo mental**,
+  no insistir con mas tamano.
+- **ESET Security**: se confirmo que **si** hace MITM de todo el HTTPS local (por TLS
+  en crudo a `127.0.0.1:443` con SNI `portal.ersm.test`, el certificado llega
+  re-firmado por `CN=ESET SSL Filter CA`, no por la CA de `mkcert`). Pero era
+  **inocente**, y ademas mala hipotesis de entrada: el usuario llevaba anos con ESET
+  y Vagrant/VirtualBox sin este problema, o sea que ESET es una **constante** entre
+  el escenario que funcionaba y el que fallaba. En diagnostico diferencial se
+  persigue la variable que cambio. (Y aqui **no habia ninguna variable de entorno**:
+  la combinacion vista+caffeine rompe en cualquier servidor, Windows o Linux. Por eso
+  ninguna hipotesis de infraestructura — buffer, TLS, antivirus, version de PHP —
+  podia explicarlo jamas. Cuando el sintoma es identico en todos los entornos, deja
+  de mirar el entorno.)
+
+Nota de medicion: incluir **siempre** `location.href` y `document.title` en cualquier
+snippet de diagnostico. En esta investigacion se midio sin querer **la pagina de
+login** (la sesion se habia perdido al reiniciar Apache) y sus numeros se dieron por
+buenos durante una ronda entera.
 
 ## Gotchas de PowerShell
 
@@ -241,6 +404,27 @@ sistema (que en esta máquina ni siquiera existe pese a estar en el PATH).
   `Set-MongoConf`), no por `mongod.lock` (formato no documentado) ni por
   nombre de proceso global — mismo criterio que `Postgres-Up` con
   `postmaster.pid`.
+
+- **Pestaña SQL Server** — gestor propio tipo phpMyAdmin para **Microsoft SQL Server**
+  (que NO se instala con la plataforma: se conecta a uno existente, local o de red). Barra
+  lateral BD→tablas, explorador de filas paginado y ordenable, vista de estructura
+  (columnas/índices), consola SQL con CodeMirror, y edición de filas (insertar/editar/borrar).
+  Las conexiones se guardan en `config\sqlsrv-servers.json` (fuera de git, contraseña en
+  claro igual que `mysql_root.pass`). **La edición se desactiva sola** en vistas y en tablas
+  sin clave primaria: sin PK no hay `WHERE` que identifique una sola fila. Ver la trampa nº6
+  sobre codificación: es lo más delicado de toda la pestaña.
+- **Actualización de la plataforma** — la versión sale junto al título del panel (etiqueta de
+  git si existe, si no `r<nº commits> <sha>`), y se vuelve ámbar cuando hay novedades. El
+  **watcher** hace `git fetch` cada X horas (`config\update.json`, fuera de git) y deja el
+  resultado en `tmp\update-status.json`; el panel solo lee ese archivo y pide acciones por
+  flag (`update-check.flag`, `update-now.flag`). **El panel no puede hacer el fetch él mismo**:
+  el remoto es SSH y Apache corre como SYSTEM, sin las claves del usuario.
+  La actualización usa `git merge --ff-only` y se niega a correr si hay cambios locales sin
+  confirmar o commits propios por delante. Tras actualizar ejecuta `Cmd-Apply` y, si el
+  propio `lua.ps1` ha cambiado, **relanza el watcher** (trampa nº1).
+  Ojo al añadir features que necesiten una extensión de PHP: va en `$WantExts` (versionado),
+  nunca en `config\php\extra-extensions.json` (ignorado por git), o los demás equipos se
+  quedan sin ella al actualizar.
 
 ## Convenciones de UI ya establecidas
 
