@@ -575,6 +575,27 @@ si lo lanza el watcher como SYSTEM.
   - Los strings de más de 256 KB se muestran recortados y **con la edición desactivada**, para no
     guardar encima una versión truncada del original.
 
+- **Pestaña Doctor** — diagnóstico automático que convierte las trampas de este documento en
+  comprobaciones de un vistazo: puertos (80/443/motores) con **quién** los ocupa vía
+  netstat+tasklist, watcher por latido, motores activados-pero-no-instalados o con el puerto
+  robado, config generada apuntando a otra carpeta (repo movido sin `init`), vhosts
+  descuadrados con `sites.json`, dominios sin sincronizar al `hosts`, versiones de PHP
+  incompletas, disco y logs gigantes. Lección clave de su primera pasada: **en Windows un
+  mismo puerto puede tener varios listeners IPv4 a la vez** (el `0.0.0.0` de un contenedor de
+  Docker convive con el `127.0.0.1` de Apache/motor nativo, y para `127.0.0.1` gana el bind
+  más específico) — cualquier comprobación de puertos debe evaluar TODOS los listeners, no el
+  primero que devuelva netstat, o acusa a Apache de no tener el 80 mientras sirve la propia
+  página. En esta máquina el 3306 y el 27017 están compartidos así (nativo + contenedor).
+  Su primera pasada real también destapó un **mongod huérfano**: un `stop` borró `mongod.pid`
+  sin lograr matar el proceso (era de SYSTEM, lanzado por el watcher fantasma), y el watcher
+  se pasó horas engendrando mongods condenados mientras mongo-express no arrancaba nunca.
+  Arreglado triple: `Stop-MongoDb` ya solo borra el pid si el proceso murió de verdad,
+  `Start-MongoDb` **adopta** al huérfano si algo llamado `mongod` escucha nuestro puerto
+  (identificado por el listener, NO por ruta del binario: la ruta de un proceso de SYSTEM es
+  ilegible desde una sesión normal), y la reconciliación de MongoDB tiene por fin el backoff
+  de 30s que ya tenían los demás motores. SQL Server y Redis ya no tienen pestaña propia en la
+  barra: se entra por sus enlaces en "Bases de datos" (que queda resaltada dentro de ellos).
+
 - **Pestaña SQL Server** — gestor propio tipo phpMyAdmin para **Microsoft SQL Server**
   (que NO se instala con la plataforma: se conecta a uno existente, local o de red). Barra
   lateral BD→tablas, explorador de filas paginado y ordenable, vista de estructura

@@ -681,6 +681,28 @@ function MongoDb-Up {
 function Start-MongoDb {
     if (-not (Test-Path $Mongod)) { return }
     if (MongoDb-Up) { return }
+    # Adopcion de huerfanos: si un mongod ya escucha nuestro puerto pero sin mongod.pid (p.ej.
+    # un stop anterior borro el pid sin lograr matar el proceso), lanzar otro seria inutil (el
+    # puerto esta cogido) y el watcher se pasaria la vida engendrando mongods condenados. Se
+    # identifica por el LISTENER del puerto + nombre de proceso, no por ruta del binario: un
+    # mongod arrancado por el watcher de SYSTEM tiene la ruta ILEGIBLE desde una sesion normal
+    # (asi se descubrio este caso). La ruta se usa solo como filtro de exclusion cuando SI es
+    # legible y apunta fuera de bin\mongodb (un mongod ajeno del usuario: ese no se toca).
+    $lst = Get-NetTCPConnection -LocalPort $MongoPort -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -eq '127.0.0.1' -or $_.LocalAddress -eq '0.0.0.0' } | Select-Object -First 1
+    if ($lst) {
+        $p = Get-Process -Id $lst.OwningProcess -ErrorAction SilentlyContinue
+        if ($p -and $p.ProcessName -eq 'mongod') {
+            $exe = $null; try { $exe = $p.Path } catch {}
+            if (-not $exe -or $exe.StartsWith($MongoDb, [System.StringComparison]::OrdinalIgnoreCase)) {
+                New-Item -ItemType Directory -Force -Path $MongoDataDir | Out-Null
+                Set-Content -Path (Join-Path $MongoDataDir "mongod.pid") -Value $p.Id -Encoding ascii
+                return
+            }
+        }
+        # El puerto lo tiene otra cosa (un contenedor, un mongod ajeno): arrancar seria inutil.
+        return
+    }
     Set-MongoConf
     Start-Process -FilePath $Mongod -WindowStyle Hidden -ArgumentList @("--config", "`"$MongoConf`"")
 }
@@ -695,7 +717,12 @@ function Stop-MongoDb {
         if ($thePid) { Stop-Process -Id ([int]$thePid) -Force -ErrorAction SilentlyContinue }
         for ($i=0; $i -lt 20; $i++) { if (-not (MongoDb-Up)) { break }; Start-Sleep -Milliseconds 250 }
     }
-    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+    # Borrar el pid SOLO si el proceso ya no esta: si el kill fallo (p.ej. lo arranco un watcher
+    # de SYSTEM y esta consola no puede matarlo), borrar el pid dejaria un mongod HUERFANO que
+    # bloquea el puerto sin que nadie lo reconozca como propio -- justo el estado que la
+    # adopcion de Start-MongoDb tiene que reparar despues.
+    if (-not (MongoDb-Up)) { Remove-Item $pidFile -Force -ErrorAction SilentlyContinue }
+    else { Warn "No se pudo detener MongoDB (PID $((Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue))): puede requerir una consola elevada." }
 }
 
 # ---------------- mongo-express (GUI web de MongoDB, sobre Node) ----------------
@@ -1038,6 +1065,7 @@ function Cmd-Watch {
     $nextMariaTry = [datetime]::MinValue
     $nextPgTry    = [datetime]::MinValue
     $nextRedisTry = [datetime]::MinValue
+    $nextMongoTry = [datetime]::MinValue
     # Memoria del supervisor de procesos (por id): ultima hora de arranque, fallos rapidos
     # seguidos y proximo intento. Vive en el proceso del watcher: si el watcher se relanza
     # (autorecarga), el contador se resetea, lo cual es aceptable -- como mucho un ciclo mas
@@ -1088,9 +1116,13 @@ function Cmd-Watch {
                 if ([datetime]::Now -ge $nextPgTry) { Start-Postgres; $nextPgTry = [datetime]::Now.AddSeconds(30) }
             } elseif ($pgOn -and (Postgres-Up)) { $nextPgTry = [datetime]::MinValue }
             if (-not $pgOn -and (Postgres-Up)) { Stop-Postgres }
-            # Reconciliar MongoDB (+ mongo-express) con su flag
+            # Reconciliar MongoDB (+ mongo-express) con su flag (con backoff, como los demas
+            # motores: sin el, un mongod que no puede arrancar se relanzaba cada segundo y
+            # ademas reescribia mongod.cfg en bucle)
             $mongoOn = Test-Path $MongoDbFlag
-            if ($mongoOn -and (Test-Path $Mongod) -and -not (MongoDb-Up)) { Start-MongoDb }
+            if ($mongoOn -and (Test-Path $Mongod) -and -not (MongoDb-Up)) {
+                if ([datetime]::Now -ge $nextMongoTry) { Start-MongoDb; $nextMongoTry = [datetime]::Now.AddSeconds(30) }
+            } elseif ($mongoOn -and (MongoDb-Up)) { $nextMongoTry = [datetime]::MinValue }
             if (-not $mongoOn -and (MongoDb-Up)) { Stop-MongoDb }
             if ($mongoOn -and (MongoDb-Up) -and -not (MongoExpress-Up)) { Start-MongoExpress }
             if ((-not $mongoOn -or -not (MongoDb-Up)) -and (MongoExpress-Up)) { Stop-MongoExpress }
