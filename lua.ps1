@@ -108,6 +108,10 @@ $RedisConf      = Join-Path $Root "config\redis\redis.conf"
 $RedisBuildFile = Join-Path $Root "config\redis\build.txt"
 $RedisFlag      = Join-Path $Root "config\redis.on"
 $RedisPort      = 6379
+# --- Supervisor de procesos por proyecto (colas, scheduler, Vite...) ---
+$ProcsFile   = Join-Path $Root "config\procs.json"
+$ProcsRunDir = Join-Path $TmpDir "procs"
+$ProcsLogDir = Join-Path $Root "logs\procs"
 # --- Node.js portable (runtime unicamente para mongo-express) ---
 $NodeDir        = Join-Path $Bin  "node"
 $NodeExe        = Join-Path $NodeDir "node.exe"
@@ -826,6 +830,113 @@ function Start-Redis {
     # del .exe y no arranca si el cwd es otro.
     Start-Process -FilePath $RedisExe -WindowStyle Hidden -ArgumentList @("`"$(Fwd $RedisConf)`"") -WorkingDirectory $RedisDir
 }
+# ---------------- Supervisor de procesos por proyecto ----------------
+# Mantiene vivos procesos largos de los proyectos (colas de Laravel, scheduler, Vite/npm...)
+# definidos en config\procs.json (NO versionado: referencia proyectos de esta maquina, igual
+# que sites.json). El panel solo edita ese json y deja flags; quien arranca, vigila y reinicia
+# es el watcher -- que para eso ya es un supervisor.
+#
+# Estado en tmp\procs\: <id>.pid ("pid;starttime" -- la hora de arranque en FileTime detecta
+# PIDs reciclados, mismo espiritu que los pidfile de los motores), <id>.restart (flag del
+# panel), state.json (lo escribe el watcher SOLO al cambiar; el panel lo lee para pintar
+# badges sin ejecutar tasklist por cada proceso).
+function Get-Procs {
+    if (-not (Test-Path $ProcsFile)) { return @() }
+    try {
+        $j = Get-Content $ProcsFile -Raw | ConvertFrom-Json
+        if ($j -is [array]) { return @($j) } else { return @() }
+    } catch { return @() }
+}
+function Proc-PidFile($id) { Join-Path $ProcsRunDir "$id.pid" }
+function Proc-Up($id) {
+    $pf = Proc-PidFile $id
+    if (-not (Test-Path $pf)) { return $false }
+    $parts = ((Get-Content $pf -Raw -ErrorAction SilentlyContinue).Trim()) -split ';'
+    if ($parts.Count -lt 2) { return $false }
+    $p = Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    # PID reciclado por Windows != nuestro proceso: la hora de arranque tiene que casar
+    # (tolerancia 2s en ticks de FileTime). Si StartTime no es legible (proceso de otra
+    # cuenta), se da por bueno: el PID existia y lo escribimos nosotros.
+    try { return ([math]::Abs($p.StartTime.ToFileTimeUtc() - [long]$parts[1]) -lt 20000000) } catch { return $true }
+}
+function Start-Proc($def) {
+    $id = "$($def.id)"
+    New-Item -ItemType Directory -Force -Path $ProcsRunDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $ProcsLogDir | Out-Null
+    $cfg = Get-Config
+    $projName = "$($def.project)"
+    if (-not ($cfg.sites.PSObject.Properties.Name -contains $projName)) { return $false }
+    $cwd = Get-SiteBase $cfg.sites.$projName $projName
+    if (-not (Test-Path $cwd)) { return $false }
+    $log = Join-Path $ProcsLogDir "$id.log"
+    # Wrapper .cmd con las mismas soluciones ya ganadas por el runner/terminal (trampa nº5):
+    # chcp 65001, HOME propio para composer/npm (autocontenido y valido tambien como SYSTEM),
+    # bin\php\<ver> del proyecto al frente del PATH y PHPRC apuntandole (PHPRC heredado GANA a
+    # "junto al .exe": sin el set, "php" del proyecto leeria el php.ini de otra version).
+    $homeDir = Join-Path $Root "tmp\home"
+    New-Item -ItemType Directory -Force -Path (Join-Path $homeDir "AppData\Roaming") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $homeDir "composer") | Out-Null
+    $w  = "@echo off`r`n"
+    $w += "chcp 65001 >NUL`r`n"
+    $w += "set `"APPDATA=$homeDir\AppData\Roaming`"`r`n"
+    $w += "set `"COMPOSER_HOME=$homeDir\composer`"`r`n"
+    $pathParts = @()
+    $phpVer = "$($def.php)"
+    if ($phpVer -match '^\d\.\d$' -and (Test-Path (Join-Path $PhpBase $phpVer))) {
+        $pathParts += (Join-Path $PhpBase $phpVer)
+        $w += "set `"PHPRC=$(Join-Path $PhpBase $phpVer)`"`r`n"
+    }
+    # PATH de maquina desde el registro: el watcher puede correr como SYSTEM, cuyo PATH de
+    # sesion no incluye las entradas tipicas del usuario; el de HKLM cubre node/git/etc.
+    try {
+        $mp = [Environment]::GetEnvironmentVariable('Path','Machine')
+        if ($mp) { $pathParts += $mp }
+    } catch {}
+    if ($pathParts.Count -gt 0) { $w += "set `"PATH=$($pathParts -join ';');%PATH%`"`r`n" }
+    $w += "cd /d `"$cwd`"`r`n"
+    $w += "$($def.cmd)`r`n"
+    $cmdf = Join-Path $ProcsRunDir "$id.cmd"
+    # Write-Utf8NoBom y NO Set-Content -Encoding UTF8: en PS 5.1 eso escribe BOM, y cmd.exe no
+    # lo entiende -- la primera linea del wrapper llega como "ï»¿@echo off" y falla.
+    Write-Utf8NoBom $cmdf $w
+    Add-Content -Path $log -Value "[lua] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') arrancando: $($def.cmd)"
+    # cmd /c con el wrapper y el log en append (>>): los reinicios se acumulan en el mismo log.
+    $args = '/c ""{0}" >> "{1}" 2>&1"' -f $cmdf, $log
+    $p = Start-Process -FilePath "cmd.exe" -ArgumentList $args -WindowStyle Hidden -PassThru
+    $stamp = 0; try { $stamp = $p.StartTime.ToFileTimeUtc() } catch {}
+    Set-Content -Path (Proc-PidFile $id) -Value "$($p.Id);$stamp" -Encoding ascii
+    return $true
+}
+function Stop-Proc($id) {
+    $pf = Proc-PidFile $id
+    if (Test-Path $pf) {
+        $parts = ((Get-Content $pf -Raw -ErrorAction SilentlyContinue).Trim()) -split ';'
+        # Solo se llama a taskkill si el PID sigue vivo. Sobre un PID muerto, taskkill escribe
+        # en stderr ("no se encontro el proceso") y, con el $ErrorActionPreference = "Stop"
+        # global de este script + la redireccion 2>&1, PowerShell 5.1 lo convierte en EXCEPCION
+        # terminante: el catch del bucle del watcher la atrapaba y se saltaba el resto de la
+        # vuelta (jobs, actualizaciones...) en cada iteracion, para siempre.
+        if ($parts.Count -ge 1 -and $parts[0] -and (Get-Process -Id ([int]$parts[0]) -ErrorAction SilentlyContinue)) {
+            $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            # /T mata el ARBOL entero: sin el quedaria vivo el php.exe/node.exe hijo del cmd.exe
+            # (la misma leccion que term_stop en el panel).
+            & taskkill /F /T /PID $parts[0] *> $null
+            $ErrorActionPreference = $prev
+            $log = Join-Path $ProcsLogDir "$id.log"
+            Add-Content -Path $log -Value "[lua] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') detenido." -ErrorAction SilentlyContinue
+        }
+        Remove-Item $pf -Force -ErrorAction SilentlyContinue
+    }
+}
+function Stop-AllProcs {
+    if (-not (Test-Path $ProcsRunDir)) { return }
+    foreach ($pf in (Get-ChildItem $ProcsRunDir -Filter *.pid -ErrorAction SilentlyContinue)) {
+        Stop-Proc $pf.BaseName
+    }
+    Remove-Item (Join-Path $ProcsRunDir "state.json") -Force -ErrorAction SilentlyContinue
+}
+
 function Stop-Redis {
     # Se intenta primero un apagado limpio con redis-cli (vuelca el RDB antes de salir); si no
     # esta o no responde, se mata por el PID propio. Con persistencia RDB perder el ultimo
@@ -890,6 +1001,7 @@ function Cmd-Stop {
     Stop-MongoExpress
     Stop-MongoDb
     Stop-Redis
+    Stop-AllProcs
     Ok "Apache detenido."
 }
 
@@ -926,6 +1038,12 @@ function Cmd-Watch {
     $nextMariaTry = [datetime]::MinValue
     $nextPgTry    = [datetime]::MinValue
     $nextRedisTry = [datetime]::MinValue
+    # Memoria del supervisor de procesos (por id): ultima hora de arranque, fallos rapidos
+    # seguidos y proximo intento. Vive en el proceso del watcher: si el watcher se relanza
+    # (autorecarga), el contador se resetea, lo cual es aceptable -- como mucho un ciclo mas
+    # de reintentos.
+    $procMem   = @{}
+    $procState = ""
     $fUpdChk      = Join-Path $TmpDir "update-check.flag"
     $fUpdNow      = Join-Path $TmpDir "update-now.flag"
     # Primera comprobacion a los 30s de arrancar (no en el mismo instante: el arranque ya
@@ -983,6 +1101,67 @@ function Cmd-Watch {
                 if ([datetime]::Now -ge $nextRedisTry) { Start-Redis; $nextRedisTry = [datetime]::Now.AddSeconds(30) }
             } elseif ($rdOn -and (Redis-Up)) { $nextRedisTry = [datetime]::MinValue }
             if (-not $rdOn -and (Redis-Up)) { Stop-Redis }
+            # ---- Supervisor de procesos por proyecto ----
+            # Reconcilia lo definido en config\procs.json con la realidad. Backoff exponencial
+            # anti crash-loop: si un proceso muere a los pocos segundos de arrancar (comando
+            # roto, puerto ocupado), reintentar cada 1s solo llenaria el log y la CPU -- se
+            # espera 5s, 10s, 20s... hasta 60s. Si aguanta >15s, el contador se resetea.
+            $defs = Get-Procs
+            $st = @{}
+            $defIds = @()
+            foreach ($d in $defs) {
+                $id = "$($d.id)"; if (-not $id) { continue }
+                $defIds += $id
+                if (-not $procMem.ContainsKey($id)) { $procMem[$id] = @{ last=[datetime]::MinValue; fails=0; next=[datetime]::MinValue } }
+                $m = $procMem[$id]
+                $rst = Join-Path $ProcsRunDir "$id.restart"
+                if (Test-Path $rst) { Remove-Item $rst -Force -ErrorAction SilentlyContinue; Stop-Proc $id; $m.fails = 0; $m.next = [datetime]::MinValue }
+                $up = Proc-Up $id
+                if ($d.enabled -and -not $up) {
+                    if ([datetime]::Now -ge $m.next) {
+                        # ¿Muerte rapida? (habia arrancado hace <15s). MinValue = primer arranque.
+                        if ($m.last -ne [datetime]::MinValue -and ([datetime]::Now - $m.last).TotalSeconds -lt 15) { $m.fails++ } else { $m.fails = 0 }
+                        $delay = [math]::Min(60, 5 * [math]::Pow(2, $m.fails))
+                        $m.next = [datetime]::Now.AddSeconds($delay)
+                        $m.last = [datetime]::Now
+                        if (-not (Start-Proc $d)) {
+                            # Proyecto desregistrado o carpeta desaparecida: no insistir cada 1s.
+                            $m.next = [datetime]::Now.AddSeconds(60)
+                        }
+                        $up = Proc-Up $id
+                    }
+                } elseif (-not $d.enabled -and $up) {
+                    Stop-Proc $id; $up = $false; $m.fails = 0; $m.next = [datetime]::MinValue
+                } elseif ($d.enabled -and $up -and $m.fails -gt 0 -and ([datetime]::Now - $m.last).TotalSeconds -ge 15) {
+                    $m.fails = 0   # lleva >15s vivo: el crash-loop se acabo
+                }
+                $pidNow = 0
+                if ($up) { $parts = ((Get-Content (Proc-PidFile $id) -Raw -ErrorAction SilentlyContinue).Trim()) -split ';'; if ($parts.Count -ge 1) { $pidNow = [int]$parts[0] } }
+                # Epocas via DateTimeOffset y no Get-Date -UFormat %s: con locale espanol este
+                # ultimo devuelve decimales con COMA y el parse revienta o da valores absurdos.
+                # m.last puede ser MinValue si el watcher acaba de autorecargarse con el proceso
+                # ya corriendo: en ese caso "since" se queda a 0 (el panel omite el "desde").
+                $st[$id] = @{
+                    running = [bool]$up
+                    pid     = $pidNow
+                    fails   = [int]$m.fails
+                    next    = $(if ($d.enabled -and -not $up -and $m.next -gt [datetime]::MinValue) { [DateTimeOffset]::new($m.next.ToUniversalTime(), [timespan]::Zero).ToUnixTimeSeconds() } else { 0 })
+                    since   = $(if ($up -and $m.last -gt [datetime]::MinValue) { [DateTimeOffset]::new($m.last.ToUniversalTime(), [timespan]::Zero).ToUnixTimeSeconds() } else { 0 })
+                }
+            }
+            # Huerfanos: pid de ids que ya no estan en procs.json (definicion borrada) -> matar.
+            if (Test-Path $ProcsRunDir) {
+                foreach ($pf in (Get-ChildItem $ProcsRunDir -Filter *.pid -ErrorAction SilentlyContinue)) {
+                    if ($defIds -notcontains $pf.BaseName) { Stop-Proc $pf.BaseName; $procMem.Remove($pf.BaseName) }
+                }
+            }
+            # state.json solo si cambio (el panel lo lee para pintar badges sin tasklist).
+            $stJson = ($st | ConvertTo-Json -Compress -Depth 4)
+            if ($stJson -ne $procState) {
+                New-Item -ItemType Directory -Force -Path $ProcsRunDir | Out-Null
+                Write-Utf8NoBom (Join-Path $ProcsRunDir "state.json") $stJson
+                $procState = $stJson
+            }
             # Dialogo nativo "Elegir carpeta": el panel corre bajo el servicio de Apache (sesion 0,
             # sin escritorio), asi que no puede mostrar UI el mismo -- lo pide aqui, en el watcher,
             # que corre en la sesion interactiva del usuario. El panel solo espera el resultado

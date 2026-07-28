@@ -394,6 +394,13 @@ si lo lanza el watcher como SYSTEM.
 
 ## Gotchas de PowerShell
 
+- **`taskkill` (o cualquier exe) sobre stderr + `$ErrorActionPreference = "Stop"` + `2>&1` =
+  excepción terminante** en PS 5.1. `lua.ps1` fija EAP=Stop global, así que un
+  `& taskkill /F /PID <muerto> 2>&1 | Out-Null` no "falla en silencio": LANZA. En el bucle del
+  watcher, el catch la atrapaba y se saltaba el resto de la vuelta (jobs, actualizaciones...)
+  en cada iteración — el supervisor de procesos estuvo matando de hambre al resto del watcher
+  por un pid file huérfano. Receta: comprobar antes con `Get-Process -Id X -EA SilentlyContinue`
+  que el PID vive, y envolver la llamada con EAP='Continue' + `*> $null`.
 - `$cfg.sites.PSObject.Properties.Name.Contains($name)` revienta con
   `$null` cuando la colección está vacía (PowerShell devuelve `$null` en
   vez de array vacío al enumerar miembros de una colección vacía). Usar
@@ -517,6 +524,30 @@ si lo lanza el watcher como SYSTEM.
     no podía instalar **ninguna** extensión oficial de PECL: ahora hay una función
     `Install-PhpExt` que acepta las dos formas y la usan tanto `phpext` como el
     motor de Redis.
+
+- **Supervisor de procesos por proyecto** (pestaña **Procesos**) — mantiene vivos comandos
+  largos de los proyectos (colas de Laravel, `schedule:work`, Vite/npm, Reverb...) con log
+  propio y reinicio automático. Definiciones en `config\procs.json` (**fuera de git**, como
+  `sites.json`: referencian proyectos de esta máquina). El panel solo edita ese json y deja
+  flags (`tmp\procs\<id>.restart`); quien arranca/vigila/reinicia es **el watcher**, que
+  reconcilia el json con la realidad en cada vuelta. Detalles con motivo:
+  - El wrapper `.cmd` reutiliza las soluciones de la trampa nº5: `chcp 65001`, HOME propio
+    (`tmp\home`) para composer/npm, `bin\php\<ver>` del proyecto al frente del `PATH` **y
+    `PHPRC` apuntándole** (verificado: proceso con PHP 7.1 real mientras el panel corre 8.4).
+    Se escribe con `Write-Utf8NoBom`: `Set-Content -Encoding UTF8` en PS 5.1 mete BOM y cmd.exe
+    falla con `"ï»¿@echo" no se reconoce...`.
+  - "Up" por `<id>.pid` con `pid;starttime` (FileTime): la hora de arranque detecta PIDs
+    reciclados por Windows. Parar usa `taskkill /F /T` (el árbol entero, verificado que el
+    PING.EXE/php.exe hijo muere, no solo el cmd.exe).
+  - **Backoff anti crash-loop**: si el proceso muere a <15s de arrancar, se reintenta a los
+    5s→10s→20s→...→60s (verificado con `cmd /c exit 1`). Si aguanta >15s, contador a cero.
+  - Estado para el panel en `tmp\procs\state.json`, que el watcher **solo escribe si cambió**;
+    el panel pinta badges en vivo leyéndolo (AJAX `?ajax=procs&op=state`), sin `tasklist`.
+  - Borrar una definición basta: el watcher mata como **huérfano** cualquier pid cuyo id ya no
+    esté en `procs.json`.
+  - Crear/tocar procesos usa la misma llave de seguridad que la Terminal (`config\terminal.on`):
+    definir un proceso ES ejecutar un comando arbitrario, y el panel puede estar expuesto a la
+    LAN. Ver estado y logs no se bloquea.
 
 - **Pestaña Redis** — gestor propio, mismo modelo que la de SQL Server: **no gestiona un motor
   propio**, se conecta a un Redis existente con conexiones guardadas en

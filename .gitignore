@@ -33,6 +33,9 @@
 # ===== config generada de MongoDB (mongod.cfg lleva rutas ABSOLUTAS de cada maquina:
 #       si se versiona, al actualizar los demas equipos apuntarian a rutas que no existen) =====
 /config/mongodb/
+
+# ===== procesos supervisados (referencian proyectos de cada maquina, como sites.json) =====
+/config/procs.json
 /config/ftp/
 /config/php/extra-extensions.json
 
