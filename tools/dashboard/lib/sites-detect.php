@@ -296,7 +296,7 @@ function rrmdir($dir){
 }
 // El panel NO lanza procesos: solo deja un archivo-senal en tmp\ que el watcher
 // (proceso independiente arrancado por 'lua.ps1 start') ejecuta en ~1 segundo.
-function lua_flag($name){ @file_put_contents(dirname(__DIR__,2).'/tmp/'.$name.'.flag', (string)time()); }
+function lua_flag($name){ global $ROOT; @file_put_contents($ROOT.'/tmp/'.$name.'.flag', (string)time()); }
 function lua_apply(){ lua_flag('apply'); }
 function lua_hosts(){ lua_flag('hosts'); }
 
