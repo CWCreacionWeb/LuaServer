@@ -797,6 +797,155 @@ function pgsrv_roles(){
     } catch (Throwable $e) { return null; }
 }
 
+// ---------------- Redis: conexiones guardadas + cliente RESP propio ----------------
+// Mismo modelo que SQL Server (ver mas abajo): NO se gestiona un motor propio aqui, se conecta
+// a un Redis existente -- el de un contenedor de Docker, uno nativo, o uno de red. Por eso lo
+// primero es una lista de conexiones guardadas y no un flag de encendido.
+//
+// Se habla el protocolo a pelo por fsockopen en vez de usar la extension php_redis. Motivos:
+//  1. php_redis NO viene con PHP en Windows y su instalacion depende de que casen version, NTS
+//     y toolset de VC (ver el mapa $PhpRedisBuilds en lua.ps1). Si el gestor dependiera de ella,
+//     no funcionaria hasta tenerla instalada en la version que sirve el panel.
+//  2. RESP es trivial: 5 tipos de respuesta y los comandos son arrays de bulk strings. Salen
+//     ~60 lineas y funciona en cualquier PHP, con o sin extension.
+// La extension sigue siendo util para las APPS del usuario, pero este gestor no la necesita.
+function redis_file($root){ return $root.'/config/redis-servers.json'; }
+function redis_servers($root){
+    $f = redis_file($root);
+    if (!is_file($f)) return [];
+    $d = json_decode((string)@file_get_contents($f), true);
+    return is_array($d) ? $d : [];
+}
+function redis_save_servers($root, $list){
+    @mkdir(dirname(redis_file($root)), 0777, true);
+    @file_put_contents(redis_file($root), json_encode(array_values($list), JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
+}
+function redis_find($root, $id){
+    foreach (redis_servers($root) as $s) { if (($s['id'] ?? '') === $id) return $s; }
+    return null;
+}
+function valid_redis_id($n){ return (bool)preg_match('/^[a-f0-9]{12}$/', (string)$n); }
+
+// Abre el socket y autentica/selecciona base. Devuelve el recurso o lanza RuntimeException.
+function redis_connect($srv, $db = 0) {
+    $host = (string)($srv['host'] ?? '127.0.0.1');
+    $port = (int)($srv['port'] ?? 6379);
+    $errno = 0; $errstr = '';
+    $fp = @fsockopen($host, $port, $errno, $errstr, 3.0);
+    if (!$fp) { throw new RuntimeException('No se pudo conectar a '.$host.':'.$port.($errstr!==''?' ('.$errstr.')':'')); }
+    stream_set_timeout($fp, 5);
+    $pass = (string)($srv['pass'] ?? '');
+    if ($pass !== '') {
+        $user = (string)($srv['user'] ?? '');
+        // Redis 6+ admite AUTH <user> <pass> (ACLs); sin usuario es el AUTH clasico.
+        $r = redis_cmd($fp, $user !== '' ? ['AUTH', $user, $pass] : ['AUTH', $pass]);
+        if ($r instanceof RedisErr) { fclose($fp); throw new RuntimeException('Autenticación rechazada: '.$r->msg); }
+    }
+    if ($db > 0) {
+        $r = redis_cmd($fp, ['SELECT', (string)$db]);
+        if ($r instanceof RedisErr) { fclose($fp); throw new RuntimeException('No se pudo seleccionar la base '.$db.': '.$r->msg); }
+    }
+    return $fp;
+}
+// Los errores del servidor (-ERR ...) se devuelven como objeto en vez de lanzar: en la consola
+// de comandos un error es un resultado legitimo que hay que mostrar, no una excepcion.
+class RedisErr { public $msg; function __construct($m){ $this->msg = $m; } }
+
+function redis_cmd($fp, array $args) {
+    // Peticion RESP: array de bulk strings. Vale para cualquier comando y evita tener que
+    // escapar nada (la longitud va por delante, asi que un valor con \r\n o espacios es seguro).
+    $out = '*'.count($args)."\r\n";
+    foreach ($args as $a) { $a = (string)$a; $out .= '$'.strlen($a)."\r\n".$a."\r\n"; }
+    if (@fwrite($fp, $out) === false) { throw new RuntimeException('Se perdió la conexión al enviar el comando.'); }
+    return redis_read($fp);
+}
+function redis_read($fp) {
+    $line = fgets($fp);
+    if ($line === false || $line === '') {
+        $meta = stream_get_meta_data($fp);
+        throw new RuntimeException(!empty($meta['timed_out']) ? 'El servidor no respondió (timeout).' : 'El servidor cerró la conexión.');
+    }
+    $type = $line[0];
+    $body = substr($line, 1, -2);   // quita el prefijo y el \r\n
+    switch ($type) {
+        case '+': return $body;                    // simple string
+        case '-': return new RedisErr($body);      // error
+        case ':': return (int)$body;               // integer
+        case '$':                                  // bulk string
+            $len = (int)$body;
+            if ($len === -1) return null;          // nil
+            $data = '';
+            // fread puede devolver menos de lo pedido: hay que insistir hasta juntar $len.
+            while (strlen($data) < $len) {
+                $chunk = fread($fp, $len - strlen($data));
+                if ($chunk === false || $chunk === '') { throw new RuntimeException('Respuesta incompleta del servidor.'); }
+                $data .= $chunk;
+            }
+            fread($fp, 2);                         // el \r\n final
+            return $data;
+        case '*':                                  // array (puede venir anidado)
+            $n = (int)$body;
+            if ($n === -1) return null;
+            $arr = [];
+            for ($i = 0; $i < $n; $i++) { $arr[] = redis_read($fp); }
+            return $arr;
+        default:
+            throw new RuntimeException('Respuesta RESP no reconocida (prefijo "'.$type.'").');
+    }
+}
+// Ejecuta un comando y lanza si el servidor devuelve error. Para los sitios donde un -ERR sí es
+// un fallo de verdad (leer una clave, listar bases...) y no algo que mostrar tal cual.
+function redis_must($fp, array $args) {
+    $r = redis_cmd($fp, $args);
+    if ($r instanceof RedisErr) { throw new RuntimeException($r->msg); }
+    return $r;
+}
+// Parte una linea escrita por el usuario en la consola en argumentos, respetando comillas
+// simples y dobles (para valores con espacios) igual que hace redis-cli. Devuelve [] si quedan
+// comillas sin cerrar, para poder avisar en vez de mandar un comando a medias.
+function redis_split_cmd($line) {
+    $args = []; $cur = ''; $q = null; $has = false;
+    $len = strlen($line);
+    for ($i = 0; $i < $len; $i++) {
+        $c = $line[$i];
+        if ($q !== null) {
+            if ($c === $q) { $q = null; continue; }
+            // \" y \' dentro de comillas: se toma el caracter literal.
+            if ($c === '\\' && $i + 1 < $len) { $cur .= $line[++$i]; continue; }
+            $cur .= $c;
+            continue;
+        }
+        if ($c === '"' || $c === "'") { $q = $c; $has = true; continue; }
+        if ($c === ' ' || $c === "\t") {
+            if ($cur !== '' || $has) { $args[] = $cur; $cur = ''; $has = false; }
+            continue;
+        }
+        $cur .= $c;
+    }
+    if ($q !== null) return [];              // comilla sin cerrar
+    if ($cur !== '' || $has) $args[] = $cur;
+    return $args;
+}
+// Prepara una respuesta de Redis para json_encode. Los arrays anidados se dejan tal cual (el
+// front los pinta recursivamente) y los nulls se marcan para poder distinguir un nil de Redis
+// de una cadena vacia, que en Redis NO es lo mismo.
+function redis_json_safe($v) {
+    if (is_array($v)) { return array_map('redis_json_safe', $v); }
+    if ($v === null)  { return ['__nil' => true]; }
+    return $v;
+}
+// Convierte la respuesta de INFO (texto plano "clave:valor" por lineas) en array asociativo.
+function redis_parse_info($txt) {
+    $out = [];
+    foreach (preg_split('/\r?\n/', (string)$txt) as $l) {
+        if ($l === '' || $l[0] === '#') continue;
+        $p = strpos($l, ':');
+        if ($p === false) continue;
+        $out[substr($l, 0, $p)] = substr($l, $p + 1);
+    }
+    return $out;
+}
+
 // ---------------- SQL Server (Microsoft): conexiones guardadas y metadatos ----------------
 // A diferencia de MySQL/Postgres/Mongo, aqui NO gestionamos un motor propio: SQL Server no se
 // instala con la plataforma, se conecta a uno existente (local o de red). Por eso lo primero
@@ -1315,7 +1464,7 @@ function safe_logname($n){ return preg_match('/^[a-z0-9._-]+\.log$/i',$n) ? $n :
 // un log de sistema/Apache, no de un proyecto -> agrupado bajo el pseudo-proyecto '(sistema)'.
 // Deriva [proyecto, kind] del nombre de un .log a partir de su sufijo (ver vhost.tpl).
 // Se usa tanto para agrupar el listado (logs_group_by_project) como para saber a que
-// proyecto volver tras borrar un archivo (accion 'deletelog'), donde el fichero ya no
+// proyecto pertenecia un archivo ya borrado (ajax 'logdelete'), donde el fichero ya no
 // existe y por tanto no se puede derivar el proyecto desde $logFiles.
 function log_file_project($lf){
     $suffixes = ['-ssl-error.log','-ssl-access.log','-error.log','-access.log'];
@@ -1621,6 +1770,283 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'file_
     if (@file_put_contents($fTarget, $toWrite) === false) { echo json_encode(['error'=>'No se pudo guardar el archivo (¿permisos?).']); exit; }
     echo json_encode(['ok'=>true]);
     exit;
+}
+
+// ---------------- AJAX: borrar/vaciar un log de la pestaña Logs (JSON, no PRG) ----------------
+// Igual razon que el explorador de SQL Server (ver mas abajo): el desplegable de
+// proyecto/archivo es demasiado interactivo para el patron PRG del resto del panel. Con
+// PRG, tras borrar habia que "adivinar" en el redirect que proyecto/archivo tocaba mostrar
+// despues -- y esa heuristica se quedaba corta en mas de un caso (p.ej. al borrar el ultimo
+// .log de un proyecto), perdiendo la seleccion del usuario en cada recarga. Por AJAX, el
+// propio cliente decide que mostrar despues sin depender de ninguna heuristica del servidor.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($_POST['ajax'] ?? '', ['logdelete','logclear'], true)) {
+    header('Content-Type: application/json; charset=utf-8');
+    $op = $_POST['ajax'];
+    $lf = safe_logname($_POST['log'] ?? '');
+    if ($lf === '' || !is_file($ROOT.'/logs/apache/'.$lf)) { echo json_encode(['error'=>'Ese log ya no existe.']); exit; }
+
+    if ($op === 'logclear') {
+        @file_put_contents($ROOT.'/logs/apache/'.$lf, '');
+        echo json_encode(['ok'=>true]);
+        exit;
+    }
+
+    // logdelete
+    @unlink($ROOT.'/logs/apache/'.$lf);
+    [$lProj] = log_file_project($lf);
+    $lRemaining = [];
+    foreach (glob($ROOT.'/logs/apache/*.log') as $f) { $lRemaining[] = basename($f); }
+    $lProjFiles = logs_group_by_project($lRemaining)[$lProj] ?? [];
+    $lNext = '';
+    foreach ($lProjFiles as $f) { if ($f['kind']==='error') { $lNext = $f['file']; break; } }
+    if ($lNext === '' && $lProjFiles) { $lNext = $lProjFiles[0]['file']; }
+    echo json_encode([
+        'ok'      => true,
+        'files'   => array_map(function($f){ return ['file'=>$f['file'], 'label'=>log_kind_label($f['kind'])]; }, $lProjFiles),
+        'next'    => $lNext,
+        'content' => $lNext !== '' ? highlight_error_log(tail_file($ROOT.'/logs/apache/'.$lNext, 300)) : '',
+    ]);
+    exit;
+}
+
+// ---------------- Endpoints AJAX del gestor de Redis (JSON, no PRG) ----------------
+// Misma razon que el explorador de SQL Server: navegar claves, paginar con cursor y editar
+// valores es demasiado interactivo para el patron PRG. En RESP no hace falta escapar nada (los
+// argumentos van con su longitud por delante), asi que no hay equivalente a la inyeccion SQL:
+// la validacion aqui es de coherencia (ids, numeros, tipos), no de escapado.
+if (($_REQUEST['ajax'] ?? '') === 'redis') {
+    header('Content-Type: application/json; charset=utf-8');
+    $rreply = function($o){ echo json_encode($o, JSON_INVALID_UTF8_SUBSTITUTE|JSON_UNESCAPED_UNICODE); exit; };
+    $op = (string)($_REQUEST['op'] ?? '');
+
+    $rsrv = valid_redis_id((string)($_REQUEST['conn'] ?? '')) ? redis_find($ROOT, $_REQUEST['conn']) : null;
+    if (!$rsrv) { $rreply(['error'=>'Conexión no válida o ya eliminada.']); }
+    $rdb = max(0, min(255, (int)($_REQUEST['db'] ?? 0)));
+
+    try {
+        $fp = redis_connect($rsrv, $rdb);
+    } catch (Throwable $e) {
+        $rreply(['error'=>$e->getMessage()]);
+    }
+
+    // Une la respuesta plana de HGETALL / ZRANGE WITHSCORES (campo, valor, campo, valor...) en
+    // pares. Redis siempre devuelve esos comandos aplanados, nunca como array de pares.
+    $rpairs = function($flat) {
+        $out = [];
+        $flat = is_array($flat) ? $flat : [];
+        for ($i = 0; $i + 1 < count($flat); $i += 2) { $out[] = ['k'=>$flat[$i], 'v'=>$flat[$i+1]]; }
+        return $out;
+    };
+
+    try {
+        switch ($op) {
+
+        case 'test':
+            $info = redis_parse_info(redis_must($fp, ['INFO','server']));
+            $rreply(['ok'=>true, 'version'=>($info['redis_version'] ?? '?'), 'mode'=>($info['redis_mode'] ?? '?')]);
+
+        // Lista de bases con su numero de claves. El total de bases sale de CONFIG GET databases
+        // (16 por defecto); si CONFIG esta deshabilitado en el servidor se asumen 16 y ya.
+        case 'dbs':
+            $cfgDb = redis_cmd($fp, ['CONFIG','GET','databases']);
+            $nDbs = (is_array($cfgDb) && isset($cfgDb[1])) ? (int)$cfgDb[1] : 16;
+            if ($nDbs < 1 || $nDbs > 256) $nDbs = 16;
+            // INFO keyspace solo lista las bases NO vacias ("db0:keys=9,expires=7,...").
+            $ks = redis_parse_info(redis_must($fp, ['INFO','keyspace']));
+            $counts = [];
+            foreach ($ks as $k => $v) {
+                if (!preg_match('/^db(\d+)$/', $k, $m)) continue;
+                $keys = 0;
+                if (preg_match('/keys=(\d+)/', $v, $mm)) $keys = (int)$mm[1];
+                $counts[(int)$m[1]] = $keys;
+            }
+            $list = [];
+            for ($i = 0; $i < $nDbs; $i++) { $list[] = ['db'=>$i, 'keys'=>($counts[$i] ?? 0)]; }
+            $rreply(['ok'=>true, 'dbs'=>$list]);
+
+        // Recorrido de claves con SCAN. Se usa SCAN y NUNCA KEYS: KEYS recorre todo el keyspace
+        // de golpe y bloquea el servidor, que aqui puede ser uno compartido con las apps del
+        // usuario. El cursor lo lleva el cliente (0 = empezar, 0 devuelto = fin).
+        case 'scan':
+            $cursor = (string)($_REQUEST['cursor'] ?? '0');
+            if (!preg_match('/^\d+$/', $cursor)) $cursor = '0';
+            $match  = (string)($_REQUEST['match'] ?? '');
+            $count  = max(10, min(1000, (int)($_REQUEST['count'] ?? 100)));
+            $args = ['SCAN', $cursor, 'COUNT', (string)$count];
+            if ($match !== '') { $args[] = 'MATCH'; $args[] = $match; }
+            $res = redis_must($fp, $args);
+            $next = is_array($res) ? (string)($res[0] ?? '0') : '0';
+            $keys = (is_array($res) && isset($res[1]) && is_array($res[1])) ? $res[1] : [];
+            // Tipo y TTL de cada clave. Son 2 comandos extra por clave; con COUNT<=1000 y una
+            // conexion ya abierta el coste es despreciable y evita tener que abrir la clave para
+            // saber que es. Una clave puede expirar entre el SCAN y esto: TYPE devuelve 'none'.
+            $out = [];
+            foreach ($keys as $k) {
+                $t = redis_cmd($fp, ['TYPE', $k]);
+                if ($t instanceof RedisErr || $t === 'none') continue;
+                $ttl = redis_cmd($fp, ['TTL', $k]);
+                $out[] = ['key'=>$k, 'type'=>(string)$t, 'ttl'=>($ttl instanceof RedisErr ? -1 : (int)$ttl)];
+            }
+            $rreply(['ok'=>true, 'cursor'=>$next, 'done'=>($next === '0'), 'keys'=>$out]);
+
+        // Valor completo de una clave, con la forma que corresponda a su tipo.
+        case 'key':
+            $key = (string)($_REQUEST['key'] ?? '');
+            if ($key === '') { $rreply(['error'=>'Falta la clave.']); }
+            $type = redis_must($fp, ['TYPE', $key]);
+            if ($type === 'none') { $rreply(['error'=>'La clave ya no existe (¿ha expirado?).']); }
+            $ttl = (int)redis_must($fp, ['TTL', $key]);
+            $o = ['ok'=>true, 'key'=>$key, 'type'=>$type, 'ttl'=>$ttl];
+            switch ($type) {
+                case 'string':
+                    $v = redis_must($fp, ['GET', $key]);
+                    $o['len'] = strlen((string)$v);
+                    // Los valores enormes (sesiones serializadas, cachés de vistas) petarían el
+                    // navegador: se manda un trozo y se avisa. El editor se bloquea en ese caso
+                    // para no guardar el valor truncado encima del original.
+                    $o['truncated'] = $o['len'] > 262144;
+                    $o['value'] = $o['truncated'] ? substr((string)$v, 0, 262144) : (string)$v;
+                    break;
+                case 'hash':
+                    $o['count'] = (int)redis_must($fp, ['HLEN', $key]);
+                    $o['items'] = $rpairs(redis_must($fp, ['HGETALL', $key]));
+                    break;
+                case 'list':
+                    $o['count'] = (int)redis_must($fp, ['LLEN', $key]);
+                    $o['items'] = redis_must($fp, ['LRANGE', $key, '0', '999']);
+                    break;
+                case 'set':
+                    $o['count'] = (int)redis_must($fp, ['SCARD', $key]);
+                    $o['items'] = redis_must($fp, ['SRANDMEMBER', $key, '1000']);
+                    break;
+                case 'zset':
+                    $o['count'] = (int)redis_must($fp, ['ZCARD', $key]);
+                    $o['items'] = $rpairs(redis_must($fp, ['ZRANGE', $key, '0', '999', 'WITHSCORES']));
+                    break;
+                default:
+                    // stream y cualquier tipo futuro: se informa, no se intenta representar.
+                    $o['items'] = [];
+                    $o['unsupported'] = true;
+            }
+            $rreply($o);
+
+        // Edicion. Cada tipo tiene su comando; no hay un "set" generico en Redis.
+        case 'edit':
+            $key  = (string)($_REQUEST['key'] ?? '');
+            $type = (string)($_REQUEST['type'] ?? '');
+            $val  = (string)($_REQUEST['value'] ?? '');
+            $fld  = (string)($_REQUEST['field'] ?? '');
+            if ($key === '') { $rreply(['error'=>'Falta la clave.']); }
+            switch ($type) {
+                case 'string': $r = redis_cmd($fp, ['SET', $key, $val]); break;
+                case 'hash':   $r = redis_cmd($fp, ['HSET', $key, $fld, $val]); break;
+                // LSET necesita un indice existente: no sirve para anadir, solo para modificar.
+                case 'list':   $r = redis_cmd($fp, ['LSET', $key, (string)(int)$fld, $val]); break;
+                // Un set no tiene "modificar": se quita el viejo y se anade el nuevo.
+                case 'set':    redis_cmd($fp, ['SREM', $key, $fld]); $r = redis_cmd($fp, ['SADD', $key, $val]); break;
+                case 'zset':   $r = redis_cmd($fp, ['ZADD', $key, $val, $fld]); break;  // value = score
+                default:       $rreply(['error'=>'Ese tipo no se puede editar aquí.']);
+            }
+            if ($r instanceof RedisErr) { $rreply(['error'=>$r->msg]); }
+            $rreply(['ok'=>true]);
+
+        case 'additem':
+            $key  = (string)($_REQUEST['key'] ?? '');
+            $type = (string)($_REQUEST['type'] ?? '');
+            $val  = (string)($_REQUEST['value'] ?? '');
+            $fld  = (string)($_REQUEST['field'] ?? '');
+            if ($key === '') { $rreply(['error'=>'Falta la clave.']); }
+            switch ($type) {
+                case 'hash': $r = redis_cmd($fp, ['HSET', $key, $fld, $val]); break;
+                case 'list': $r = redis_cmd($fp, ['RPUSH', $key, $val]); break;
+                case 'set':  $r = redis_cmd($fp, ['SADD', $key, $val]); break;
+                case 'zset': $r = redis_cmd($fp, ['ZADD', $key, ($val !== '' ? $val : '0'), $fld]); break;
+                default:     $rreply(['error'=>'Ese tipo no admite añadir elementos aquí.']);
+            }
+            if ($r instanceof RedisErr) { $rreply(['error'=>$r->msg]); }
+            $rreply(['ok'=>true]);
+
+        case 'delitem':
+            $key  = (string)($_REQUEST['key'] ?? '');
+            $type = (string)($_REQUEST['type'] ?? '');
+            $fld  = (string)($_REQUEST['field'] ?? '');
+            if ($key === '') { $rreply(['error'=>'Falta la clave.']); }
+            switch ($type) {
+                case 'hash': $r = redis_cmd($fp, ['HDEL', $key, $fld]); break;
+                // En una lista no se puede borrar por indice: se marca con un centinela y se
+                // quita. Es el idioma habitual de Redis para esto (LSET + LREM).
+                case 'list': redis_cmd($fp, ['LSET', $key, (string)(int)$fld, '__lua_del__']); $r = redis_cmd($fp, ['LREM', $key, '1', '__lua_del__']); break;
+                case 'set':  $r = redis_cmd($fp, ['SREM', $key, $fld]); break;
+                case 'zset': $r = redis_cmd($fp, ['ZREM', $key, $fld]); break;
+                default:     $rreply(['error'=>'Ese tipo no admite borrar elementos aquí.']);
+            }
+            if ($r instanceof RedisErr) { $rreply(['error'=>$r->msg]); }
+            $rreply(['ok'=>true]);
+
+        case 'del':
+            $keys = $_REQUEST['keys'] ?? [];
+            if (is_string($keys)) $keys = [$keys];
+            if (!is_array($keys) || !$keys) { $rreply(['error'=>'No se indicó ninguna clave.']); }
+            $n = redis_must($fp, array_merge(['DEL'], array_map('strval', $keys)));
+            $rreply(['ok'=>true, 'deleted'=>(int)$n]);
+
+        case 'ttl':
+            $key = (string)($_REQUEST['key'] ?? '');
+            $sec = (int)($_REQUEST['seconds'] ?? -1);
+            if ($key === '') { $rreply(['error'=>'Falta la clave.']); }
+            // -1 (o menos) = quitar la expiracion. EXPIRE con 0 o negativo BORRA la clave, que
+            // no es lo que quiere quien escribe "sin expiracion": ahi va PERSIST.
+            $r = $sec > 0 ? redis_cmd($fp, ['EXPIRE', $key, (string)$sec]) : redis_cmd($fp, ['PERSIST', $key]);
+            if ($r instanceof RedisErr) { $rreply(['error'=>$r->msg]); }
+            $rreply(['ok'=>true]);
+
+        case 'rename':
+            $key = (string)($_REQUEST['key'] ?? '');
+            $to  = (string)($_REQUEST['to'] ?? '');
+            if ($key === '' || $to === '') { $rreply(['error'=>'Falta el nombre de origen o de destino.']); }
+            // RENAMENX en vez de RENAME: RENAME pisa el destino sin avisar si ya existe.
+            $r = redis_cmd($fp, ['RENAMENX', $key, $to]);
+            if ($r instanceof RedisErr) { $rreply(['error'=>$r->msg]); }
+            if ((int)$r === 0) { $rreply(['error'=>'Ya existe una clave llamada "'.$to.'".']); }
+            $rreply(['ok'=>true]);
+
+        case 'flushdb':
+            $r = redis_cmd($fp, ['FLUSHDB']);
+            if ($r instanceof RedisErr) { $rreply(['error'=>$r->msg]); }
+            $rreply(['ok'=>true]);
+
+        case 'info':
+            $raw = redis_must($fp, ['INFO']);
+            $i = redis_parse_info($raw);
+            $rreply(['ok'=>true, 'info'=>$i, 'raw'=>(string)$raw]);
+
+        // Consola de comandos. Equivalente a la consola SQL de la pestana SQL Server: se ejecuta
+        // lo que el usuario escriba y los errores del servidor se muestran como resultado.
+        case 'cmd':
+            $line = trim((string)($_REQUEST['line'] ?? ''));
+            if ($line === '') { $rreply(['error'=>'Escribe un comando.']); }
+            $args = redis_split_cmd($line);
+            if (!$args) { $rreply(['error'=>'No se entendió el comando (¿comillas sin cerrar?).']); }
+            $verb = strtoupper($args[0]);
+            // SHUTDOWN se bloquea: apagaria el servidor (que aqui puede ser un contenedor
+            // compartido con las apps) y desde el panel no hay forma de volver a levantarlo.
+            if ($verb === 'SHUTDOWN') { $rreply(['error'=>'SHUTDOWN está bloqueado desde el panel: apagaría el servidor y no se puede rearrancar desde aquí.']); }
+            // Comandos que dejan la conexion en otro modo y romperian el ciclo peticion/respuesta.
+            if (in_array($verb, ['SUBSCRIBE','PSUBSCRIBE','MONITOR','SSUBSCRIBE'], true)) {
+                $rreply(['error'=>$verb.' deja la conexión escuchando indefinidamente: no encaja en este gestor.']);
+            }
+            $r = redis_cmd($fp, $args);
+            if ($r instanceof RedisErr) { $rreply(['ok'=>true, 'err'=>$r->msg]); }
+            $rreply(['ok'=>true, 'result'=>redis_json_safe($r)]);
+
+        default:
+            $rreply(['error'=>'Operación no válida.']);
+        }
+    } catch (Throwable $e) {
+        $rreply(['error'=>$e->getMessage()]);
+    } finally {
+        if (isset($fp) && is_resource($fp)) { @fclose($fp); }
+    }
 }
 
 // ---------------- Endpoints AJAX del explorador de SQL Server (JSON, no PRG) ----------------
@@ -2386,26 +2812,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $tab='logs';
         header('Location: ?tab=logs&log='.urlencode($lf)); exit;
     }
-    elseif ($action === 'deletelog') {
-        $lf = safe_logname($_POST['log'] ?? '');
-        $tab='logs';
-        if ($lf && is_file($ROOT.'/logs/apache/'.$lf)) { @unlink($ROOT.'/logs/apache/'.$lf); $msg='applied:Log '.$lf.' eliminado.'; }
-        else { $msg='error:Ese log ya no existe.'; }
-        // El archivo borrado ya no se puede volver a seleccionar: se vuelve al mismo
-        // proyecto (derivado del propio nombre) y, si le quedan otros archivos, se
-        // selecciona uno (preferiblemente "error") para no dejar la vista en blanco
-        // pidiendo elegir de nuevo -- solo si el proyecto se queda sin ninguno se cae
-        // al estado "elige un archivo".
-        [$proj] = log_file_project($lf);
-        $remaining = [];
-        foreach (glob($ROOT.'/logs/apache/*.log') as $f) { $remaining[] = basename($f); }
-        $projFiles = logs_group_by_project($remaining)[$proj] ?? [];
-        $fallback = '';
-        foreach ($projFiles as $f) { if ($f['kind']==='error') { $fallback = $f['file']; break; } }
-        if ($fallback === '' && $projFiles) { $fallback = $projFiles[0]['file']; }
-        $loc = '?tab=logs&project='.urlencode($proj).($fallback!==''?'&log='.urlencode($fallback):'').'&msg='.urlencode($msg);
-        header('Location: '.$loc); exit;
-    }
     elseif ($action === 'switch') {
         $name=$_POST['name']??''; $php=$_POST['php']??'';
         $siteKey = resolve_site_key($cfg['sites'], $name);
@@ -2853,7 +3259,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $enable = ($_POST['enable'] ?? '') === '1';
         if ($enable) {
             @file_put_contents($ROOT.'/config/mongodb.on','1');
-            if (is_file($ROOT.'/bin/mongodb/bin/mongod.exe')) {
+            // Comprueba tambien mongo-express, no solo mongod.exe: son dos pasos independientes
+            // del mismo job (ver case 'mongodb' de Run-Job) y uno puede faltar sin el otro
+            // (p.ej. tras un fallo del build de mongo-express con MongoDB ya instalado). Si solo
+            // se mirara mongod.exe, "Activar" se quedaria callado sin arreglar nada en ese caso.
+            if (is_file($ROOT.'/bin/mongodb/bin/mongod.exe') && is_file($ROOT.'/bin/mongo-express/app.js')) {
                 $msg='info:MongoDB activándose. Conecta en 127.0.0.1:27017, sin autenticación.';
             } else {
                 $id='mongodb-'.time();
@@ -2863,6 +3273,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $msg='job:Descargando e instalando MongoDB + Node.js + mongo-express (~400-500 MB en total)… puede tardar varios minutos.';
             }
         } else { @unlink($ROOT.'/config/mongodb.on'); $msg='info:MongoDB desactivándose.'; }
+    }
+    elseif ($action === 'redis') {
+        $tab = ($_POST['from_tab'] ?? '') === 'proyectos' ? 'proyectos' : 'config';
+        $enable = ($_POST['enable'] ?? '') === '1';
+        if ($enable) {
+            @file_put_contents($ROOT.'/config/redis.on','1');
+            // Igual que MongoDB: el job tiene dos partes independientes (servidor + extension de
+            // PHP), asi que no basta con mirar el .exe. Si el servidor ya esta pero falta la
+            // extension en alguna version, hay que volver a lanzar el job para completarla.
+            $rExe  = is_file($ROOT.'/bin/redis/redis-server.exe');
+            $rExtOk = false;
+            if ($rExe) {
+                // Basta con que la version por defecto la tenga: es la que usan el panel y los
+                // proyectos nuevos. El job, si se lanza, completa igualmente todas las demas.
+                $rDef = $cfg['defaultPhp'] ?? '8.4';
+                $rExtOk = is_file($ROOT.'/bin/php/'.$rDef.'/ext/php_redis.dll');
+            }
+            if ($rExe && $rExtOk) {
+                $msg='info:Redis activándose. Conecta en 127.0.0.1:6379, sin contraseña.';
+            } else {
+                // 'build' solo se usa si el servidor no esta instalado todavia; una vez instalado
+                // se respeta el que haya (config\redis\build.txt) y el job solo completa la extension.
+                $rBuild = ($_POST['build'] ?? '') === 'native5' ? 'native5' : 'redis8';
+                $id='redis-'.time();
+                $job=['id'=>$id,'name'=>'redis','php'=>($cfg['defaultPhp']??'8.4'),'type'=>'redis','url'=>'','build'=>$rBuild];
+                @mkdir($ROOT.'/tmp/jobs',0777,true);
+                file_put_contents($ROOT.'/tmp/jobs/'.$id.'.job', json_encode($job));
+                $msg='job:Descargando Redis ('.($rBuild==='native5'?'5.0.14.1 nativo':'8.8.1').') y la extensión php_redis para cada versión de PHP… puede tardar unos minutos.';
+            }
+        } else { @unlink($ROOT.'/config/redis.on'); $msg='info:Redis desactivándose.'; }
     }
     elseif ($action === 'startup') {
         $tab='config';
@@ -3133,6 +3573,60 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $msg='applied:Conexión eliminada.';
         }
     }
+    // ---- Conexiones de Redis (mismo modelo que las de SQL Server) ----
+    elseif ($action === 'redis_save') {
+        $tab='redis';
+        $id    = trim($_POST['id'] ?? '');
+        $label = trim($_POST['label'] ?? '');
+        $host  = trim($_POST['host'] ?? '');
+        $port  = (int)($_POST['port'] ?? 6379);
+        $user  = trim($_POST['user'] ?? '');
+        $pass  = (string)($_POST['pass'] ?? '');
+        $editing = $id !== '' && valid_redis_id($id) && redis_find($ROOT, $id) !== null;
+        if ($host === '')                   { $msg='error:Indica el host o la IP del servidor.'; }
+        elseif ($port < 1 || $port > 65535) { $msg='error:Puerto no válido.'; }
+        else {
+            $list = redis_servers($ROOT);
+            // Igual que en SQL Server: si al editar no se escribe contraseña, se conserva la
+            // guardada (el formulario nunca la reenvia al navegador).
+            if ($editing && $pass === '') {
+                $prev = redis_find($ROOT, $id);
+                $pass = (string)($prev['pass'] ?? '');
+            }
+            $entry = [
+                'id'    => $editing ? $id : bin2hex(random_bytes(6)),
+                'label' => $label !== '' ? $label : $host.':'.$port,
+                'host'  => $host, 'port' => $port, 'user' => $user, 'pass' => $pass,
+            ];
+            // Se prueba la conexion al guardar para avisar en el momento, pero se guarda igual:
+            // el servidor puede estar apagado ahora y arrancar despues.
+            $okC = false; $infoC = '';
+            try {
+                $tfp = redis_connect($entry, 0);
+                $ti = redis_parse_info(redis_cmd($tfp, ['INFO','server']));
+                @fclose($tfp);
+                $okC = true; $infoC = 'Redis '.($ti['redis_version'] ?? '?').' ('.($ti['redis_mode'] ?? 'standalone').').';
+            } catch (Throwable $e) { $infoC = $e->getMessage(); }
+            if ($editing) {
+                foreach ($list as $i => $s) { if (($s['id'] ?? '') === $id) { $list[$i] = $entry; break; } }
+            } else { $list[] = $entry; }
+            redis_save_servers($ROOT, $list);
+            $verbo = $editing ? 'actualizada' : 'guardada';
+            $msg = $okC
+                ? 'applied:Conexión "'.$entry['label'].'" '.$verbo.'. '.$infoC
+                : 'info:Conexión "'.$entry['label'].'" '.$verbo.', pero NO se pudo conectar: '.$infoC;
+        }
+    }
+    elseif ($action === 'redis_del') {
+        $tab='redis';
+        $id = trim($_POST['id'] ?? '');
+        if (!valid_redis_id($id)) { $msg='error:Conexión no válida.'; }
+        else {
+            $list = array_values(array_filter(redis_servers($ROOT), function($s) use ($id){ return ($s['id'] ?? '') !== $id; }));
+            redis_save_servers($ROOT, $list);
+            $msg='applied:Conexión eliminada.';
+        }
+    }
     // ---- Actualizaciones de la plataforma ----
     // El panel no puede hacer 'git fetch' (remoto SSH, y aqui corremos como SYSTEM): deja un
     // archivo-senal y el watcher lo recoge, igual que con HTTPS o la sincronizacion de hosts.
@@ -3193,6 +3687,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // modal al recargar -- si no, el usuario pierde de vista el formulario que acaba de
     // rellenar y tiene que volver a abrirlo el mismo desde cero.
     $reopenModal = in_array($action, ['create','add_external'], true) && strpos((string)$msg, 'error:') === 0;
+
+    // Guardado con el icono de disquete de las cards de ajustes: mismo handler de siempre,
+    // solo cambia la respuesta. Se contesta JSON en vez de redirigir para que la página no
+    // recargue y el icono pueda ponerse verde en sitio. 'reload' marca las acciones cuyo
+    // efecto no se puede reflejar sin repintar la página entera (set_tld cambia el dominio
+    // de todos los proyectos y dispara la sincronización de hosts con UAC).
+    if (($_POST['ajax'] ?? '') === '1') {
+        header('Content-Type: application/json; charset=utf-8');
+        [$aType,$aText] = array_pad(explode(':',(string)$msg,2),2,'');
+        echo json_encode([
+            'ok'     => $aType !== 'error',
+            'type'   => $aType,
+            'msg'    => $aText,
+            'reload' => in_array($action, ['set_tld'], true),
+        ], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+
     header('Location: ?tab='.$tab.(isset($ver)?'&ver='.urlencode($ver):'').($redirName?'&name='.urlencode($redirName):'').(isset($tab_engine)?'&engine='.urlencode($tab_engine):'').($reopenModal?'&reopen=newproject':'').'&msg='.urlencode($msg));
     exit;
 }
@@ -3342,6 +3854,18 @@ setTimeout(ping,1500);})();
   .cfg3 .cfg3-actions{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
   .cfg3 label{display:block;font-size:12px;color:var(--mut);margin:0 0 4px}
   @media (max-width:900px){ .cfg3{grid-template-columns:1fr} }
+  /* Icono de disquete = guardar los ajustes de esa card (sin boton en el pie). Guarda por
+     AJAX y se pone verde al confirmar el servidor; rojo si el guardado se rechaza. */
+  .card.cardsave{position:relative}
+  .card.cardsave .cardsave-title{padding-right:38px}
+  .savebtn{position:absolute;top:14px;right:14px;display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0;border:1px solid var(--line);border-radius:7px;background:var(--in);color:var(--mut);cursor:pointer;transition:color .15s,border-color .15s,background-color .15s}
+  .savebtn:hover{color:var(--tx);border-color:var(--mut)}
+  .savebtn.ok{color:var(--ok);border-color:var(--ok);background:rgba(63,185,80,.14)}
+  .savebtn.err{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.14)}
+  .savebtn[disabled]{opacity:.55;cursor:default}
+  .savemsg{font-size:11.5px;margin-top:8px}
+  .savemsg.ok{color:var(--ok)}
+  .savemsg.err{color:var(--err)}
   @media (max-width:900px){ .pgrid2{grid-template-columns:1fr} }
 
   .sitegrid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
@@ -3540,6 +4064,41 @@ setTimeout(ping,1500);})();
                      font-size:13px;font-weight:600;padding:8px 2px;margin-bottom:-1px;cursor:pointer}
   .sqlx-views button:hover{color:var(--tx)}
   .sqlx-views button.on{color:var(--ac);border-bottom-color:var(--ac)}
+  /* ---- gestor de Redis (reutiliza .sqlx / .sqltbl; solo lo propio va aqui) ---- */
+  .rdb{display:flex;flex-direction:column;gap:1px;margin:8px -6px 0;max-height:46vh;overflow:auto}
+  .rdb button{display:flex;align-items:center;gap:7px;width:100%;text-align:left;background:none;border:0;color:var(--tx);
+              font:inherit;font-size:12.5px;padding:5px 10px;border-radius:5px;cursor:pointer}
+  .rdb button:hover{background:rgba(110,168,254,.10)}
+  .rdb button.on{background:rgba(110,168,254,.16);color:var(--ac);font-weight:600}
+  .rdb button .n{margin-left:auto;font-size:10.5px;color:var(--mut);font-family:ui-monospace,Consolas,monospace}
+  .rdb button.vacia{color:var(--mut)}
+  /* Etiqueta de tipo de clave. Cada tipo su color para reconocerlo de un vistazo en la lista. */
+  .rtype{font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;padding:1px 5px;border-radius:3px;
+         font-family:inherit;flex:0 0 auto}
+  .rtype.string{background:rgba(110,168,254,.18);color:var(--ac)}
+  .rtype.hash{background:rgba(155,110,254,.18);color:#b18cff}
+  .rtype.list{background:rgba(63,185,80,.18);color:var(--ok)}
+  .rtype.set{background:rgba(210,153,34,.18);color:var(--warn)}
+  .rtype.zset{background:rgba(248,81,73,.16);color:var(--err)}
+  .rtype.stream{background:rgba(125,125,125,.18);color:var(--mut)}
+  .rkeys{max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--in)}
+  .rkey{display:flex;align-items:center;gap:8px;padding:5px 9px;border-bottom:1px solid var(--line);cursor:pointer}
+  .rkey:last-child{border-bottom:none}
+  .rkey:hover{background:rgba(110,168,254,.08)}
+  .rkey.on{background:rgba(110,168,254,.16)}
+  .rkey .kn{font-family:ui-monospace,Consolas,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  .rkey .kt{font-size:10.5px;color:var(--mut);font-family:ui-monospace,Consolas,monospace;flex:0 0 auto}
+  .rval{width:100%;min-height:190px;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.5;
+        background:var(--in);color:var(--tx);border:1px solid var(--line);border-radius:6px;padding:9px;resize:vertical}
+  .rcons{background:var(--in);border:1px solid var(--line);border-radius:6px;padding:10px;max-height:32vh;overflow:auto;
+         font-family:ui-monospace,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;line-height:1.5}
+  .rcons .cin{color:var(--ac)}
+  .rcons .cerr{color:var(--err)}
+  .rcons .cnil{color:var(--mut);font-style:italic}
+  .rinfo{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+  .rinfo .b{background:var(--in);border:1px solid var(--line);border-radius:6px;padding:9px 11px}
+  .rinfo .b .l{font-size:10.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.3px}
+  .rinfo .b .v{font-size:15px;font-weight:600;margin-top:2px;font-family:ui-monospace,Consolas,monospace}
   .sqlgrid{overflow:auto;max-height:60vh;border:1px solid var(--line);border-radius:6px;background:var(--in)}
   table.sqltbl{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;font-family:ui-monospace,Consolas,monospace}
   table.sqltbl th,table.sqltbl td{padding:5px 9px;border-bottom:1px solid var(--line);white-space:nowrap;
@@ -3574,6 +4133,10 @@ setTimeout(ping,1500);})();
   .sqlmsg.err{background:rgba(248,81,73,.12);border-color:var(--err);color:var(--err)}
   .sqlmsg.ok{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
   .sqlmsg.warn{background:rgba(210,153,34,.12);border-color:var(--warn);color:var(--warn)}
+  .msgtext{font-size:12.5px;margin-bottom:6px}
+  .msgtext.err{color:var(--err)}
+  .msgtext.ok{color:var(--ok)}
+  .msgtext.warn{color:var(--warn)}
   .logview{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;font-family:ui-monospace,Consolas,monospace;font-size:13px;white-space:pre-wrap;max-height:62vh;overflow:auto;color:var(--mut)}
   .logview .log-fatal{color:var(--err);font-weight:700}
   .logview .log-warning{color:var(--warn);font-weight:600}
@@ -3737,6 +4300,7 @@ setTimeout(ping,1500);})();
       <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
       <a href="?tab=bd" class="<?= $tab==='bd'?'on':'' ?>">Bases de datos</a>
       <a href="?tab=sqlsrv" class="<?= $tab==='sqlsrv'?'on':'' ?>">SQL Server</a>
+      <a href="?tab=redis" class="<?= $tab==='redis'?'on':'' ?>">Redis</a>
       <?php if (docker_installed()): ?>
         <a href="?tab=docker" class="<?= $tab==='docker'?'on':'' ?>">Docker</a>
       <?php endif; ?>
@@ -4707,6 +5271,13 @@ setTimeout(ping,1500);})();
       $byProject = logs_group_by_project($logFiles);
       $projects = array_keys($byProject);
 
+      // Se guarda si la URL traia ?project=/?log= ANTES de invalidarlos: hace falta para
+      // distinguir mas abajo "primera visita a la pestana" de "me pedian un proyecto que
+      // se ha quedado sin archivos" (p.ej. tras borrar su ultimo .log) -- de lo contrario
+      // ambos casos se veian iguales (sel==='' && selProject==='') y el segundo saltaba
+      // por sorpresa a los logs de (sistema) en vez de quedarse en el estado vacio.
+      $hadLogParam     = isset($_GET['log']) && $_GET['log'] !== '';
+      $hadProjectParam = isset($_GET['project']) && $_GET['project'] !== '';
       $sel = safe_logname($_GET['log'] ?? '');
       if ($sel !== '' && !in_array($sel, $logFiles, true)) $sel = '';
       $selProject = (string)($_GET['project'] ?? '');
@@ -4720,7 +5291,7 @@ setTimeout(ping,1500);})();
       }
       // Sin ?project= ni ?log= (primera visita a la pestaña): mismo valor por defecto de
       // siempre (error.log de sistema), solo que ahora expresado en el modelo proyecto+archivo.
-      if ($sel === '' && $selProject === '' && $byProject) {
+      if ($sel === '' && $selProject === '' && $byProject && !$hadLogParam && !$hadProjectParam) {
           $selProject = isset($byProject['(sistema)']) ? '(sistema)' : $projects[0];
           foreach ($byProject[$selProject] as $f) { if ($f['kind']==='error') { $sel = $f['file']; break; } }
           if ($sel === '' && isset($byProject[$selProject][0])) $sel = $byProject[$selProject][0]['file'];
@@ -4735,34 +5306,77 @@ setTimeout(ping,1500);})();
                placeholder="Buscar proyecto&hellip; (<?= count($projects) ?>)" value="<?= $selProject!==''?e(log_project_label($selProject)):'' ?>">
         <div id="logProjectList" class="logpicker-list" hidden></div>
       </div>
-      <?php if ($selProject !== ''): ?>
-        <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
-          <?php foreach ($byProject[$selProject] as $i => $f): ?>
-            <?php if ($i > 0): ?><span class="loglink-sep">&middot;</span><?php endif; ?>
-            <a href="?tab=logs&project=<?= urlencode($selProject) ?>&log=<?= urlencode($f['file']) ?><?= $refresh?'&refresh=1':'' ?>"
-               class="loglink<?= $f['file']===$sel?' active':'' ?>"><?= e(log_kind_label($f['kind'])) ?></a>
-          <?php endforeach; ?>
-        </div>
-      <?php endif; ?>
+      <div class="row" id="logFileLinks" style="gap:8px;flex-wrap:wrap;align-items:center;display:<?= $selProject===''?'none':'flex' ?>">
+        <?php foreach (($byProject[$selProject] ?? []) as $i => $f): ?>
+          <?php if ($i > 0): ?><span class="loglink-sep">&middot;</span><?php endif; ?>
+          <a href="?tab=logs&project=<?= urlencode($selProject) ?>&log=<?= urlencode($f['file']) ?><?= $refresh?'&refresh=1':'' ?>"
+             class="loglink<?= $f['file']===$sel?' active':'' ?>"><?= e(log_kind_label($f['kind'])) ?></a>
+        <?php endforeach; ?>
+      </div>
       <div class="spacer"></div>
-      <?php if ($sel !== ''): ?>
-        <a href="?tab=logs&project=<?= urlencode($selProject) ?>&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost sm"><?= $refresh?'Auto-refresco ON':'Auto-refresco' ?></a>
-        <button type="button" class="btn ghost sm" onclick="luaAskClearLog('<?= e($sel) ?>')">Vaciar</button>
-        <button type="button" class="btn danger sm" onclick="luaAskDeleteLog('<?= e($sel) ?>')">Eliminar</button>
-      <?php endif; ?>
+      <div id="logActions" style="display:<?= $sel===''?'none':'flex' ?>;gap:8px;align-items:center">
+        <a id="logAutoRefreshLink" href="?tab=logs&project=<?= urlencode($selProject) ?>&log=<?= urlencode($sel) ?><?= $refresh?'':'&refresh=1' ?>" class="btn ghost sm"><?= $refresh?'Auto-refresco ON':'Auto-refresco' ?></a>
+        <button type="button" class="btn ghost sm" id="logClearBtn">Vaciar</button>
+        <button type="button" class="btn danger sm" id="logDeleteBtn">Eliminar</button>
+        <span id="logActionStatus" class="muted" style="font-size:12px"></span>
+      </div>
     </div>
-    <?php if ($sel === ''): ?>
-      <div class="card muted">Elige un proyecto y luego un archivo de log para ver su contenido.</div>
-    <?php else: ?>
-      <pre class="logview"><?= $content!=='' ? highlight_error_log($content) : '(vac&iacute;o)' ?></pre>
-    <?php endif; ?>
+    <div id="logEmptyCard" class="card muted" style="<?= $sel!==''?'display:none':'' ?>">Elige un proyecto y luego un archivo de log para ver su contenido.</div>
+    <pre class="logview" id="logViewPre" style="<?= $sel===''?'display:none':'' ?>"><?= $content!=='' ? highlight_error_log($content) : '(vac&iacute;o)' ?></pre>
+
+    <!-- Modal de confirmacion de borrado de archivo de log -->
+    <div id="delLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDeleteLog()">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delLogTitle">
+        <div class="modal-ic">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+        </div>
+        <h3 id="delLogTitle">¿Eliminar el archivo de log?</h3>
+        <p class="modal-tx">Se borrará <strong id="delLogName"></strong> del disco de forma permanente. Si el servicio que lo genera sigue activo, puede volver a crearse solo.</p>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" onclick="luaCloseDeleteLog()">Cancelar</button>
+          <button type="button" class="btn danger" id="delLogConfirm">Sí, eliminar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal de confirmacion de vaciado de log -->
+    <div id="clearLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseClearLog()">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="clearLogTitle">
+        <div class="modal-ic">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+        </div>
+        <h3 id="clearLogTitle">¿Vaciar el log?</h3>
+        <p class="modal-tx">Se borrará todo el contenido de <strong id="clearLogName"></strong>. Esto no se puede deshacer.</p>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" onclick="luaCloseClearLog()">Cancelar</button>
+          <button type="button" class="btn danger" id="clearLogConfirm">Sí, vaciar</button>
+        </div>
+      </div>
+    </div>
+
     <script>
       (function(){
         var PROJECTS=<?= json_encode(array_map(function($p){ return ['key'=>$p,'label'=>log_project_label($p)]; }, $projects), JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE) ?>;
-        var SEL_PROJECT=<?= json_encode($selProject) ?>, SEL_LABEL=<?= json_encode($selProject!==''?log_project_label($selProject):'') ?>, REFRESH=<?= $refresh?'true':'false' ?>;
+        var curProject=<?= json_encode($selProject) ?>, curLog=<?= json_encode($sel) ?>, REFRESH=<?= $refresh?'true':'false' ?>;
         var inp=document.getElementById('logProjectInput'), list=document.getElementById('logProjectList');
+        var linksRow=document.getElementById('logFileLinks');
+        var actionsBox=document.getElementById('logActions');
+        var emptyCard=document.getElementById('logEmptyCard');
+        var viewPre=document.getElementById('logViewPre');
+        var autoLink=document.getElementById('logAutoRefreshLink');
+        var statusEl=document.getElementById('logActionStatus');
         var items=[], active=-1;
-        function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+        function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+        function projectLabel(key){
+          for (var i=0;i<PROJECTS.length;i++){ if (PROJECTS[i].key===key) return PROJECTS[i].label; }
+          return key;
+        }
         function go(key){ location.href='?tab=logs&project='+encodeURIComponent(key)+(REFRESH?'&refresh=1':''); }
         function render(filter){
           var f=(filter||'').toLowerCase();
@@ -4770,7 +5384,7 @@ setTimeout(ping,1500);})();
           active=-1;
           if(!items.length){ list.innerHTML='<div class="logpicker-empty">Sin coincidencias</div>'; list.hidden=false; return; }
           list.innerHTML = items.map(function(p){
-            return '<div class="logpicker-opt'+(p.key===SEL_PROJECT?' sel':'')+'" data-key="'+esc(p.key)+'">'+esc(p.label)+'</div>';
+            return '<div class="logpicker-opt'+(p.key===curProject?' sel':'')+'" data-key="'+esc(p.key)+'">'+esc(p.label)+'</div>';
           }).join('');
           list.hidden=false;
         }
@@ -4786,39 +5400,81 @@ setTimeout(ping,1500);})();
           if(e.key==='ArrowDown'){ e.preventDefault(); highlight(Math.min(active+1, items.length-1)); }
           else if(e.key==='ArrowUp'){ e.preventDefault(); highlight(Math.max(active-1,0)); }
           else if(e.key==='Enter'){ e.preventDefault(); if(items[active]) go(items[active].key); else if(items.length===1) go(items[0].key); }
-          else if(e.key==='Escape'){ list.hidden=true; inp.value=SEL_LABEL; inp.blur(); }
+          else if(e.key==='Escape'){ list.hidden=true; inp.value=projectLabel(curProject); inp.blur(); }
         });
         list.addEventListener('mousedown', function(e){
           var opt=e.target.closest('.logpicker-opt'); if(!opt||!opt.dataset.key) return;
           go(opt.dataset.key);
         });
-        document.addEventListener('click', function(e){ if(!e.target.closest('.logpicker')){ list.hidden=true; inp.value=SEL_LABEL; } });
-      })();
-    </script>
+        document.addEventListener('click', function(e){ if(!e.target.closest('.logpicker')){ list.hidden=true; inp.value=projectLabel(curProject); } });
 
-    <!-- Modal de confirmacion de borrado de archivo de log -->
-    <div id="delLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDeleteLog()">
-      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delLogTitle">
-        <div class="modal-ic">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
-          </svg>
-        </div>
-        <h3 id="delLogTitle">¿Eliminar el archivo de log?</h3>
-        <p class="modal-tx">Se borrará <strong id="delLogName"></strong> del disco de forma permanente. Si el servicio que lo genera sigue activo, puede volver a crearse solo.</p>
-        <form method="post" class="modal-actions">
-          <input type="hidden" name="action" value="deletelog">
-          <input type="hidden" name="log" id="delLogInput">
-          <button type="button" class="btn ghost" onclick="luaCloseDeleteLog()">Cancelar</button>
-          <button type="submit" class="btn danger">Sí, eliminar</button>
-        </form>
-      </div>
-    </div>
-    <script>
+        // ---- Borrar/vaciar sin recargar: la seleccion la decide el cliente con lo que el
+        // servidor devuelve en la respuesta, no una heuristica de redirect adivinando que
+        // proyecto/archivo tocaria despues (eso era lo que perdia la seleccion al borrar).
+        function renderLinks(files){
+          linksRow.innerHTML = files.map(function(f,i){
+            var sep = i>0 ? '<span class="loglink-sep">&middot;</span>' : '';
+            var active = f.file===curLog ? ' active' : '';
+            return sep+'<a href="?tab=logs&project='+encodeURIComponent(curProject)+'&log='+encodeURIComponent(f.file)+'" class="loglink'+active+'">'+esc(f.label)+'</a>';
+          }).join('');
+          linksRow.style.display = files.length ? 'flex' : 'none';
+        }
+        function selectLog(file, content){
+          curLog = file;
+          if (file === '') {
+            actionsBox.style.display = 'none';
+            emptyCard.style.display = '';
+            viewPre.style.display = 'none';
+          } else {
+            actionsBox.style.display = 'flex';
+            emptyCard.style.display = 'none';
+            viewPre.style.display = '';
+            viewPre.innerHTML = content !== '' ? content : '(vacío)';
+            autoLink.href = '?tab=logs&project='+encodeURIComponent(curProject)+'&log='+encodeURIComponent(file)+(REFRESH?'&refresh=1':'');
+          }
+          var qs = '?tab=logs&project='+encodeURIComponent(curProject)+(file!==''?'&log='+encodeURIComponent(file):'');
+          history.replaceState(null, '', qs);
+        }
+        function flash(msg){
+          statusEl.textContent = msg;
+          setTimeout(function(){ if (statusEl.textContent===msg) statusEl.textContent=''; }, 2500);
+        }
+        function post(op, log){
+          return fetch('?', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+            body:'ajax='+op+'&log='+encodeURIComponent(log)}).then(function(r){ return r.json(); });
+        }
+        document.getElementById('delLogConfirm').addEventListener('click', function(){
+          var log = curLog;
+          luaCloseDeleteLog();
+          post('logdelete', log).then(function(j){
+            if (j.error) { flash(j.error); return; }
+            renderLinks(j.files);
+            selectLog(j.next, j.content);
+            if (!j.files.length) {
+              PROJECTS = PROJECTS.filter(function(p){ return p.key !== curProject; });
+              curProject = '';
+              inp.value = '';
+              inp.placeholder = 'Buscar proyecto… (' + PROJECTS.length + ')';
+              history.replaceState(null, '', '?tab=logs');
+            }
+            flash('Eliminado.');
+          }).catch(function(){ flash('Error de red al eliminar.'); });
+        });
+        document.getElementById('clearLogConfirm').addEventListener('click', function(){
+          var log = curLog;
+          luaCloseClearLog();
+          post('logclear', log).then(function(j){
+            if (j.error) { flash(j.error); return; }
+            if (log === curLog) { viewPre.innerHTML = '(vacío)'; }
+            flash('Vaciado.');
+          }).catch(function(){ flash('Error de red al vaciar.'); });
+        });
+        document.getElementById('logDeleteBtn').addEventListener('click', function(){ luaAskDeleteLog(curLog); });
+        document.getElementById('logClearBtn').addEventListener('click', function(){ luaAskClearLog(curLog); });
+      })();
+
       function luaAskDeleteLog(name){
         document.getElementById('delLogName').textContent = name;
-        document.getElementById('delLogInput').value = name;
         document.getElementById('delLogModal').hidden = false;
         document.addEventListener('keydown', luaEscDeleteLog);
       }
@@ -4827,31 +5483,9 @@ setTimeout(ping,1500);})();
         document.removeEventListener('keydown', luaEscDeleteLog);
       }
       function luaEscDeleteLog(e){ if(e.key==='Escape') luaCloseDeleteLog(); }
-    </script>
 
-    <!-- Modal de confirmacion de vaciado de log -->
-    <div id="clearLogModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseClearLog()">
-      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="clearLogTitle">
-        <div class="modal-ic">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
-            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
-          </svg>
-        </div>
-        <h3 id="clearLogTitle">¿Vaciar el log?</h3>
-        <p class="modal-tx">Se borrará todo el contenido de <strong id="clearLogName"></strong>. Esto no se puede deshacer.</p>
-        <form method="post" class="modal-actions">
-          <input type="hidden" name="action" value="clearlog">
-          <input type="hidden" name="log" id="clearLogInput">
-          <button type="button" class="btn ghost" onclick="luaCloseClearLog()">Cancelar</button>
-          <button type="submit" class="btn danger">Sí, vaciar</button>
-        </form>
-      </div>
-    </div>
-    <script>
       function luaAskClearLog(name){
         document.getElementById('clearLogName').textContent = name;
-        document.getElementById('clearLogInput').value = name;
         document.getElementById('clearLogModal').hidden = false;
         document.addEventListener('keydown', luaEscClearLog);
       }
@@ -4870,74 +5504,81 @@ setTimeout(ping,1500);})();
       $updDelant = (int)($updSt['delante'] ?? 0);
       $updCuando = !empty($updSt['comprobado']) ? @strtotime($updSt['comprobado']) : 0;
     ?>
-    <div class="card" id="actualizaciones">
-      <div class="row" style="flex-wrap:wrap;gap:8px">
-        <div style="min-width:260px">
-          <div style="font-weight:600">Actualizaciones de la plataforma</div>
-          <div class="muted" style="margin-top:4px">
+    <div class="cfg3">
+
+      <div class="card cardsave" id="actualizaciones">
+        <button type="button" class="savebtn" data-form="updCfgForm" title="Guardar">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
+          </svg>
+        </button>
+        <div class="cfg3-body">
+          <div class="cardsave-title" style="font-weight:600;margin-bottom:4px">Actualizaciones de la plataforma</div>
+          <div class="muted" style="margin-bottom:12px">
             Versión instalada: <code><?= $luaVer !== '' ? e($luaVer) : 'desconocida' ?></code>
             <?php if ($updCuando): ?> &middot; comprobado <?= e(date('d/m/Y H:i', $updCuando)) ?><?php endif; ?>
           </div>
+
+          <?php if ($updSt === null): ?>
+            <div class="muted" style="font-size:12.5px">Aún no se ha comprobado. El watcher lo hace solo al arrancar y cada <?= (int)$updCfg['cada_horas'] ?> h.</div>
+          <?php elseif ($updErr): ?>
+            <div class="msgtext err">No se pudo consultar el repositorio: <?= e((string)$updErr) ?></div>
+            <div class="muted" style="font-size:12px">El <code>fetch</code> lo hace el watcher con tus claves SSH. Si falla, comprueba que <code>git fetch</code> funciona a mano en esta carpeta.</div>
+          <?php elseif ($updHay): ?>
+            <div class="msgtext warn">Hay <?= (int)$updDetras ?> actualización(es) disponible(s) en <code><?= e((string)($updSt['remoto'] ?? 'origin')) ?></code>.</div>
+            <?php if (!empty($updSt['mensaje'])): ?><pre class="joblog" style="margin-top:0"><?= e((string)$updSt['mensaje']) ?></pre><?php endif; ?>
+          <?php else: ?>
+            <div class="msgtext ok">Estás en la última versión.</div>
+          <?php endif; ?>
+
+          <?php if ($updSucio): ?>
+            <div class="msgtext warn">Hay cambios locales sin confirmar en la carpeta de la plataforma. <b>No se actualizará automáticamente</b> para no pisarlos: confírmalos o descártalos primero.</div>
+          <?php endif; ?>
+          <?php if ($updDelant > 0): ?>
+            <div class="msgtext warn">Tu copia va <?= (int)$updDelant ?> commit(s) por delante del remoto. La actualización automática se salta este caso para no decidir por ti cómo integrarlos.</div>
+          <?php endif; ?>
+
+          <details class="extform" style="margin-top:8px">
+            <summary style="padding:0;font-size:12.5px;font-weight:400;color:var(--mut)">Actualizaciones automáticas</summary>
+            <div style="padding-top:10px">
+              <form method="post" id="updCfgForm">
+                <input type="hidden" name="action" value="update_cfg">
+                <label>Actualizaciones automáticas</label>
+                <select name="auto">
+                  <option value="0" <?= $updCfg['auto'] ? '' : 'selected' ?>>Solo avisar</option>
+                  <option value="1" <?= $updCfg['auto'] ? 'selected' : '' ?>>Instalar automáticamente</option>
+                </select>
+                <label style="margin-top:8px">Comprobar cada</label>
+                <select name="cada_horas">
+                  <?php foreach ([1,3,6,12,24,72,168] as $h): ?>
+                    <option value="<?= $h ?>" <?= (int)$updCfg['cada_horas']===$h ? 'selected' : '' ?>><?= $h < 24 ? $h.' h' : ($h/24).' día(s)' ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </form>
+              <div class="muted" style="margin-top:10px;font-size:11px">
+                Se actualiza con <code>git merge --ff-only</code> desde <code>origin</code>, sin tocar tu configuración de esta máquina (<code>sites.json</code>, contraseñas, conexiones, <code>www\</code>).
+              </div>
+            </div>
+          </details>
         </div>
-        <div class="spacer"></div>
-        <form method="post" style="display:inline"><input type="hidden" name="action" value="update_check">
-          <button class="btn ghost sm" type="submit">Buscar ahora</button></form>
-        <?php if ($updHay && !$updSucio && $updDelant === 0): ?>
-          <form method="post" style="display:inline"><input type="hidden" name="action" value="update_now">
-            <button class="btn sm" type="submit">Actualizar a la última</button></form>
-        <?php endif; ?>
+        <div class="cfg3-actions">
+          <form method="post" style="display:inline"><input type="hidden" name="action" value="update_check">
+            <button class="btn ghost sm" type="submit">Buscar ahora</button></form>
+          <?php if ($updHay && !$updSucio && $updDelant === 0): ?>
+            <form method="post" style="display:inline"><input type="hidden" name="action" value="update_now">
+              <button class="btn sm" type="submit">Actualizar a la última</button></form>
+          <?php endif; ?>
+        </div>
       </div>
 
-      <?php if ($updSt === null): ?>
-        <div class="muted" style="margin-top:10px;font-size:12.5px">Aún no se ha comprobado. El watcher lo hace solo al arrancar y cada <?= (int)$updCfg['cada_horas'] ?> h.</div>
-      <?php elseif ($updErr): ?>
-        <div class="sqlmsg err" style="margin-top:10px">No se pudo consultar el repositorio: <?= e((string)$updErr) ?></div>
-        <div class="muted" style="font-size:12px">El <code>fetch</code> lo hace el watcher con tus claves SSH. Si falla, comprueba que <code>git fetch</code> funciona a mano en esta carpeta.</div>
-      <?php elseif ($updHay): ?>
-        <div class="sqlmsg warn" style="margin-top:10px">Hay <?= (int)$updDetras ?> actualización(es) disponible(s) en <code><?= e((string)($updSt['remoto'] ?? 'origin')) ?></code>.</div>
-        <?php if (!empty($updSt['mensaje'])): ?><pre class="joblog" style="margin-top:0"><?= e((string)$updSt['mensaje']) ?></pre><?php endif; ?>
-      <?php else: ?>
-        <div class="sqlmsg ok" style="margin-top:10px">Estás en la última versión.</div>
-      <?php endif; ?>
-
-      <?php if ($updSucio): ?>
-        <div class="sqlmsg warn" style="margin-top:8px">Hay cambios locales sin confirmar en la carpeta de la plataforma. <b>No se actualizará automáticamente</b> para no pisarlos: confírmalos o descártalos primero.</div>
-      <?php endif; ?>
-      <?php if ($updDelant > 0): ?>
-        <div class="sqlmsg warn" style="margin-top:8px">Tu copia va <?= (int)$updDelant ?> commit(s) por delante del remoto. La actualización automática se salta este caso para no decidir por ti cómo integrarlos.</div>
-      <?php endif; ?>
-
-      <form method="post" class="inline" style="margin-top:14px">
-        <input type="hidden" name="action" value="update_cfg">
-        <div>
-          <label>Actualizaciones automáticas</label>
-          <select name="auto">
-            <option value="0" <?= $updCfg['auto'] ? '' : 'selected' ?>>Solo avisar</option>
-            <option value="1" <?= $updCfg['auto'] ? 'selected' : '' ?>>Instalar automáticamente</option>
-          </select>
-        </div>
-        <div style="max-width:150px">
-          <label>Comprobar cada</label>
-          <select name="cada_horas">
-            <?php foreach ([1,3,6,12,24,72,168] as $h): ?>
-              <option value="<?= $h ?>" <?= (int)$updCfg['cada_horas']===$h ? 'selected' : '' ?>><?= $h < 24 ? $h.' h' : ($h/24).' día(s)' ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <button class="btn ghost" type="submit">Guardar</button>
-      </form>
-      <div class="muted" style="margin-top:10px;font-size:12px">
-        Se actualiza con <code>git merge --ff-only</code> desde <code>origin</code>: nunca genera conflictos ni reescribe tu historial.
-        Tu configuración de esta máquina (<code>sites.json</code>, contraseñas, conexiones, <code>www\</code>) no está versionada, así que no se toca.
-        Al terminar se regeneran los <code>php.ini</code> y los vhosts, y se reinicia Apache.
-      </div>
-    </div>
-
-    <div class="cfg3">
-
-      <div class="card">
+      <div class="card cardsave">
+        <button type="button" class="savebtn" data-form="brandNameForm" title="Guardar nombre">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
+          </svg>
+        </button>
         <div class="cfg3-body">
-          <div style="font-weight:600;margin-bottom:4px">Identidad de la plataforma</div>
+          <div class="cardsave-title" style="font-weight:600;margin-bottom:4px">Identidad de la plataforma</div>
           <div class="muted" style="margin-bottom:12px">Nombre y logo que aparecen en la cabecera, la pestaña del navegador y el pie. Solo afecta a este panel.</div>
           <form method="post" id="brandNameForm">
             <input type="hidden" name="action" value="set_brand">
@@ -4965,23 +5606,22 @@ setTimeout(ping,1500);})();
             </div>
           </div>
         </div>
-        <div class="cfg3-actions">
-          <button class="btn ghost" type="submit" form="brandNameForm">Guardar nombre</button>
-        </div>
       </div>
 
-      <div class="card">
+      <div class="card cardsave">
+        <button type="button" class="savebtn" data-form="tldForm" title="Guardar dominio">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
+          </svg>
+        </button>
         <div class="cfg3-body">
-          <div style="font-weight:600;margin-bottom:4px">Dominio local</div>
+          <div class="cardsave-title" style="font-weight:600;margin-bottom:4px">Dominio local</div>
           <div class="muted" style="margin-bottom:12px">Tus proyectos se sirven en <code>&lt;nombre&gt;.<?= e($tld) ?></code>. Recomendado <code>test</code> (reservado para pruebas). Evita <code>dev</code> (Chrome fuerza HTTPS) y <code>local</code> (lo usa mDNS de Windows).</div>
           <form method="post" id="tldForm">
             <input type="hidden" name="action" value="set_tld">
             <label>Dominio (TLD)</label>
             <input name="tld" value="<?= e($tld) ?>" placeholder="test" style="width:100%">
           </form>
-        </div>
-        <div class="cfg3-actions">
-          <button class="btn ghost" type="submit" form="tldForm">Guardar</button>
         </div>
       </div>
 
@@ -5011,6 +5651,14 @@ setTimeout(ping,1500);})();
       [$mariaCls,$mariaLbl] = svc_status($mariaOn, 3306);
       [$pgCls,$pgLbl]       = svc_status($pgOn, 5432);
       $mongoOn  = is_file($ROOT.'/config/mongodb.on');
+      $redisOn  = is_file($ROOT.'/config/redis.on');
+      [$redisCls,$redisLbl] = svc_status($redisOn, 6379);
+      // Build instalado ('redis8' / 'native5') y en que versiones de PHP quedo la extension: las
+      // dos cosas se muestran en la card porque el motor puede estar arriba y aun asi faltarle la
+      // extension a alguna version (son pasos independientes del job).
+      $redisBuild = trim((string)@file_get_contents($ROOT.'/config/redis/build.txt'));
+      $redisExtVers = [];
+      foreach ($vers as $rv) { if (is_file($PHP_BASE.'/'.$rv.'/ext/php_redis.dll')) $redisExtVers[] = $rv; }
       $termOn   = is_file($ROOT.'/config/terminal.on');
       $startupOn= startup_enabled($ROOT);
       $lanIps = array_values(array_filter(array_map('trim', explode(',', (string)@file_get_contents($ROOT.'/config/lan-ip.txt'))),
@@ -5118,6 +5766,47 @@ setTimeout(ping,1500);})();
 
       <div class="card">
         <div class="cfg3-body">
+          <div style="font-weight:600;margin-bottom:4px">Servidor Redis <span class="jstate <?= $redisCls ?>"><?= $redisLbl ?></span></div>
+          <div class="muted">Almacén en memoria (caché, sesiones, colas) en <code>127.0.0.1:6379</code>, sin contraseña. Solo accesible desde esta máquina. Se instala también la extensión <code>php_redis</code> en cada versión de PHP.</div>
+          <?php if ($redisOn || $redisBuild !== ''): ?>
+            <div class="muted" style="margin-top:8px;font-size:11.5px">
+              <?php if ($redisBuild !== ''): ?>
+                Build: <code><?= $redisBuild==='native5' ? 'tporadowski 5.0.14.1 (nativo)' : 'redis-windows 8.8.1' ?></code><br>
+              <?php endif; ?>
+              <?php if ($redisExtVers): ?>
+                Extensión en PHP <?= e(implode(', ', $redisExtVers)) ?>.
+              <?php else: ?>
+                <span class="msgtext warn" style="margin:0">La extensión <code>php_redis</code> aún no está en ninguna versión de PHP.</span>
+              <?php endif; ?>
+            </div>
+          <?php endif; ?>
+          <?php if (!$redisOn && $redisBuild === ''): ?>
+            <div style="margin-top:12px">
+              <label>Build de Redis para Windows</label>
+              <select name="build" id="redisBuildSel">
+                <option value="redis8">Redis 8.8.1 — al día, sobre capa msys2</option>
+                <option value="native5">Redis 5.0.14.1 — nativo, congelado en 2022</option>
+              </select>
+              <div class="muted" style="margin-top:6px;font-size:11px">Redis no publica builds oficiales para Windows: ambas son ports de la comunidad. Solo se pregunta la primera vez.</div>
+            </div>
+          <?php endif; ?>
+        </div>
+        <div class="cfg3-actions">
+          <form method="post">
+            <input type="hidden" name="action" value="redis">
+            <input type="hidden" name="enable" value="<?= $redisOn?'0':'1' ?>">
+            <?php if (!$redisOn && $redisBuild === ''): ?>
+              <!-- El <select> vive arriba, fuera de este <form>: se copia aqui al enviar para no
+                   partir el layout de la card (cuerpo arriba, acciones abajo). -->
+              <input type="hidden" name="build" id="redisBuildHidden" value="redis8">
+            <?php endif; ?>
+            <button class="btn <?= $redisOn?'danger':'ghost' ?>" type="submit"><?= $redisOn?'Desactivar':'Activar' ?> Redis</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="cfg3-body">
           <div style="font-weight:600;margin-bottom:4px">Terminal <span class="jstate <?= $termOn?'ok':'err' ?>"><?= $termOn?'ACTIVA':'INACTIVA' ?></span></div>
           <div class="muted">Ejecuta comandos (composer, git, npm, artisan…) desde el navegador con la misma cuenta que Apache. Desactivada por defecto por seguridad: solo actívala si confías en quién tiene acceso a esta máquina.</div>
         </div>
@@ -5146,6 +5835,55 @@ setTimeout(ping,1500);})();
 
     </div>
 
+    <script>
+      // El selector de build de Redis esta en el cuerpo de la card y el boton en su pie (dos
+      // sitios distintos), asi que el valor se copia al campo oculto del form al cambiarlo.
+      (function(){
+        var sel = document.getElementById('redisBuildSel'), hid = document.getElementById('redisBuildHidden');
+        if (sel && hid) { sel.addEventListener('change', function(){ hid.value = sel.value; }); }
+      })();
+
+      // Guardado de las cards de ajustes por el icono de disquete. Va por AJAX (el backend
+      // responde JSON cuando recibe ajax=1, ver el hook junto al redirect de PRG) para poder
+      // confirmar en verde sobre el propio icono sin recargar y perder el aviso.
+      (function(){
+        document.addEventListener('click', function(e){
+          var btn = e.target.closest('.savebtn'); if (!btn) return;
+          var form = document.getElementById(btn.dataset.form); if (!form) return;
+          var card = btn.closest('.card');
+          var out  = card.querySelector('.savemsg');
+          if (!out) { out = document.createElement('div'); out.className = 'savemsg'; card.querySelector('.cfg3-body').appendChild(out); }
+          var body = new URLSearchParams(new FormData(form)); body.set('ajax','1');
+          btn.classList.remove('ok','err'); btn.disabled = true; out.textContent = '';
+          fetch('?', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:body.toString()})
+            .then(function(r){ return r.json(); })
+            .then(function(j){
+              btn.disabled = false;
+              btn.classList.add(j.ok ? 'ok' : 'err');
+              out.className = 'savemsg ' + (j.ok ? 'ok' : 'err');
+              out.textContent = j.msg || (j.ok ? 'Guardado.' : 'No se pudo guardar.');
+              // El nombre de marca sale en la cabecera y en el titulo de la pestaña: se
+              // refrescan aqui para que el cambio se vea sin tener que recargar a mano.
+              // Ojo: el <h1> lleva detras la etiqueta de version (<a class="verchip">), asi
+              // que se reescribe solo su primer nodo de texto, no el textContent entero.
+              if (j.ok && form.id === 'brandNameForm') {
+                var nuevo = (form.querySelector('[name=brand_name]').value || '').trim() || 'lua-server';
+                var h = document.querySelector('header h1');
+                if (h && h.firstChild && h.firstChild.nodeType === 3) { h.firstChild.nodeValue = nuevo; }
+                var lg = document.querySelector('header .logo img'); if (lg) lg.alt = nuevo;
+                document.title = nuevo;
+              }
+              if (j.ok && j.reload) { setTimeout(function(){ location.href = '?tab=config'; }, 1200); }
+              else if (j.ok) { setTimeout(function(){ btn.classList.remove('ok'); out.textContent = ''; }, 4000); }
+            })
+            .catch(function(){
+              btn.disabled = false; btn.classList.add('err');
+              out.className = 'savemsg err'; out.textContent = 'Error de red al guardar.';
+            });
+        });
+      })();
+    </script>
+
   <?php elseif ($tab==='bd'): /* ---------- PESTAÑA BASES DE DATOS ---------- */
       $mariaOn = is_file($ROOT.'/config/mariadb.on');
       $pgOn    = is_file($ROOT.'/config/postgres.on');
@@ -5165,10 +5903,18 @@ setTimeout(ping,1500);})();
       <?php else: ?>
         <a class="btn ghost sm" href="?tab=config">MongoDB · inactivo</a>
       <?php endif; ?>
+      <?php
+        // Redis no tiene flag de encendido que mirar (no gestionamos el motor): lo que cuenta es
+        // si hay alguna conexion guardada, igual que en SQL Server.
+        $rdConns = redis_servers($ROOT);
+      ?>
+      <a class="btn ghost sm" href="?tab=redis">Redis<?= $rdConns ? ' ('.count($rdConns).')' : ' · sin conexiones' ?></a>
+      <a class="btn ghost sm" href="?tab=sqlsrv">SQL Server</a>
     </div>
     <?php if ($mongoOn): ?>
       <div class="muted" style="margin-bottom:16px;font-size:12px">MongoDB no usa SQL, así que no tiene un listado de bases de datos aquí: gestiónalo desde <b>mongo-express</b> (arriba).</div>
     <?php endif; ?>
+    <div class="muted" style="margin-bottom:16px;font-size:12px">Redis tampoco usa SQL: se gestiona en su propia pestaña <a href="?tab=redis"><b>Redis</b></a> (explorador de claves, consola y estado del servidor).</div>
 
     <?php if ($dbEngine==='pg'): /* ===== PostgreSQL ===== */ ?>
 
@@ -5679,6 +6425,538 @@ setTimeout(ping,1500);})();
         function luaEscImportDir(e){ if(e.key==='Escape') luaCloseImportDir(); }
       </script>
 
+    <?php endif; ?>
+
+  <?php elseif ($tab==='redis'): /* ---------- PESTAÑA REDIS ---------- */
+      // Mismo esquema que SQL Server: lista de conexiones guardadas arriba, y debajo el
+      // explorador (barra lateral de bases + claves + valor). Todo el trabajo real lo hace
+      // ?ajax=redis; aqui solo se pinta el armazon y se le pasa la conexion elegida al JS.
+      $rdServers = redis_servers($ROOT);
+      $rdSel  = (string)($_GET['conn'] ?? '');
+      $rdSrv  = valid_redis_id($rdSel) ? redis_find($ROOT, $rdSel) : null;
+      if (!$rdSrv && $rdServers) { $rdSrv = $rdServers[0]; }
+      $rdEditSrv = valid_redis_id((string)($_GET['edit'] ?? '')) ? redis_find($ROOT, $_GET['edit']) : null;
+      $rdForm = $rdEditSrv !== null || isset($_GET['nueva']) || !$rdServers; ?>
+
+    <div class="card row" style="flex-wrap:wrap;gap:8px">
+      <div style="min-width:220px">
+        <div style="font-weight:600">Servidores Redis</div>
+        <div class="muted" style="margin-top:4px">Conecta con un Redis existente (un contenedor de Docker, uno nativo o uno de red). No hace falta la extensión <code>php_redis</code>: el panel habla el protocolo directamente.</div>
+      </div>
+      <div class="spacer"></div>
+      <?php foreach ($rdServers as $s): ?>
+        <a class="btn <?= ($rdSrv && $s['id']===$rdSrv['id'] && !$rdForm) ? '' : 'ghost' ?> sm"
+           href="?tab=redis&conn=<?= e(rawurlencode($s['id'])) ?>"><?= e($s['label']) ?></a>
+      <?php endforeach; ?>
+      <a class="btn ghost sm" href="?tab=redis&nueva=1">+ Añadir conexión</a>
+    </div>
+
+    <?php if ($rdForm): ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:12px"><?= $rdEditSrv ? 'Editar conexión' : 'Nueva conexión' ?></div>
+        <form method="post" class="inline">
+          <input type="hidden" name="action" value="redis_save">
+          <?php if ($rdEditSrv): ?><input type="hidden" name="id" value="<?= e($rdEditSrv['id']) ?>"><?php endif; ?>
+          <div><label>Nombre</label><input type="text" name="label" placeholder="Docker local" value="<?= e($rdEditSrv['label'] ?? '') ?>"></div>
+          <div><label>Host o IP</label><input type="text" name="host" placeholder="127.0.0.1" value="<?= e($rdEditSrv['host'] ?? '127.0.0.1') ?>" required></div>
+          <div style="max-width:110px"><label>Puerto</label><input type="text" name="port" value="<?= e((string)($rdEditSrv['port'] ?? 6379)) ?>" required></div>
+          <div><label>Usuario <span class="muted">(ACL, Redis 6+)</span></label><input type="text" name="user" placeholder="opcional" value="<?= e($rdEditSrv['user'] ?? '') ?>"></div>
+          <div><label>Contraseña</label>
+            <input type="password" name="pass" autocomplete="new-password" placeholder="<?= $rdEditSrv ? 'dejar vacío para no cambiarla' : 'si no tiene, déjalo vacío' ?>">
+          </div>
+          <button class="btn" type="submit"><?= $rdEditSrv ? 'Guardar cambios' : 'Guardar conexión' ?></button>
+          <?php if ($rdEditSrv): ?><a class="btn ghost" href="?tab=redis&conn=<?= e(rawurlencode($rdEditSrv['id'])) ?>">Cancelar</a><?php endif; ?>
+          <?php if (!$rdEditSrv && $rdServers): ?><a class="btn ghost" href="?tab=redis">Cancelar</a><?php endif; ?>
+        </form>
+        <div class="muted" style="margin-top:10px;font-size:11.5px">La contraseña se guarda en claro en <code>config\redis-servers.json</code> (fuera de git), igual que las de MySQL y SQL Server.</div>
+      </div>
+    <?php endif; ?>
+
+    <?php if ($rdSrv && !$rdForm): ?>
+      <div class="sqlx" id="rdApp" data-conn="<?= e($rdSrv['id']) ?>">
+        <div class="sqlx-side">
+          <div class="card">
+            <div class="row" style="gap:6px;align-items:center">
+              <div style="font-weight:600;font-size:13px"><?= e($rdSrv['label']) ?></div>
+              <div class="spacer"></div>
+              <a class="btn ghost sm" href="?tab=redis&edit=<?= e(rawurlencode($rdSrv['id'])) ?>">Editar</a>
+            </div>
+            <div class="muted" style="margin-top:3px;font-size:11.5px">
+              <code><?= e($rdSrv['host'].':'.$rdSrv['port']) ?></code> · <span id="rdVer">…</span>
+            </div>
+            <div class="row" style="margin-top:12px;align-items:center">
+              <span style="font-weight:600;font-size:12px">Bases</span>
+              <div class="spacer"></div>
+              <button type="button" class="btn ghost sm" id="rdReload" title="Recargar bases y claves">Refrescar</button>
+            </div>
+            <div class="rdb" id="rdDbs"><div class="sqlx-empty">cargando…</div></div>
+          </div>
+        </div>
+
+        <div class="sqlx-main">
+          <div class="card">
+            <div class="sqlx-views">
+              <button type="button" data-view="keys" class="on">Claves</button>
+              <button type="button" data-view="cons">Consola</button>
+              <button type="button" data-view="info">Servidor</button>
+            </div>
+
+            <!-- ---- vista Claves ---- -->
+            <div id="rdViewKeys">
+              <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+                <div style="flex:1;min-width:200px">
+                  <label>Patrón <span class="muted">(comodín <code>*</code>)</span></label>
+                  <input type="text" id="rdMatch" placeholder="*" style="width:100%">
+                </div>
+                <div style="max-width:110px">
+                  <label>Por página</label>
+                  <select id="rdCount">
+                    <option value="50">50</option>
+                    <option value="100" selected>100</option>
+                    <option value="500">500</option>
+                  </select>
+                </div>
+                <button type="button" class="btn sm" id="rdSearch">Buscar</button>
+                <div class="spacer"></div>
+                <button type="button" class="btn danger sm" id="rdFlush">Vaciar base</button>
+              </div>
+              <div class="rkeys" id="rdKeys"><div class="sqlx-empty">elige una base</div></div>
+              <div class="row" style="margin-top:8px;align-items:center">
+                <span class="muted" id="rdKeysMeta" style="font-size:11.5px"></span>
+                <div class="spacer"></div>
+                <button type="button" class="btn ghost sm" id="rdMore" hidden>Cargar más</button>
+              </div>
+
+              <!-- detalle de la clave seleccionada -->
+              <div id="rdDetail" hidden style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px">
+                <div class="row" style="gap:8px;flex-wrap:wrap;align-items:center">
+                  <span class="rtype" id="rdDType">—</span>
+                  <code id="rdDKey" style="font-size:12.5px;word-break:break-all"></code>
+                  <div class="spacer"></div>
+                  <span class="muted" id="rdDMeta" style="font-size:11.5px"></span>
+                </div>
+                <div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+                  <div style="max-width:150px">
+                    <label>TTL (segundos)</label>
+                    <input type="text" id="rdTtl" placeholder="sin expiración">
+                  </div>
+                  <button type="button" class="btn ghost sm" id="rdTtlSave">Aplicar TTL</button>
+                  <div style="flex:1;min-width:180px">
+                    <label>Renombrar a</label>
+                    <input type="text" id="rdRename" placeholder="nuevo:nombre" style="width:100%">
+                  </div>
+                  <button type="button" class="btn ghost sm" id="rdRenameSave">Renombrar</button>
+                  <div class="spacer"></div>
+                  <button type="button" class="btn danger sm" id="rdDel">Eliminar clave</button>
+                </div>
+                <div id="rdEditor" style="margin-top:12px"></div>
+                <div class="msgtext" id="rdDMsg" style="margin-top:8px"></div>
+              </div>
+            </div>
+
+            <!-- ---- vista Consola ---- -->
+            <div id="rdViewCons" hidden>
+              <div class="muted" style="font-size:12px;margin-bottom:8px">
+                Se ejecuta contra la base seleccionada. Los argumentos con espacios van entre comillas, como en <code>redis-cli</code>.
+                <code>SHUTDOWN</code> y los comandos que dejan la conexión escuchando (<code>SUBSCRIBE</code>, <code>MONITOR</code>…) están bloqueados.
+              </div>
+              <div class="rcons" id="rdConsOut"><span class="muted">Escribe un comando y pulsa Enter. Flechas ↑/↓ para el historial.</span></div>
+              <div class="row" style="gap:8px;margin-top:8px">
+                <input type="text" id="rdConsIn" placeholder="GET mi:clave" autocomplete="off" spellcheck="false"
+                       style="flex:1;font-family:ui-monospace,Consolas,monospace">
+                <button type="button" class="btn sm" id="rdConsRun">Ejecutar</button>
+                <button type="button" class="btn ghost sm" id="rdConsClear">Limpiar</button>
+              </div>
+            </div>
+
+            <!-- ---- vista Servidor ---- -->
+            <div id="rdViewInfo" hidden>
+              <div class="rinfo" id="rdInfoBoxes"><div class="sqlx-empty">cargando…</div></div>
+              <details style="margin-top:14px">
+                <summary style="cursor:pointer;font-size:12.5px;color:var(--mut)">INFO completo</summary>
+                <pre class="rcons" style="margin-top:8px;max-height:44vh" id="rdInfoRaw"></pre>
+              </details>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal: eliminar clave -->
+      <div id="rdDelModal" class="modal-overlay" hidden onclick="if(event.target===this)rdCloseDel()">
+        <div class="modal-box" role="dialog" aria-modal="true">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+            </svg>
+          </div>
+          <h3>¿Eliminar la clave?</h3>
+          <p class="modal-tx">Se borrará <strong id="rdDelName"></strong> del servidor. Esto no se puede deshacer.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" onclick="rdCloseDel()">Cancelar</button>
+            <button type="button" class="btn danger" id="rdDelYes">Sí, eliminar</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal: vaciar base -->
+      <div id="rdFlushModal" class="modal-overlay" hidden onclick="if(event.target===this)rdCloseFlush()">
+        <div class="modal-box" role="dialog" aria-modal="true">
+          <div class="modal-ic">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+          <h3>¿Vaciar la base <span id="rdFlushDb"></span>?</h3>
+          <p class="modal-tx">Se borrarán <strong id="rdFlushN"></strong> del servidor <strong><?= e($rdSrv['label']) ?></strong>.
+             Si alguna aplicación usa esta base como caché o para sesiones, lo notará. No se puede deshacer.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" onclick="rdCloseFlush()">Cancelar</button>
+            <button type="button" class="btn danger" id="rdFlushYes">Sí, vaciar</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:14px">
+        <div class="row" style="align-items:center">
+          <div>
+            <div style="font-weight:600;font-size:13px">Eliminar esta conexión</div>
+            <div class="muted" style="font-size:11.5px;margin-top:3px">Solo borra los datos de acceso guardados aquí; no toca el servidor de Redis.</div>
+          </div>
+          <div class="spacer"></div>
+          <form method="post" onsubmit="return confirm('¿Eliminar la conexión guardada?')">
+            <input type="hidden" name="action" value="redis_del">
+            <input type="hidden" name="id" value="<?= e($rdSrv['id']) ?>">
+            <button class="btn danger sm" type="submit">Eliminar conexión</button>
+          </form>
+        </div>
+      </div>
+
+    <script>
+    (function(){
+      var CONN = document.getElementById('rdApp').dataset.conn;
+      var db = 0, cursor = '0', curKey = null, curType = null, hist = [], histIx = -1;
+      var $ = function(id){ return document.getElementById(id); };
+      function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+      // Todas las llamadas van por POST: una clave puede ser larga o traer caracteres raros y
+      // en el query string acabaria recortada o mal codificada por el camino.
+      function api(op, extra) {
+        var b = new URLSearchParams();
+        b.set('op', op); b.set('db', db);
+        if (extra) { for (var k in extra) {
+          if (Array.isArray(extra[k])) { extra[k].forEach(function(v){ b.append(k+'[]', v); }); }
+          else { b.set(k, extra[k]); }
+        } }
+        return fetch('?ajax=redis&conn=' + encodeURIComponent(CONN), {
+          method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded; charset=utf-8'}, body:b.toString()
+        }).then(function(r){ return r.json(); });
+      }
+      function dmsg(txt, ok) {
+        var el = $('rdDMsg');
+        el.className = 'msgtext ' + (ok ? 'ok' : 'err');
+        el.textContent = txt || '';
+        if (txt && ok) setTimeout(function(){ if (el.textContent===txt) el.textContent=''; }, 3000);
+      }
+      function ttlTxt(t){ return t < 0 ? 'sin expiración' : t + 's'; }
+
+      // ---- pestañas internas ----
+      document.querySelectorAll('.sqlx-views button').forEach(function(b){
+        b.addEventListener('click', function(){
+          var v = b.dataset.view;
+          document.querySelectorAll('.sqlx-views button').forEach(function(x){ x.classList.toggle('on', x===b); });
+          $('rdViewKeys').hidden = v!=='keys';
+          $('rdViewCons').hidden = v!=='cons';
+          $('rdViewInfo').hidden = v!=='info';
+          if (v==='info') loadInfo();
+        });
+      });
+
+      // ---- bases ----
+      function loadDbs() {
+        api('dbs').then(function(j){
+          if (j.error) { $('rdDbs').innerHTML = '<div class="sqlx-empty">'+esc(j.error)+'</div>'; return; }
+          $('rdDbs').innerHTML = j.dbs.map(function(d){
+            return '<button type="button" data-db="'+d.db+'" class="'+(d.db===db?'on':'')+(d.keys===0?' vacia':'')+'">'
+                 + 'db'+d.db+'<span class="n">'+d.keys+'</span></button>';
+          }).join('');
+          $('rdDbs').querySelectorAll('button').forEach(function(b){
+            b.addEventListener('click', function(){
+              db = parseInt(b.dataset.db,10);
+              $('rdDbs').querySelectorAll('button').forEach(function(x){ x.classList.toggle('on', x===b); });
+              hideDetail(); search();
+            });
+          });
+        });
+      }
+      api('test').then(function(j){ $('rdVer').textContent = j.error ? 'sin conexión' : ('Redis '+j.version+' · '+j.mode); });
+
+      // ---- claves ----
+      function renderKeys(keys, append) {
+        var html = keys.map(function(k){
+          return '<div class="rkey" data-key="'+esc(k.key)+'" data-type="'+esc(k.type)+'">'
+               + '<span class="rtype '+esc(k.type)+'">'+esc(k.type)+'</span>'
+               + '<span class="kn">'+esc(k.key)+'</span>'
+               + '<span class="kt">'+(k.ttl<0?'—':k.ttl+'s')+'</span></div>';
+        }).join('');
+        if (append) { $('rdKeys').insertAdjacentHTML('beforeend', html); }
+        else { $('rdKeys').innerHTML = html || '<div class="sqlx-empty">Sin claves que coincidan.</div>'; }
+        $('rdKeys').querySelectorAll('.rkey:not([data-bound])').forEach(function(el){
+          el.setAttribute('data-bound','1');
+          el.addEventListener('click', function(){
+            $('rdKeys').querySelectorAll('.rkey').forEach(function(x){ x.classList.remove('on'); });
+            el.classList.add('on');
+            openKey(el.dataset.key);
+          });
+        });
+      }
+      function search(append) {
+        if (!append) { cursor = '0'; }
+        api('scan', { cursor: cursor, match: $('rdMatch').value.trim(), count: $('rdCount').value })
+          .then(function(j){
+            if (j.error) { $('rdKeys').innerHTML = '<div class="sqlx-empty">'+esc(j.error)+'</div>'; return; }
+            cursor = j.cursor;
+            renderKeys(j.keys, append);
+            $('rdMore').hidden = j.done;
+            var n = $('rdKeys').querySelectorAll('.rkey').length;
+            // SCAN no sabe cuantas claves hay en total hasta terminar: se dice lo mostrado, no
+            // un total inventado. Ademas SCAN puede devolver lotes vacios y aun no haber acabado.
+            $('rdKeysMeta').textContent = n + ' clave(s) mostradas' + (j.done ? ' · recorrido completo' : ' · quedan más');
+          });
+      }
+      $('rdSearch').addEventListener('click', function(){ search(false); });
+      $('rdMatch').addEventListener('keydown', function(e){ if (e.key==='Enter') search(false); });
+      $('rdCount').addEventListener('change', function(){ search(false); });
+      $('rdMore').addEventListener('click', function(){ search(true); });
+      $('rdReload').addEventListener('click', function(){ loadDbs(); search(false); hideDetail(); });
+
+      // ---- detalle / editor ----
+      function hideDetail(){ $('rdDetail').hidden = true; curKey = null; curType = null; }
+      function openKey(key) {
+        api('key', { key: key }).then(function(j){
+          if (j.error) { dmsg(j.error, false); $('rdDetail').hidden = false; $('rdEditor').innerHTML=''; return; }
+          curKey = j.key; curType = j.type;
+          $('rdDetail').hidden = false;
+          $('rdDType').textContent = j.type;
+          $('rdDType').className = 'rtype ' + j.type;
+          $('rdDKey').textContent = j.key;
+          $('rdTtl').value = j.ttl < 0 ? '' : j.ttl;
+          $('rdRename').value = '';
+          dmsg('', true);
+          var meta = 'TTL: ' + ttlTxt(j.ttl);
+          if (j.type==='string') { meta += ' · ' + j.len + ' bytes'; }
+          else if (typeof j.count === 'number') { meta += ' · ' + j.count + ' elemento(s)'; }
+          $('rdDMeta').textContent = meta;
+          renderEditor(j);
+        });
+      }
+      function renderEditor(j) {
+        var h = '';
+        if (j.unsupported) {
+          h = '<div class="muted" style="font-size:12px">El tipo <code>'+esc(j.type)+'</code> no se puede editar aquí todavía. '
+            + 'Puedes consultarlo desde la <b>Consola</b> (por ejemplo <code>XRANGE '+esc(j.key)+' - +</code>).</div>';
+        } else if (j.type === 'string') {
+          h = '<label>Valor</label><textarea class="rval" id="rdStr"'+(j.truncated?' readonly':'')+'>'+esc(j.value)+'</textarea>';
+          if (j.truncated) {
+            h += '<div class="msgtext warn" style="margin-top:6px">Valor demasiado grande ('+j.len+' bytes): se muestran los primeros 256 KB '
+               + 'y la edición está desactivada para no guardar encima una versión recortada.</div>';
+          } else {
+            h += '<div style="margin-top:8px"><button type="button" class="btn sm" id="rdStrSave">Guardar valor</button></div>';
+          }
+        } else {
+          // hash/zset traen pares {k,v}; list/set traen valores planos (el "campo" es el indice
+          // en las listas y el propio valor en los sets).
+          var pares = (j.type==='hash' || j.type==='zset');
+          var c1 = j.type==='hash' ? 'Campo' : (j.type==='zset' ? 'Miembro' : (j.type==='list' ? '#' : 'Valor'));
+          var c2 = j.type==='zset' ? 'Score' : 'Valor';
+          h += '<div class="sqlgrid" style="max-height:40vh"><table class="sqltbl"><thead><tr>'
+             + '<th style="width:34%">'+c1+'</th><th>'+(pares||j.type==='list'?c2:'')+'</th><th style="width:120px"></th>'
+             + '</tr></thead><tbody>';
+          (j.items||[]).forEach(function(it, i){
+            var campo, valor;
+            if (pares)                 { campo = it.k; valor = it.v; }
+            else if (j.type==='list')  { campo = String(i); valor = it; }
+            else                       { campo = it; valor = ''; }
+            // En un set el miembro ES el valor: se pinta solo en la primera columna, no repetido.
+            h += '<tr><td><code>'+esc(campo)+'</code></td>'
+               + '<td>'+(j.type==='set' ? '' : '<code>'+esc(valor)+'</code>')+'</td>'
+               + '<td><button type="button" class="btn ghost sm rdEd" data-f="'+esc(campo)+'" data-v="'+esc(j.type==='set'?campo:valor)+'">Editar</button> '
+               + '<button type="button" class="btn danger sm rdRm" data-f="'+esc(campo)+'">Quitar</button></td></tr>';
+          });
+          h += '</tbody></table></div>';
+          if ((j.count||0) > (j.items||[]).length) {
+            h += '<div class="muted" style="margin-top:6px;font-size:11.5px">Mostrando '+(j.items||[]).length+' de '+j.count
+               + ' elementos (se limita a 1000 para no bloquear el navegador).</div>';
+          }
+          h += '<div class="row" style="gap:8px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">';
+          // El campo extra solo tiene sentido en hash (nombre del campo) y zset (miembro). En una
+          // lista se anade con RPUSH al final -- pedir un indice enganaria -- y en un set el
+          // miembro es el propio valor.
+          if (j.type==='hash' || j.type==='zset') { h += '<div><label>'+c1+'</label><input type="text" id="rdNewF"></div>'; }
+          h += '<div style="flex:1;min-width:160px"><label>'+(j.type==='zset'?'Score':'Valor')+'</label><input type="text" id="rdNewV" style="width:100%"></div>'
+             + '<button type="button" class="btn sm" id="rdAdd">'+(j.type==='list'?'Añadir al final':'Añadir')+'</button></div>';
+        }
+        $('rdEditor').innerHTML = h;
+
+        if ($('rdStrSave')) {
+          $('rdStrSave').addEventListener('click', function(){
+            api('edit', { key: curKey, type: 'string', value: $('rdStr').value })
+              .then(function(r){ dmsg(r.error || 'Valor guardado.', !r.error); });
+          });
+        }
+        if ($('rdAdd')) {
+          $('rdAdd').addEventListener('click', function(){
+            var f = $('rdNewF') ? $('rdNewF').value : '';
+            var v = $('rdNewV').value;
+            // En un set el "valor" es el propio miembro; en un zset el campo es el miembro y el
+            // valor es el score (asi es como los espera el endpoint).
+            if (curType==='set') { f = ''; }
+            api('additem', { key: curKey, type: curType, field: f, value: v })
+              .then(function(r){ if (r.error) { dmsg(r.error, false); } else { openKey(curKey); dmsg('Añadido.', true); } });
+          });
+        }
+        $('rdEditor').querySelectorAll('.rdEd').forEach(function(b){
+          b.addEventListener('click', function(){
+            var actual = b.dataset.v;
+            var etiqueta = curType==='zset' ? 'Nuevo score para "'+b.dataset.f+'"' : 'Nuevo valor para "'+b.dataset.f+'"';
+            var nv = window.prompt(etiqueta, actual);
+            if (nv === null) return;
+            api('edit', { key: curKey, type: curType, field: b.dataset.f, value: nv })
+              .then(function(r){ if (r.error) { dmsg(r.error, false); } else { openKey(curKey); dmsg('Guardado.', true); } });
+          });
+        });
+        $('rdEditor').querySelectorAll('.rdRm').forEach(function(b){
+          b.addEventListener('click', function(){
+            api('delitem', { key: curKey, type: curType, field: b.dataset.f })
+              .then(function(r){ if (r.error) { dmsg(r.error, false); } else { openKey(curKey); dmsg('Elemento quitado.', true); } });
+          });
+        });
+      }
+
+      $('rdTtlSave').addEventListener('click', function(){
+        var v = $('rdTtl').value.trim();
+        // Vacio = sin expiracion. El endpoint traduce <=0 a PERSIST, porque EXPIRE 0 borraria
+        // la clave, que no es lo que espera nadie al vaciar este campo.
+        var sec = v === '' ? -1 : parseInt(v, 10);
+        if (v !== '' && (isNaN(sec) || sec < 1)) { dmsg('El TTL tiene que ser un número de segundos mayor que 0, o vacío para quitarlo.', false); return; }
+        api('ttl', { key: curKey, seconds: sec }).then(function(r){
+          if (r.error) { dmsg(r.error, false); return; }
+          dmsg(sec > 0 ? 'TTL puesto en ' + sec + 's.' : 'Expiración quitada.', true);
+          openKey(curKey); search(false);
+        });
+      });
+      $('rdRenameSave').addEventListener('click', function(){
+        var to = $('rdRename').value.trim();
+        if (to === '') { dmsg('Escribe el nombre nuevo.', false); return; }
+        api('rename', { key: curKey, to: to }).then(function(r){
+          if (r.error) { dmsg(r.error, false); return; }
+          dmsg('Renombrada.', true); search(false); openKey(to);
+        });
+      });
+
+      // ---- borrar clave (modal propio, no confirm()) ----
+      var delKey = null;
+      $('rdDel').addEventListener('click', function(){
+        delKey = curKey;
+        $('rdDelName').textContent = curKey;
+        $('rdDelModal').hidden = false;
+        document.addEventListener('keydown', escDel);
+      });
+      function escDel(e){ if (e.key==='Escape') rdCloseDel(); }
+      window.rdCloseDel = function(){ $('rdDelModal').hidden = true; document.removeEventListener('keydown', escDel); };
+      $('rdDelYes').addEventListener('click', function(){
+        rdCloseDel();
+        api('del', { keys: [delKey] }).then(function(r){
+          if (r.error) { dmsg(r.error, false); return; }
+          hideDetail(); loadDbs(); search(false);
+        });
+      });
+
+      // ---- vaciar base ----
+      $('rdFlush').addEventListener('click', function(){
+        var b = $('rdDbs').querySelector('button.on');
+        var n = b ? b.querySelector('.n').textContent : '?';
+        $('rdFlushDb').textContent = 'db' + db;
+        $('rdFlushN').textContent = n + ' clave(s)';
+        $('rdFlushModal').hidden = false;
+        document.addEventListener('keydown', escFlush);
+      });
+      function escFlush(e){ if (e.key==='Escape') rdCloseFlush(); }
+      window.rdCloseFlush = function(){ $('rdFlushModal').hidden = true; document.removeEventListener('keydown', escFlush); };
+      $('rdFlushYes').addEventListener('click', function(){
+        rdCloseFlush();
+        api('flushdb').then(function(){ hideDetail(); loadDbs(); search(false); });
+      });
+
+      // ---- consola ----
+      function consPrint(html){ var o=$('rdConsOut'); o.insertAdjacentHTML('beforeend', html); o.scrollTop = o.scrollHeight; }
+      function fmt(v, depth) {
+        depth = depth || 0;
+        if (v === null) return '<span class="cnil">(nil)</span>';
+        if (typeof v === 'object' && v.__nil) return '<span class="cnil">(nil)</span>';
+        if (Array.isArray(v)) {
+          if (!v.length) return '<span class="cnil">(lista vacía)</span>';
+          return v.map(function(x,i){ return '\n' + '  '.repeat(depth+1) + (i+1) + ') ' + fmt(x, depth+1); }).join('');
+        }
+        return esc(v);
+      }
+      function runCmd() {
+        var line = $rdIn().value.trim();
+        if (!line) return;
+        hist.push(line); histIx = hist.length;
+        $rdIn().value = '';
+        if ($('rdConsOut').querySelector('.muted')) { $('rdConsOut').innerHTML = ''; }
+        consPrint('<div><span class="cin">db'+db+'&gt; '+esc(line)+'</span></div>');
+        api('cmd', { line: line }).then(function(r){
+          if (r.error)     { consPrint('<div class="cerr">'+esc(r.error)+'</div>'); return; }
+          if (r.err)       { consPrint('<div class="cerr">(error) '+esc(r.err)+'</div>'); return; }
+          consPrint('<div>'+fmt(r.result)+'</div>');
+          // Un comando de la consola puede haber creado o borrado claves: refrescar contadores.
+          loadDbs();
+        });
+      }
+      function $rdIn(){ return $('rdConsIn'); }
+      $('rdConsRun').addEventListener('click', runCmd);
+      $('rdConsClear').addEventListener('click', function(){ $('rdConsOut').innerHTML = '<span class="muted">Consola limpia.</span>'; });
+      $rdIn().addEventListener('keydown', function(e){
+        if (e.key === 'Enter') { e.preventDefault(); runCmd(); }
+        else if (e.key === 'ArrowUp')   { e.preventDefault(); if (histIx > 0) { $rdIn().value = hist[--histIx]; } }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); if (histIx < hist.length-1) { $rdIn().value = hist[++histIx]; } else { histIx = hist.length; $rdIn().value = ''; } }
+      });
+
+      // ---- servidor ----
+      function loadInfo() {
+        api('info').then(function(j){
+          if (j.error) { $('rdInfoBoxes').innerHTML = '<div class="sqlx-empty">'+esc(j.error)+'</div>'; return; }
+          var i = j.info;
+          var hits = parseInt(i.keyspace_hits||0,10), miss = parseInt(i.keyspace_misses||0,10);
+          var ratio = (hits+miss) > 0 ? Math.round(hits*100/(hits+miss)) + '%' : '—';
+          var up = parseInt(i.uptime_in_seconds||0,10);
+          var upTxt = up >= 86400 ? Math.floor(up/86400)+'d' : (up >= 3600 ? Math.floor(up/3600)+'h' : Math.floor(up/60)+'m');
+          var cajas = [
+            ['Versión', i.redis_version || '?'],
+            ['Modo', i.redis_mode || '?'],
+            ['Memoria usada', i.used_memory_human || '?'],
+            ['Pico de memoria', i.used_memory_peak_human || '?'],
+            ['Clientes', i.connected_clients || '0'],
+            ['Uptime', upTxt],
+            ['Aciertos de caché', ratio],
+            ['Comandos procesados', i.total_commands_processed || '0'],
+            ['Claves con TTL vencido', i.expired_keys || '0'],
+            ['Claves desalojadas', i.evicted_keys || '0']
+          ];
+          $('rdInfoBoxes').innerHTML = cajas.map(function(c){
+            return '<div class="b"><div class="l">'+esc(c[0])+'</div><div class="v">'+esc(c[1])+'</div></div>';
+          }).join('');
+          $('rdInfoRaw').textContent = j.raw;
+        });
+      }
+
+      loadDbs();
+      search(false);
+    })();
+    </script>
     <?php endif; ?>
 
   <?php elseif ($tab==='sqlsrv'): /* ---------- PESTAÑA SQL SERVER ---------- */

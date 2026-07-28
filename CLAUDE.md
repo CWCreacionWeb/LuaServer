@@ -58,6 +58,49 @@ que cambios en `lua.ps1` surtan efecto de verdad:
 Este bug se repitió varias veces esta sesión (features que "no hacían
 nada" porque el watcher viejo no conocía la acción nueva).
 
+### El caso grave: con "Arrancar con Windows" activo, `stop`/`start` NO bastan
+
+**Corregido el 2026-07-28**: lo de arriba es verdad, pero la receta
+(`stop` + `start`) **falla en silencio** si "Arrancar con Windows" está
+activo. En ese caso el watcher es una **tarea programada de `SYSTEM`**
+(`lua-server-watcher`), y entonces:
+
+- Una consola **no elevada no puede matarlo** (acceso denegado) — y
+  `Cmd-Stop` se lo tragaba con `-ErrorAction SilentlyContinue`, así que
+  `lua.ps1 stop` decía "Apache detenido" como si todo hubiera ido bien.
+- `lua.ps1 start` arranca **además** otro watcher como el usuario, así que
+  quedan **dos** compitiendo.
+- `Process-Jobs` **borra el `.job` en cuanto lo lee**, así que se lo queda
+  el primero que pase por el bucle. Si gana el de `SYSTEM` (con código de
+  hace días), la feature nueva falla con **`Tipo desconocido: <tipo>`**
+  aunque el código en disco esté perfecto y aunque acabes de reiniciar.
+- Y es **invisible**: `Get-CimInstance Win32_Process` no puede leer el
+  `CommandLine` de un proceso de `SYSTEM`, así que filtrar por
+  `*lua.ps1*watch*` **no lo encuentra**. Parece que no hay ningún watcher
+  y aun así los jobs se procesan.
+
+Así se diagnosticó (y es la forma rápida de confirmarlo): dejar un `.job`
+a mano en `tmp\jobs\` sin ningún watcher visible. Si el `.job` desaparece
+y aparece su `.status`, hay un watcher fantasma. Para confirmar que es la
+tarea de `SYSTEM`, **`schtasks /query /tn "lua-server-watcher"`** →
+`Acceso denegado` (existe pero no se puede leer). Ojo: `Get-ScheduledTask`
+para ese mismo caso dice **"no se encontraron objetos"**, que se
+confunde con "no existe" (ver el gotcha de PowerShell más abajo).
+
+**Arreglo implementado — el watcher ahora se autorecarga.** `Cmd-Watch`
+guarda el `LastWriteTimeUtc` de `lua.ps1` al arrancar y, al principio de
+cada vuelta del bucle, lo compara con el actual: si cambió, se relanza y
+sale. Cualquier watcher se pone al día solo, incluido el de `SYSTEM` (se
+relanza a sí mismo con sus mismos privilegios). Se compara contra la
+fecha de **arranque**, no contra la vuelta anterior, para que el relevo
+nazca al día y no haya bucle de reinicios. Además `Cmd-Stop` ahora
+**avisa** si no ha podido matar al watcher en vez de callárselo.
+
+Consecuencia práctica: editar `lua.ps1` ya surte efecto solo, en ~1s, sin
+reiniciar nada. La única excepción es un watcher que venga de **antes** de
+este cambio (su código no sabe autorecargarse): ese hay que matarlo una
+vez desde una consola **elevada**.
+
 ## ⚠️ Trampa nº2: `localhost` no es fiable en esta máquina
 
 Docker Desktop (`com.docker.backend`/`wslrelay`) ocupa el puerto 80 en
@@ -305,6 +348,30 @@ snippet de diagnostico. En esta investigacion se midio sin querer **la pagina de
 login** (la sesion se habia perdido al reiniciar Apache) y sus numeros se dieron por
 buenos durante una ronda entera.
 
+## ⚠️ Trampa nº8: git y "dubious ownership" cuando el watcher corre como SYSTEM
+
+Con **"Arrancar con Windows"** activo, el watcher corre como tarea programada
+`SYSTEM`, cuenta distinta de quien clono el repo. Git desde 2.35 se niega a operar
+sobre un repo de otro dueño (protección `safe.directory`), así que
+`Update-Check`/`Update-Apply` (pestaña Configuración → Actualizaciones) fallaban en
+cualquier máquina de un compañero con este mensaje:
+
+```
+fatal: detected dubious ownership in repository at 'C:/server/LuaServer'
+'C:/server/LuaServer' is owned by: EGonzalez/Eduard Gonzalez (S-1-5-21-...)
+but the current user is: NT AUTHORITY/SYSTEM (S-1-5-18)
+```
+
+La solución que sugiere el propio git (`git config --global --add safe.directory ...`)
+no vale aquí: habría que ejecutarla **con el perfil de SYSTEM**, a mano, en cada
+máquina — nada portable. Arreglado pasando la excepción **por argumento** en cada
+invocación de git sobre `$Root`, sin tocar ninguna config global: `$GitSafeDir`
+(`lua.ps1`, junto a las demás rutas) vale `"safe.directory=" + ($Root -replace
+'\\','/')` (mismo formato que exige git, barras hacia adelante), y todas las
+llamadas usan `& git -c $GitSafeDir -C "$Root" ...` en vez de `& git -C "$Root" ...`.
+Así funciona sin setup extra tanto si `lua.ps1` lo lanza el usuario interactivo como
+si lo lanza el watcher como SYSTEM.
+
 ## Gotchas de PowerShell
 
 - `$cfg.sites.PSObject.Properties.Name.Contains($name)` revienta con
@@ -404,6 +471,58 @@ buenos durante una ronda entera.
   `Set-MongoConf`), no por `mongod.lock` (formato no documentado) ni por
   nombre de proceso global — mismo criterio que `Postgres-Up` con
   `postmaster.pid`.
+
+- **Redis nativo** (`config/redis.on`, `127.0.0.1:6379`, sin contraseña) — mismo
+  patrón flag+watcher que los demás motores (`Set-RedisConf`/`Redis-Up`/
+  `Start-Redis`/`Stop-Redis`, "up" por el `pidfile` que le fijamos nosotros, con
+  backoff de 30s en el watcher como MariaDB/PostgreSQL). Dos cosas propias:
+  - **Redis no publica builds oficiales para Windows**, así que el panel deja
+    **elegir el port** la primera vez y lo recuerda en `config\redis\build.txt`:
+    `redis8` (redis-windows/redis-windows 8.8.1, al día pero sobre una capa
+    **msys2** — de ahí que `Start-Redis` lance el proceso con el cwd en
+    `bin\redis\`, o no encuentra sus DLLs) o `native5` (tporadowski 5.0.14.1,
+    port Win32 nativo pero congelado en 2022).
+  - La extensión **`php_redis` se instala por cada versión de PHP**, y ahí las
+    tres cosas tienen que casar exactas o la DLL no carga: versión de PHP, **NTS**
+    (este servidor usa mod_fcgid + `php-cgi.exe`, no mod_php — se ve en que
+    `bin\php\<ver>\` tiene `php8.dll` y NO `php8ts.dll`) y el toolset de VC
+    (`vc14` en 7.1, `vc15` en 7.2–7.4, `vs16` en 8.0–8.3, `vs17` en 8.4+).
+    Además la rama de phpredis no es libre: la 6.x cubre 7.4 y 8.x, pero 7.1–7.3
+    necesitan ramas viejas. Por eso hay un mapa explícito (`$PhpRedisBuilds` +
+    `Get-PhpRedisUrl`) en vez de construir la URL al vuelo. Va en **`$WantExts`**
+    (versionado), y `Set-PhpInis` ya la activa solo en las versiones donde el
+    `.dll` exista de verdad, con la sintaxis vieja en 7.1.
+  - De paso, PECL **distribuye siempre en `.zip`** (con el `.dll` junto a docs y
+    su `.pdb`), no en `.dll` suelto. El job `phpext` solo sabía de `.dll`, así que
+    no podía instalar **ninguna** extensión oficial de PECL: ahora hay una función
+    `Install-PhpExt` que acepta las dos formas y la usan tanto `phpext` como el
+    motor de Redis.
+
+- **Pestaña Redis** — gestor propio, mismo modelo que la de SQL Server: **no gestiona un motor
+  propio**, se conecta a un Redis existente con conexiones guardadas en
+  `config\redis-servers.json` (fuera de git, contraseña en claro como las demás). Explorador de
+  claves con `SCAN` (patrón + paginación por cursor), visor/editor por tipo (string, hash, list,
+  set, zset), TTL, renombrar, borrar, vaciar base, consola de comandos con historial, y panel de
+  estado con `INFO`. Decisiones que conviene no volver a discutir:
+  - **Se habla RESP a pelo por `fsockopen`, sin `php_redis`** (`redis_connect`/`redis_cmd`/
+    `redis_read`). Si dependiera de la extensión, el gestor no funcionaría hasta tenerla
+    instalada justo en la versión de PHP que sirve el panel — y en Windows eso implica que casen
+    versión, NTS y toolset de VC. RESP son 5 tipos de respuesta: sale más barato implementarlo.
+    Verificado que el round-trip de acentos, `€`, chino, emoji, saltos de línea y valores de
+    200 KB sale **idéntico byte a byte** (RESP lleva la longitud por delante, así que no hay
+    nada del infierno de codificaciones de la trampa nº6).
+  - **`SCAN`, nunca `KEYS`**: `KEYS` recorre todo el keyspace de golpe y bloquea el servidor, que
+    aquí suele ser uno compartido con las apps del usuario. El cursor lo lleva el cliente.
+  - **`RENAMENX` en vez de `RENAME`**: `RENAME` pisa el destino sin avisar.
+  - **TTL vacío → `PERSIST`, no `EXPIRE 0`**: `EXPIRE` con 0 o negativo **borra** la clave, que no
+    es lo que espera nadie al vaciar ese campo.
+  - Los errores del servidor (`-ERR …`) se devuelven como objeto `RedisErr` en vez de lanzar: en
+    la consola un error es un resultado que hay que mostrar, no una excepción. Y se distingue el
+    `nil` de Redis de la cadena vacía (`{"__nil":true}`), porque no son lo mismo.
+  - `SHUTDOWN` está bloqueado (apagaría el servidor sin forma de rearrancarlo desde el panel) y
+    también `SUBSCRIBE`/`MONITOR` y compañía, que dejan la conexión escuchando para siempre.
+  - Los strings de más de 256 KB se muestran recortados y **con la edición desactivada**, para no
+    guardar encima una versión truncada del original.
 
 - **Pestaña SQL Server** — gestor propio tipo phpMyAdmin para **Microsoft SQL Server**
   (que NO se instala con la plataforma: se conecta a uno existente, local o de red). Barra

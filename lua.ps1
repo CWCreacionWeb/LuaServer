@@ -50,6 +50,11 @@ $Template   = Join-Path $Root "config\apache\templates\vhost.tpl"
 $SitesJson  = Join-Path $Root "config\sites.json"
 $ApacheLog  = Join-Path $Root "logs\apache"
 $TmpDir     = Join-Path $Root "tmp"
+# Evita "detected dubious ownership": el watcher/tarea de arranque corren como
+# SYSTEM (ver startup-enable), cuenta distinta de quien clono el repo. Se pasa
+# por argumento en vez de "git config --global --add safe.directory" para no
+# depender de tocar el perfil de SYSTEM en cada maquina.
+$GitSafeDir = "safe.directory=" + ($Root -replace '\\', '/')
 $HostsFile  = Join-Path $env:WINDIR "System32\drivers\etc\hosts"
 # --- HTTPS (mkcert + mod_ssl) ---
 $SslDir     = Join-Path $Root "data\ssl"
@@ -86,13 +91,38 @@ $MongoLogDir    = Join-Path $Root "logs\mongodb"
 $MongoConf      = Join-Path $Root "config\mongodb\mongod.cfg"
 $MongoDbFlag    = Join-Path $Root "config\mongodb.on"
 $MongoPort      = 27017
+# --- Redis (portable) ---
+# Redis no tiene build oficial para Windows, asi que se elige entre dos ports de la comunidad
+# al instalar (el panel manda 'build' en el job, ver el case "redis" de Run-Job):
+#   'redis8'  -> redis-windows/redis-windows 8.8.1, Redis moderno pero sobre una capa msys2
+#                (trae sus DLLs al lado del .exe; por eso se ejecuta con el cwd en su carpeta).
+#   'native5' -> tporadowski/redis 5.0.14.1, port Win32 nativo de verdad y sin dependencias,
+#                pero congelado en Redis 5 (ultima release de 2022).
+# Cual quedo instalado se recuerda en config\redis\build.txt: hace falta para el aviso del panel
+# y para no reinstalar el otro por error al reactivar el motor.
+$RedisDir       = Join-Path $Bin  "redis"
+$RedisExe       = Join-Path $RedisDir "redis-server.exe"
+$RedisDataDir   = Join-Path $Root "data\redis"
+$RedisLogDir    = Join-Path $Root "logs\redis"
+$RedisConf      = Join-Path $Root "config\redis\redis.conf"
+$RedisBuildFile = Join-Path $Root "config\redis\build.txt"
+$RedisFlag      = Join-Path $Root "config\redis.on"
+$RedisPort      = 6379
 # --- Node.js portable (runtime unicamente para mongo-express) ---
 $NodeDir        = Join-Path $Bin  "node"
 $NodeExe        = Join-Path $NodeDir "node.exe"
 $NpmCmd         = Join-Path $NodeDir "npm.cmd"
 # --- mongo-express (GUI web de MongoDB, corre sobre Node) ---
+# Se instala clonando el repo (ver case "mongodb" de Run-Job), no "npm install mongo-express":
+# el tag "latest" de npm apunta hoy a un release candidate (1.1.0-rc-4) cuyo tarball publicado
+# no incluye build-assets.json (falta en su whitelist "files"), asi que una instalacion normal
+# revienta al arrancar con ENOENT. Clonando el repo y compilando nosotros mismos (npm install
+# genera ese archivo via el script "prepublish", que npm tambien ejecuta en instalaciones
+# locales) se evita depender de ese tarball roto. Tag fijo en vez de una rama para que el
+# instalador sea reproducible pase lo que pase con el estado del repo en GitHub.
 $MongoExpress        = Join-Path $Root "bin\mongo-express"
-$MongoExpressApp     = Join-Path $MongoExpress "node_modules\mongo-express\app.js"
+$MongoExpressApp     = Join-Path $MongoExpress "app.js"
+$MongoExpressTag     = "v1.1.0-rc-4"
 $MongoExpressPidFile = Join-Path $TmpDir "mongo-express.pid"
 $MongoExpressPort    = 8081
 # --- WP-CLI (automatiza el alta guiada de WordPress: wp-config.php + wp core install) ---
@@ -120,7 +150,10 @@ $HostsEnd   = "# === lua-server END ==="
 # config\php\extra-extensions.json, que esta en .gitignore: si estuviera alli, al actualizar
 # la plataforma los demas equipos se quedarian sin el driver y la pestana no arrancaria.
 # Set-PhpInis solo activa las que tengan su DLL, y php_pdo_odbc.dll viene con PHP en Windows.
-$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_pgsql','pgsql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet','pdo_odbc')
+# redis: la DLL no viene con PHP, la instala el motor de Redis desde PECL (ver el case "redis"
+# de Run-Job). Va aqui igualmente para que Set-PhpInis la active en cuanto aparezca -- y va en
+# ESTA lista, no en extra-extensions.json, por lo dicho arriba sobre pdo_odbc.
+$WantExts   = @('curl','intl','mbstring','exif','mysqli','openssl','pdo_mysql','pdo_pgsql','pgsql','pdo_sqlite','sqlite3','zip','fileinfo','sodium','soap','bz2','com_dotnet','pdo_odbc','redis')
 
 function Info($m){ Write-Host "[lua] $m" -ForegroundColor Cyan }
 function Ok($m){ Write-Host "[ok]  $m" -ForegroundColor Green }
@@ -679,12 +712,26 @@ function Start-MongoExpress {
     if (MongoExpress-Up) { return }
     # Sin autenticacion (ME_CONFIG_BASICAUTH_ENABLED=false): mismo modelo que el root
     # sin contrasena de MariaDB y el trust de PostgreSQL -- solo accesible en 127.0.0.1.
-    $env:ME_CONFIG_MONGODB_SERVER      = "127.0.0.1"
-    $env:ME_CONFIG_MONGODB_PORT        = "$MongoPort"
-    $env:ME_CONFIG_SITE_PORT           = "$MongoExpressPort"
+    # OJO: esta version (1.1.0-rc-*, reescritura a ESM) cambio silenciosamente la API de
+    # variables de entorno documentada historicamente por la imagen Docker oficial:
+    # - Ya NO arma la connection string a partir de ME_CONFIG_MONGODB_SERVER/_PORT (los
+    #   ignora sin avisar); hace falta darsela ya construida en ME_CONFIG_MONGODB_URL.
+    # - Ya NO lee ME_CONFIG_SITE_PORT (usa el "PORT" generico de Node/Express).
+    # - No existe ME_CONFIG_SITE_HOST: el host de escucha solo se puede fijar via la
+    #   variable "VCAP_APP_HOST" (residuo de su soporte a Cloud Foundry). Sin esto usa su
+    #   default 'localhost', que en esta clase de maquinas Windows resuelve a la IPv6 ::1
+    #   (ver trampa nº2 de CLAUDE.md) y deja 127.0.0.1:8081 sin nadie escuchando aunque el
+    #   proceso este vivo.
+    # - express-session exige ahora un secreto explicito o tira 500 en toda peticion; sin
+    #   autenticacion real de por medio (BASICAUTH_ENABLED=false) su valor es irrelevante,
+    #   solo hace falta que exista.
+    $env:ME_CONFIG_MONGODB_URL         = "mongodb://127.0.0.1:$MongoPort"
+    $env:VCAP_APP_HOST                 = "127.0.0.1"
+    $env:PORT                          = "$MongoExpressPort"
     $env:ME_CONFIG_BASICAUTH_ENABLED   = "false"
     $env:ME_CONFIG_MONGODB_ENABLE_ADMIN= "true"
-    $proc = Start-Process -FilePath $NodeExe -ArgumentList @("`"$MongoExpressApp`"") -WindowStyle Hidden -PassThru
+    $env:ME_CONFIG_SITE_SESSIONSECRET  = "lua-server-mongo-express"
+    $proc = Start-Process -FilePath $NodeExe -ArgumentList @("`"$MongoExpressApp`"") -WindowStyle Hidden -PassThru -WorkingDirectory $MongoExpress
     Set-Content -Path $MongoExpressPidFile -Value $proc.Id -Encoding ascii
 }
 function Stop-MongoExpress {
@@ -693,6 +740,108 @@ function Stop-MongoExpress {
         if ($thePid) { Stop-Process -Id ([int]$thePid) -Force -ErrorAction SilentlyContinue }
     }
     Remove-Item $MongoExpressPidFile -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------- Redis (portable, mismo patron que MongoDB/PostgreSQL) ----------------
+# "Up" se comprueba por el .pid que NOSOTROS le pedimos escribir en redis.conf, no por nombre
+# de proceso: en esta maquina puede haber otro redis-server.exe (Docker, WSL, instalacion
+# ajena) y matarlo o darlo por nuestro seria un desastre. Mismo criterio que Postgres-Up
+# (postmaster.pid) y MongoDb-Up.
+function Redis-Build {
+    if (Test-Path $RedisBuildFile) { return (Get-Content $RedisBuildFile -Raw).Trim() }
+    return ""
+}
+# URL del php_redis.dll oficial de PECL para una version de PHP. Tres cosas tienen que casar
+# EXACTAS o PHP no carga la DLL (y ademas falla en silencio en el log de Apache, no en pantalla):
+#   1. La version de PHP.
+#   2. NTS (non-thread-safe): es lo que usa este servidor. Se sirve con mod_fcgid + php-cgi.exe,
+#      no mod_php, asi que los builds son NTS -- comprobable porque bin\php\<ver>\ tiene php8.dll
+#      y NO php8ts.dll. Un .dll TS aqui no carga.
+#   3. El toolset de VC con el que se compilo PHP: vc14 (7.1), vc15 (7.2-7.4), vs16 (8.0-8.3),
+#      vs17 (8.4+).
+# Y la version de phpredis no es libre: la rama 6.x soporta 7.4 y 8.x, pero para 7.1-7.3 hay que
+# bajar a ramas viejas (la ultima que publico DLL para cada una). De ahi el mapa explicito.
+$PhpRedisBuilds = @{
+    '7.1' = '5.1.1/php_redis-5.1.1-7.1-nts-vc14-x64.zip'
+    '7.2' = '5.1.1/php_redis-5.1.1-7.2-nts-vc15-x64.zip'
+    '7.3' = '5.3.4/php_redis-5.3.4-7.3-nts-vc15-x64.zip'
+    '7.4' = '6.3.0/php_redis-6.3.0-7.4-nts-vc15-x64.zip'
+    '8.0' = '6.3.0/php_redis-6.3.0-8.0-nts-vs16-x64.zip'
+    '8.1' = '6.3.0/php_redis-6.3.0-8.1-nts-vs16-x64.zip'
+    '8.2' = '6.3.0/php_redis-6.3.0-8.2-nts-vs16-x64.zip'
+    '8.3' = '6.3.0/php_redis-6.3.0-8.3-nts-vs16-x64.zip'
+    '8.4' = '6.3.0/php_redis-6.3.0-8.4-nts-vs17-x64.zip'
+    '8.5' = '6.3.0/php_redis-6.3.0-8.5-nts-vs17-x64.zip'
+}
+function Get-PhpRedisUrl($ver) {
+    if (-not $PhpRedisBuilds.ContainsKey("$ver")) { return $null }
+    return "https://windows.php.net/downloads/pecl/releases/redis/$($PhpRedisBuilds[$ver])"
+}
+function Set-RedisConf {
+    New-Item -ItemType Directory -Force -Path (Split-Path $RedisConf) | Out-Null
+    New-Item -ItemType Directory -Force -Path $RedisDataDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $RedisLogDir  | Out-Null
+    # Rutas con barra hacia adelante (Fwd): el parser de redis.conf trata la barra invertida
+    # como escape, y una ruta tipo C:\personal\... acaba interpretada mal.
+    $dd      = Fwd $RedisDataDir
+    $log     = Fwd (Join-Path $RedisLogDir "redis.log")
+    $pidPath = Fwd (Join-Path $RedisDataDir "redis.pid")
+    Set-Content -Path $RedisConf -Encoding ascii -Value @(
+        "# Generado por lua-server -- no editar a mano (se sobrescribe en cada init/start)",
+        "bind 127.0.0.1",
+        "port $RedisPort",
+        # Sin contrasena, igual que el root de MariaDB y el trust de PostgreSQL: solo escucha
+        # en 127.0.0.1, asi que no sale de esta maquina.
+        "protected-mode yes",
+        "dir $dd",
+        "logfile `"$log`"",
+        "pidfile `"$pidPath`"",
+        # daemonize no existe en Windows (ninguno de los dos ports lo soporta): el proceso se
+        # lanza oculto con Start-Process y se controla por su PID, como mongod.
+        "daemonize no",
+        # Persistencia RDB con los intervalos por defecto de Redis. Para un almacen de
+        # desarrollo (cache/sesiones/colas) sobra, y evita perder las claves al reiniciar.
+        "save 900 1",
+        "save 300 10",
+        "save 60 10000",
+        "dbfilename dump.rdb",
+        # Sin esto, en Windows un fallo al persistir el RDB deja a Redis rechazando escrituras
+        # con MISCONF hasta que se arregle a mano -- comportamiento pesimo en local.
+        "stop-writes-on-bgsave-error no"
+    )
+}
+function Redis-Up {
+    $pidFile = Join-Path $RedisDataDir "redis.pid"
+    if (-not (Test-Path $pidFile)) { return $false }
+    $thePid = Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue
+    if (-not $thePid) { return $false }
+    $p = Get-Process -Id ([int]$thePid) -ErrorAction SilentlyContinue
+    return ($p -and $p.ProcessName -eq 'redis-server')
+}
+function Start-Redis {
+    if (-not (Test-Path $RedisExe)) { return }
+    if (Redis-Up) { return }
+    Set-RedisConf
+    # -WorkingDirectory en su propia carpeta: el build msys2 (redis8) carga sus DLLs de al lado
+    # del .exe y no arranca si el cwd es otro.
+    Start-Process -FilePath $RedisExe -WindowStyle Hidden -ArgumentList @("`"$(Fwd $RedisConf)`"") -WorkingDirectory $RedisDir
+}
+function Stop-Redis {
+    # Se intenta primero un apagado limpio con redis-cli (vuelca el RDB antes de salir); si no
+    # esta o no responde, se mata por el PID propio. Con persistencia RDB perder el ultimo
+    # snapshot en un almacen de desarrollo es aceptable, igual que en Stop-MariaDb/Stop-MongoDb.
+    $pidFile = Join-Path $RedisDataDir "redis.pid"
+    if (Redis-Up) {
+        $cli = Join-Path $RedisDir "redis-cli.exe"
+        if (Test-Path $cli) { & $cli -h 127.0.0.1 -p $RedisPort shutdown nosave 2>$null | Out-Null }
+        for ($i=0; $i -lt 20; $i++) { if (-not (Redis-Up)) { break }; Start-Sleep -Milliseconds 250 }
+        if (Redis-Up) {
+            $thePid = Get-Content $pidFile -TotalCount 1 -ErrorAction SilentlyContinue
+            if ($thePid) { Stop-Process -Id ([int]$thePid) -Force -ErrorAction SilentlyContinue }
+            for ($i=0; $i -lt 20; $i++) { if (-not (Redis-Up)) { break }; Start-Sleep -Milliseconds 250 }
+        }
+    }
+    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
 }
 
 function Cmd-Start {
@@ -711,17 +860,34 @@ function Cmd-Start {
     if (Test-Path $MariaDbFlag) { Start-MariaDb }
     if (Test-Path $PostgresFlag) { Start-Postgres }
     if (Test-Path $MongoDbFlag) { Start-MongoDb; if (MongoDb-Up) { Start-MongoExpress } }
+    if (Test-Path $RedisFlag) { Start-Redis }
     Write-Host ""; Ok "Panel:  http://localhost"
     Cmd-ListSites
 }
 function Cmd-Stop {
     if (Service-Exists $SvcApache) { Stop-Service $SvcApache -Force -ErrorAction SilentlyContinue } else { Get-Process httpd -ErrorAction SilentlyContinue | Stop-Process -Force }
+    # Parar el watcher. Si corre como SYSTEM (tarea programada de "Arrancar con Windows") una
+    # consola no elevada NO puede matarlo: antes ese fallo se tragaba en silencio y el watcher
+    # viejo seguia vivo con su codigo cacheado, robando jobs a cualquier watcher nuevo (ver el
+    # comentario largo en Cmd-Watch). Ahora se avisa. Aun asi no es grave: desde este commit el
+    # watcher se autorecarga al detectar que lua.ps1 ha cambiado.
     $pf = Join-Path $TmpDir "watch.pid"
-    if (Test-Path $pf) { $wp = Get-Content $pf -ErrorAction SilentlyContinue; if ($wp) { Stop-Process -Id ([int]$wp) -Force -ErrorAction SilentlyContinue }; Remove-Item $pf -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $pf) {
+        $wp = Get-Content $pf -ErrorAction SilentlyContinue
+        if ($wp) {
+            Stop-Process -Id ([int]$wp) -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 300
+            if (Get-Process -Id ([int]$wp) -ErrorAction SilentlyContinue) {
+                Warn "No se pudo detener el watcher (PID $wp): seguramente corre como SYSTEM. Se pondra al dia solo al detectar cambios en lua.ps1."
+            }
+        }
+        Remove-Item $pf -Force -ErrorAction SilentlyContinue
+    }
     Stop-Mailpit
     Stop-MariaDb
     Stop-MongoExpress
     Stop-MongoDb
+    Stop-Redis
     Ok "Apache detenido."
 }
 
@@ -729,6 +895,21 @@ function Cmd-Stop {
 # El panel solo crea archivos-senal en tmp\; este proceso los ejecuta (no es hijo de Apache).
 function Cmd-Watch {
     $pf = Join-Path $TmpDir "watch.pid"; Set-Content -Path $pf -Value $PID -Encoding ascii
+    # Fecha de lua.ps1 tal y como estaba al cargar ESTE proceso. PowerShell compila el script
+    # entero en memoria al arrancar: a partir de aqui, editar el archivo no cambia nada de lo
+    # que ejecuta este watcher (la trampa nº1 de CLAUDE.md). Mas abajo, en el bucle, se compara
+    # con la fecha actual y el watcher se sustituye por uno nuevo en cuanto detecta un cambio.
+    #
+    # Esto importa mucho mas de lo que parece: con "Arrancar con Windows" activo el watcher es
+    # una tarea programada de SYSTEM, y entonces `lua.ps1 stop` desde una consola normal NO
+    # puede matarlo (acceso denegado, y el error va a /dev/null por -ErrorAction
+    # SilentlyContinue). El watcher viejo sobrevive, `lua.ps1 start` arranca ADEMAS otro como
+    # usuario, y los dos compiten por los jobs -- Process-Jobs borra el .job en cuanto lo lee,
+    # asi que gana el primero que pase por ahi. Si gana el de SYSTEM (con codigo de hace dias),
+    # las features nuevas fallan con "Tipo desconocido: <tipo>" aunque el codigo en disco este
+    # perfecto y aunque acabes de reiniciar. Autorecargandose, cualquier watcher -- incluido el
+    # de SYSTEM, que se relanza a si mismo con sus mismos privilegios -- se pone al dia solo.
+    $selfStamp = try { (Get-Item $PSCommandPath).LastWriteTimeUtc } catch { [datetime]::MinValue }
     $fApply = Join-Path $TmpDir "apply.flag"
     $fHosts = Join-Path $TmpDir "hosts.flag"
     $fHttps = Join-Path $TmpDir "https.flag"
@@ -741,6 +922,7 @@ function Cmd-Watch {
     # reescritura de my.ini en bucle). Se reintenta como mucho cada 30s.
     $nextMariaTry = [datetime]::MinValue
     $nextPgTry    = [datetime]::MinValue
+    $nextRedisTry = [datetime]::MinValue
     $fUpdChk      = Join-Path $TmpDir "update-check.flag"
     $fUpdNow      = Join-Path $TmpDir "update-now.flag"
     # Primera comprobacion a los 30s de arrancar (no en el mismo instante: el arranque ya
@@ -748,6 +930,15 @@ function Cmd-Watch {
     $nextUpdTry   = [datetime]::Now.AddSeconds(30)
     while ($true) {
         try {
+            # Autorecarga: si lua.ps1 ha cambiado desde que arranco este proceso, relanzarse y
+            # salir. Se compara contra la fecha capturada al arrancar (no contra la anterior
+            # vuelta del bucle), asi el relevo ya nace al dia y no se produce un bucle de
+            # reinicios. Va lo PRIMERO del bucle para no dejar a medias un job con codigo viejo.
+            $nowStamp = try { (Get-Item $PSCommandPath).LastWriteTimeUtc } catch { $selfStamp }
+            if ($nowStamp -ne $selfStamp) {
+                Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
+                return
+            }
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
             if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
             if (Test-Path $fHttps) { Remove-Item $fHttps -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'https-setup') }
@@ -777,6 +968,13 @@ function Cmd-Watch {
             if (-not $mongoOn -and (MongoDb-Up)) { Stop-MongoDb }
             if ($mongoOn -and (MongoDb-Up) -and -not (MongoExpress-Up)) { Start-MongoExpress }
             if ((-not $mongoOn -or -not (MongoDb-Up)) -and (MongoExpress-Up)) { Stop-MongoExpress }
+            # Reconciliar Redis con su flag (con backoff si no arranca, como MariaDB/PostgreSQL:
+            # sin el, un build que revienta al arrancar se reintentaria cada segundo para siempre)
+            $rdOn = Test-Path $RedisFlag
+            if ($rdOn -and (Test-Path $RedisExe) -and -not (Redis-Up)) {
+                if ([datetime]::Now -ge $nextRedisTry) { Start-Redis; $nextRedisTry = [datetime]::Now.AddSeconds(30) }
+            } elseif ($rdOn -and (Redis-Up)) { $nextRedisTry = [datetime]::MinValue }
+            if (-not $rdOn -and (Redis-Up)) { Stop-Redis }
             # Dialogo nativo "Elegir carpeta": el panel corre bajo el servicio de Apache (sesion 0,
             # sin escritorio), asi que no puede mostrar UI el mismo -- lo pide aqui, en el watcher,
             # que corre en la sesion interactiva del usuario. El panel solo espera el resultado
@@ -847,8 +1045,8 @@ function Cmd-Watch {
             # denegado porque Apache es servicio y este watcher no esta elevado) no
             # dejaba ningun rastro. Se registra para poder diagnosticarlo.
             try {
-                New-Item -ItemType Directory -Force -Path (Join-Path $Root "logs") | Out-Null
-                "$(Get-Date -Format o)  watch-loop error: $($_.Exception.Message)" | Add-Content (Join-Path $Root "logs\watcher-error.log")
+                New-Item -ItemType Directory -Force -Path $ApacheLog | Out-Null
+                "$(Get-Date -Format o)  watch-loop error: $($_.Exception.Message)" | Add-Content (Join-Path $ApacheLog "watcher-error.log")
             } catch {}
         }
         Start-Sleep -Seconds 1
@@ -925,9 +1123,9 @@ function Save-UpdateConfig($cfg) {
 function Get-LuaVersion {
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
-        $tag = (& git -C "$Root" describe --tags --abbrev=0 2>$null | Select-Object -First 1)
-        $sha = (& git -C "$Root" rev-parse --short HEAD 2>$null | Select-Object -First 1)
-        $n   = (& git -C "$Root" rev-list --count HEAD 2>$null | Select-Object -First 1)
+        $tag = (& git -c $GitSafeDir -C "$Root" describe --tags --abbrev=0 2>$null | Select-Object -First 1)
+        $sha = (& git -c $GitSafeDir -C "$Root" rev-parse --short HEAD 2>$null | Select-Object -First 1)
+        $n   = (& git -c $GitSafeDir -C "$Root" rev-list --count HEAD 2>$null | Select-Object -First 1)
         if ($tag) { return "$tag" }
         if ($sha) { return "r$n $sha" }
         return "desconocida"
@@ -944,20 +1142,20 @@ function Update-Check {
     $o = @{ comprobado = (Get-Date -Format o); version = (Get-LuaVersion); error = $null
             detras = 0; delante = 0; sucio = $false; remoto = $null; mensaje = $null }
     try {
-        $fetch = (& git -C "$Root" fetch --quiet origin 2>&1)
+        $fetch = (& git -c $GitSafeDir -C "$Root" fetch --quiet origin 2>&1)
         if ($LASTEXITCODE -ne 0) {
             # Tipico: sin clave SSH cargada, sin red, o el remoto pide autenticacion.
             $o.error = "No se pudo consultar el remoto: $fetch"
             Write-UpdateStatus $o; return $o
         }
-        $up = (& git -C "$Root" rev-parse --abbrev-ref '@{u}' 2>$null | Select-Object -First 1)
+        $up = (& git -c $GitSafeDir -C "$Root" rev-parse --abbrev-ref '@{u}' 2>$null | Select-Object -First 1)
         if (-not $up) { $o.error = 'La rama actual no sigue a ninguna rama remota.'; Write-UpdateStatus $o; return $o }
         $o.remoto  = "$up"
-        $o.detras  = [int]((& git -C "$Root" rev-list --count "HEAD..$up" 2>$null | Select-Object -First 1))
-        $o.delante = [int]((& git -C "$Root" rev-list --count "$up..HEAD" 2>$null | Select-Object -First 1))
-        $o.sucio   = [bool]((& git -C "$Root" status --porcelain 2>$null) -ne $null -and (& git -C "$Root" status --porcelain 2>$null).Count -gt 0)
+        $o.detras  = [int]((& git -c $GitSafeDir -C "$Root" rev-list --count "HEAD..$up" 2>$null | Select-Object -First 1))
+        $o.delante = [int]((& git -c $GitSafeDir -C "$Root" rev-list --count "$up..HEAD" 2>$null | Select-Object -First 1))
+        $o.sucio   = [bool]((& git -c $GitSafeDir -C "$Root" status --porcelain 2>$null) -ne $null -and (& git -c $GitSafeDir -C "$Root" status --porcelain 2>$null).Count -gt 0)
         if ($o.detras -gt 0) {
-            $o.mensaje = ((& git -C "$Root" log --format='%h %s' -n 5 "HEAD..$up" 2>$null) -join "`n")
+            $o.mensaje = ((& git -c $GitSafeDir -C "$Root" log --format='%h %s' -n 5 "HEAD..$up" 2>$null) -join "`n")
         }
     } catch { $o.error = $_.Exception.Message }
     finally { $ErrorActionPreference = $prev }
@@ -979,7 +1177,7 @@ function Update-Apply {
 
         $antesLua = (Get-FileHash (Join-Path $Root "lua.ps1") -Algorithm MD5).Hash
         Info "Actualizando desde $($est.remoto)..."
-        $out = (& git -C "$Root" merge --ff-only "$($est.remoto)" 2>&1)
+        $out = (& git -c $GitSafeDir -C "$Root" merge --ff-only "$($est.remoto)" 2>&1)
         if ($LASTEXITCODE -ne 0) { Err "No se pudo actualizar: $out"; return $false }
         Ok "Actualizado a $(Get-LuaVersion)."
 
@@ -1096,6 +1294,43 @@ function Ensure-WpCli($log) {
     "WP-CLI descargado." | Add-Content $log
     return $true
 }
+# Instala php_<ext>.dll en bin\php\<ver>\ext\ desde una URL que puede ser el .dll suelto O un
+# .zip. Lo segundo hace falta porque PECL (windows.php.net) distribuye SIEMPRE en zip -- con el
+# .dll acompanado de docs, LICENSE y su .pdb -- asi que sin esto no se puede instalar ninguna
+# extension oficial de PECL, solo .dll sueltos alojados a mano. Devuelve $true si acaba con el
+# .dll en su sitio.
+function Install-PhpExt($ver, $extName, $url, $log) {
+    $extDir = Join-Path $PhpBase "$ver\ext"
+    if (-not (Test-Path $extDir)) { "  ! PHP $ver no tiene carpeta ext\ (no instalado?)" | Add-Content $log; return $false }
+    $dest = Join-Path $extDir "php_$extName.dll"
+    $esZip = ($url -match '\.zip($|\?)')
+    if (-not $esZip) {
+        "  Descargando php_$extName.dll para PHP $ver..." | Add-Content $log
+        & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log
+        if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 1024)) {
+            Remove-Item $dest -Force -ErrorAction SilentlyContinue
+            "  ! No se descargo el .dll (revisa la URL)" | Add-Content $log; return $false
+        }
+    } else {
+        $work = Join-Path $TmpDir ("ext-" + [System.IO.Path]::GetRandomFileName())
+        $zip  = "$work.zip"
+        "  Descargando php_$extName.dll (zip de PECL) para PHP $ver..." | Add-Content $log
+        & curl.exe -s -L -o "$zip" "$url" 2>&1 | Add-Content $log
+        if ((-not (Test-Path $zip)) -or ((Get-Item $zip).Length -lt 1024)) {
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            "  ! No se descargo el zip (revisa la URL)" | Add-Content $log; return $false
+        }
+        try { Expand-Archive $zip $work -Force } catch { "  ! El zip no se pudo descomprimir: $($_.Exception.Message)" | Add-Content $log }
+        # -Recurse: algunos zips de PECL meten el .dll en la raiz y otros dentro de una carpeta.
+        $dll = Get-ChildItem $work -Filter "php_$extName.dll" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($dll) { Copy-Item $dll.FullName $dest -Force }
+        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $zip  -Force -ErrorAction SilentlyContinue
+        if (-not $dll) { "  ! El zip no contenia php_$extName.dll" | Add-Content $log; return $false }
+    }
+    "  php_$extName.dll instalada en PHP $ver ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log
+    return $true
+}
 function Run-Job($id, $job) {
     $name="$($job.name)"; $type="$($job.type)"; $php="$($job.php)"; $url="$($job.url)"; $withdb=[bool]$job.withdb; $extName="$($job.extName)"
     $logDir = Join-Path $Root "logs\jobs"; New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -1139,7 +1374,7 @@ function Run-Job($id, $job) {
             }
             "git"       { & git clone "$url" "$dir" 2>&1 | Add-Content $log; if ($LASTEXITCODE -ne 0) { $ok=$false; $err="git clone fallo (ver log)" } elseif (Test-Path (Join-Path $dir "composer.json")) { "composer install..." | Add-Content $log; & $phpExe $composer install --no-interaction --working-dir="$dir" 2>&1 | Add-Content $log } }
             "xdebug"    { $dest = Join-Path $PhpBase "$php\ext\php_xdebug.dll"; "Descargando Xdebug: $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 20000)) { $ok=$false; $err="No se descargo la DLL de Xdebug"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Xdebug descargado ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
-            "phpext"    { $dest = Join-Path $PhpBase "$php\ext\php_$extName.dll"; "Descargando extension '$extName': $url" | Add-Content $log; & curl.exe -s -L -o "$dest" "$url" 2>&1 | Add-Content $log; if ((-not (Test-Path $dest)) -or ((Get-Item $dest).Length -lt 1024)) { $ok=$false; $err="No se descargo el .dll (revisa la URL)"; Remove-Item $dest -Force -ErrorAction SilentlyContinue } else { "Extension '$extName' descargada ($([math]::Round((Get-Item $dest).Length/1KB)) KB)." | Add-Content $log } }
+            "phpext"    { "Instalando extension '$extName' desde: $url" | Add-Content $log; if (-not (Install-PhpExt $php $extName $url $log)) { $ok=$false; $err="No se pudo instalar la extension (revisa la URL / el log)" } }
             "mailpit"   { $mpDir = Join-Path $Bin "mailpit"; New-Item -ItemType Directory -Force -Path $mpDir | Out-Null; $zip = Join-Path $mpDir "mailpit.zip"; "Descargando Mailpit..." | Add-Content $log; & curl.exe -s -L -o "$zip" "https://github.com/axllent/mailpit/releases/latest/download/mailpit-windows-amd64.zip" 2>&1 | Add-Content $log; if (Test-Path $zip) { Expand-Archive $zip $mpDir -Force; Remove-Item $zip -Force -ErrorAction SilentlyContinue }; if (-not (Test-Path $Mailpit)) { $ok=$false; $err="No se descargo Mailpit" } else { "Mailpit descargado." | Add-Content $log } }
             "mariadb"   {
                 $mdDir = Join-Path $Bin "mariadb"; New-Item -ItemType Directory -Force -Path $mdDir | Out-Null
@@ -1215,12 +1450,93 @@ function Run-Job($id, $job) {
                     }
                     if (-not (Test-Path $NodeExe)) { $ok=$false; $err="No se descargo Node.js" } else { "Node.js descargado." | Add-Content $log }
                 }
-                # mongo-express (GUI web), instalado via npm del Node bundleado
+                # mongo-express (GUI web): se clona su repo y se compila en vez de "npm install
+                # mongo-express" -- el tag "latest" de npm apunta hoy a un release candidate
+                # (1.1.0-rc-4) cuyo tarball publicado NO trae build-assets.json (falta de su
+                # whitelist "files"), asi que revienta con ENOENT nada mas arrancar. Un tag fijo
+                # de git en vez de "latest" hace ademas el instalador reproducible.
+                # "npm install" (sin --production, en el propio directorio del repo) instala
+                # tambien las devDependencies (webpack...) y de paso ejecuta el script
+                # "prepublish" -- que pese al nombre, npm lo corre igualmente en instalaciones
+                # locales -- generando build-assets.json y el bundle de public\. Una vez
+                # generado, esas devDependencies ya no hacen falta para ejecutar la app: se
+                # podan despues con "npm prune" para no dejar ~250 MB de mas en el equipo.
                 if ($ok -and -not (Test-Path $MongoExpressApp)) {
-                    New-Item -ItemType Directory -Force -Path $MongoExpress | Out-Null
-                    "Instalando mongo-express (npm)..." | Add-Content $log
-                    & $NpmCmd install mongo-express --no-save --no-audit --no-fund --production --prefix "$MongoExpress" 2>&1 | Add-Content $log
-                    if (-not (Test-Path $MongoExpressApp)) { $ok=$false; $err="No se instalo mongo-express (ver log)" } else { "mongo-express instalado." | Add-Content $log }
+                    Remove-Item $MongoExpress -Recurse -Force -ErrorAction SilentlyContinue
+                    "Clonando mongo-express ($MongoExpressTag)..." | Add-Content $log
+                    & git clone --quiet --depth 1 --branch $MongoExpressTag "https://github.com/mongo-express/mongo-express.git" "$MongoExpress" 2>&1 | Add-Content $log
+                    if (-not (Test-Path (Join-Path $MongoExpress "package.json"))) { $ok=$false; $err="No se pudo clonar mongo-express (ver log)" }
+                    else {
+                        "Compilando mongo-express (npm install, puede tardar)..." | Add-Content $log
+                        Push-Location $MongoExpress
+                        try { & $NpmCmd install --no-audit --no-fund 2>&1 | Add-Content $log }
+                        finally { Pop-Location }
+                        if (-not (Test-Path (Join-Path $MongoExpress "build-assets.json"))) { $ok=$false; $err="Fallo la compilacion de mongo-express (ver log)" }
+                        else {
+                            "mongo-express compilado; podando dependencias de desarrollo..." | Add-Content $log
+                            Push-Location $MongoExpress
+                            try { & $NpmCmd prune --omit=dev 2>&1 | Add-Content $log }
+                            finally { Pop-Location }
+                        }
+                    }
+                    if ($ok -and -not (Test-Path $MongoExpressApp)) { $ok=$false; $err="No se instalo mongo-express (ver log)" }
+                    elseif ($ok) { "mongo-express instalado." | Add-Content $log }
+                }
+            }
+            "redis"     {
+                # Dos partes independientes: el servidor (un port de la comunidad, elegido por el
+                # usuario en el panel y recordado en config\redis\build.txt) y la extension
+                # php_redis.dll para CADA version de PHP instalada.
+                $rBuild = "$($job.build)"; if ($rBuild -ne 'native5') { $rBuild = 'redis8' }
+                if (-not (Test-Path $RedisExe)) {
+                    # redis8  = redis-windows/redis-windows 8.8.1 (variante msys2: mas ligera que la
+                    #           de cygwin y sin el wrapper de servicio, que aqui no se usa).
+                    # native5 = tporadowski/redis 5.0.14.1, port Win32 nativo.
+                    $rUrl = if ($rBuild -eq 'native5') {
+                        "https://github.com/tporadowski/redis/releases/download/v5.0.14.1/Redis-x64-5.0.14.1.zip"
+                    } else {
+                        "https://github.com/redis-windows/redis-windows/releases/download/8.8.1/Redis-8.8.1-Windows-x64-msys2.zip"
+                    }
+                    New-Item -ItemType Directory -Force -Path $RedisDir | Out-Null
+                    $zip = Join-Path $RedisDir "redis.zip"
+                    "Descargando Redis ($rBuild)..." | Add-Content $log
+                    & curl.exe -s -L -o "$zip" "$rUrl" 2>&1 | Add-Content $log
+                    if (Test-Path $zip) {
+                        $work = Join-Path $TmpDir ("rd-" + [System.IO.Path]::GetRandomFileName())
+                        Expand-Archive $zip $work -Force
+                        # Los dos zips no tienen la misma forma (uno deja los .exe en la raiz, el
+                        # otro dentro de una carpeta con el nombre de la release), asi que en vez de
+                        # asumir una estructura se busca redis-server.exe y se toma SU carpeta como
+                        # raiz. Sirve para cualquiera de los dos y para futuros cambios de empaquetado.
+                        $srv = Get-ChildItem $work -Filter "redis-server.exe" -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($srv) {
+                            Get-ChildItem $RedisDir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'redis.zip' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                            Get-ChildItem $srv.Directory.FullName -Force | Move-Item -Destination $RedisDir -Force
+                        }
+                        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+                        Remove-Item $zip  -Force -ErrorAction SilentlyContinue
+                    }
+                    if (-not (Test-Path $RedisExe)) { $ok=$false; $err="No se descargo Redis (ver log)" }
+                    else {
+                        New-Item -ItemType Directory -Force -Path (Split-Path $RedisBuildFile) | Out-Null
+                        Set-Content -Path $RedisBuildFile -Value $rBuild -Encoding ascii
+                        "Redis ($rBuild) descargado." | Add-Content $log
+                    }
+                }
+                # Extension de PHP, una por version instalada. No se aborta el job si alguna falla:
+                # tener Redis en 6 de 7 versiones es mejor que no tenerlo en ninguna, y Set-PhpInis
+                # solo activa la extension en las versiones donde el .dll exista de verdad.
+                if ($ok) {
+                    $rHechas = 0; $rFallos = @()
+                    foreach ($pv in (Get-PhpVersions)) {
+                        if (Test-Path (Join-Path $PhpBase "$pv\ext\php_redis.dll")) { $rHechas++; continue }
+                        $eUrl = Get-PhpRedisUrl $pv
+                        if (-not $eUrl) { "  ! PECL no publica php_redis para PHP ${pv}: se omite." | Add-Content $log; $rFallos += $pv; continue }
+                        if (Install-PhpExt $pv 'redis' $eUrl $log) { $rHechas++ } else { $rFallos += $pv }
+                    }
+                    "Extension redis instalada en $rHechas version(es) de PHP." | Add-Content $log
+                    if ($rFallos.Count -gt 0) { "Sin extension redis: $($rFallos -join ', ')." | Add-Content $log }
+                    if ($rHechas -eq 0) { $ok=$false; $err="No se pudo instalar php_redis.dll en ninguna version de PHP (ver log)" }
                 }
             }
             "db_import_dir" {
@@ -1334,7 +1650,7 @@ function Run-Job($id, $job) {
             }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'ftp_deploy') -and ($type -ne 'db_import_dir') -and ($type -ne 'db_import_file') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'redis') -and ($type -ne 'ftp_deploy') -and ($type -ne 'db_import_dir') -and ($type -ne 'db_import_file') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -1368,6 +1684,15 @@ function Run-Job($id, $job) {
             if (MongoDb-Up) { Start-MongoExpress }
             if ((MongoDb-Up) -and (MongoExpress-Up)) { Set-JobStatus $id $name $type "done" "MongoDB activo en 127.0.0.1:27017 (sin autenticacion). mongo-express en http://127.0.0.1:8081/" }
             else { Set-JobStatus $id $name $type "error" "MongoDB se descargo pero no arranco del todo (revisa logs\mongodb y logs\jobs)" }
+        } elseif ($type -eq 'redis') {
+            # Set-PhpInis + Restart-Apache: acaba de aparecer php_redis.dll en bin\php\<ver>\ext\,
+            # pero hasta regenerar los php.ini y reiniciar Apache la extension no existe para las
+            # apps (los php-cgi.exe vivos siguen con el ini viejo cargado).
+            Set-PhpInis | Out-Null
+            if (Test-HttpdConfig) { Restart-Apache }
+            Start-Redis
+            if (Redis-Up) { Set-JobStatus $id $name $type "done" "Redis activo en 127.0.0.1:$RedisPort (sin contrasena). Extension php_redis lista." }
+            else { Set-JobStatus $id $name $type "error" "Redis se descargo pero no arranco (revisa logs\redis\redis.log)" }
         } elseif ($type -eq 'ftp_deploy') {
             Set-JobStatus $id $name $type "done" "Desplegado por FTP a $ftpHost ($total archivo(s))"
         } elseif ($type -eq 'db_import_dir') {
@@ -1534,6 +1859,8 @@ function Cmd-Status {
     Write-Host "  MySQL (MariaDB) : " -NoNewline; Write-Host $mdTxt -ForegroundColor $mdC
     $mgTxt = "apagado"; $mgC = "Yellow"; if (MongoDb-Up) { $mgTxt="corriendo (127.0.0.1:27017)"; $mgC="Green" }
     Write-Host "  MongoDB         : " -NoNewline; Write-Host $mgTxt -ForegroundColor $mgC
+    $rdTxt = "apagado"; $rdC = "Yellow"; if (Redis-Up) { $rdTxt="corriendo (127.0.0.1:$RedisPort, build $(Redis-Build))"; $rdC="Green" }
+    Write-Host "  Redis           : " -NoNewline; Write-Host $rdTxt -ForegroundColor $rdC
     Write-Host "  Sitios:"; Cmd-ListSites; Write-Host ""
 }
 function Cmd-Hosts {

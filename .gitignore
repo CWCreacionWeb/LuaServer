@@ -24,6 +24,15 @@
 
 # ===== conexiones a SQL Server externos (host/usuario/contrasena de cada maquina) =====
 /config/sqlsrv-servers.json
+
+# ===== conexiones a Redis (host/contrasena de cada maquina) + motor nativo =====
+/config/redis-servers.json
+/config/redis.on
+/config/redis/
+
+# ===== config generada de MongoDB (mongod.cfg lleva rutas ABSOLUTAS de cada maquina:
+#       si se versiona, al actualizar los demas equipos apuntarian a rutas que no existen) =====
+/config/mongodb/
 /config/ftp/
 /config/php/extra-extensions.json
 
