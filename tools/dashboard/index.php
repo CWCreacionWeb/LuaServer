@@ -3136,7 +3136,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($gone) {
             foreach ($gone as $name) { unset($cfg['sites'][$name]); }
             write_json($CFG_FILE,$cfg); lua_apply();
-            $msg='applied:'.count($gone).' proyecto(s) quitado(s) de la lista (su carpeta ya no existe en disco).';
+            $msg='applied:'.count($gone).' proyecto(s) quitado(s) de la lista por no tener ya carpeta en disco: '.implode(', ', $gone).'.';
         } else {
             $msg='info:Todos los proyectos registrados tienen su carpeta en disco. Nada que sincronizar.';
         }
@@ -4955,10 +4955,7 @@ setTimeout(ping,1500);})();
         </form>
         <?php endif; ?>
         <?php if ($sitesFaltantes): ?>
-        <form method="post" title="Quita de la lista los proyectos cuya carpeta ya no existe en www\ (borrada fuera del panel)" onsubmit="event.stopPropagation()">
-          <input type="hidden" name="action" value="sync_projects">
-          <button type="button" class="btn ghost sm" onclick="event.stopPropagation();event.preventDefault();if(confirm('Se quitarán '+<?= count($sitesFaltantes) ?>+' proyecto(s) cuya carpeta ya no existe: '+<?= json_encode(implode(', ', $sitesFaltantes)) ?>+'. La carpeta ya no está, así que no hay nada que borrar en disco. ¿Continuar?'))this.closest('form').requestSubmit()">Sincronizar proyectos (<?= count($sitesFaltantes) ?>)</button>
-        </form>
+        <button type="button" class="btn ghost sm" title="Quita de la lista los proyectos cuya carpeta ya no existe en www\ (borrada fuera del panel)" data-names="<?= e(implode(', ', $sitesFaltantes)) ?>" onclick="event.stopPropagation();luaAskSyncProjects(this)">Sincronizar proyectos (<?= count($sitesFaltantes) ?>)</button>
         <?php endif; ?>
         <div class="viewtoggle" onclick="event.stopPropagation()">
           <button type="button" class="viewbtn" data-view="grid" title="Vista de cuadrícula" aria-label="Vista de cuadrícula">
@@ -5122,6 +5119,36 @@ setTimeout(ping,1500);})();
         document.removeEventListener('keydown', luaEscDeleteUnreg);
       }
       function luaEscDeleteUnreg(e){ if(e.key==='Escape') luaCloseDeleteUnreg(); }
+    </script>
+
+    <!-- Modal de confirmacion de "Sincronizar proyectos": no toca disco, solo quita
+         entradas de sites.json cuya carpeta ya no existe -- por eso icono/boton "info",
+         no "danger" (mismo criterio que el modal de reinicio). -->
+    <div id="syncProjModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseSyncProjects()">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="syncProjTitle">
+        <div class="modal-ic modal-ic-info">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>
+        </div>
+        <h3 id="syncProjTitle">¿Sincronizar proyectos?</h3>
+        <p class="modal-tx">Se quitará de la lista <strong id="syncProjNames"></strong> por no tener ya carpeta en <code>www\</code>. La carpeta ya no está, así que no hay nada que borrar en disco.</p>
+        <form method="post" class="modal-actions">
+          <input type="hidden" name="action" value="sync_projects">
+          <button type="button" class="btn ghost" onclick="luaCloseSyncProjects()">Cancelar</button>
+          <button type="submit" class="btn" data-loading-text="Sincronizando…">Sí, sincronizar</button>
+        </form>
+      </div>
+    </div>
+    <script>
+      function luaAskSyncProjects(btn){
+        document.getElementById('syncProjNames').textContent = btn.dataset.names || '';
+        document.getElementById('syncProjModal').hidden = false;
+        document.addEventListener('keydown', luaEscSyncProjects);
+      }
+      function luaCloseSyncProjects(){
+        document.getElementById('syncProjModal').hidden = true;
+        document.removeEventListener('keydown', luaEscSyncProjects);
+      }
+      function luaEscSyncProjects(e){ if(e.key==='Escape') luaCloseSyncProjects(); }
     </script>
 
   <?php elseif ($tab==='proyecto'): /* ---------- FICHA DE PROYECTO ---------- */
