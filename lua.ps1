@@ -883,6 +883,8 @@ function Cmd-Stop {
         }
         Remove-Item $pf -Force -ErrorAction SilentlyContinue
     }
+    # Sin esto el badge del panel seguiria en verde hasta que el latido caduque (15s).
+    Remove-Item (Join-Path $TmpDir "watch.beat") -Force -ErrorAction SilentlyContinue
     Stop-Mailpit
     Stop-MariaDb
     Stop-MongoExpress
@@ -910,6 +912,7 @@ function Cmd-Watch {
     # perfecto y aunque acabes de reiniciar. Autorecargandose, cualquier watcher -- incluido el
     # de SYSTEM, que se relanza a si mismo con sus mismos privilegios -- se pone al dia solo.
     $selfStamp = try { (Get-Item $PSCommandPath).LastWriteTimeUtc } catch { [datetime]::MinValue }
+    $wBeat  = Join-Path $TmpDir "watch.beat"
     $fApply = Join-Path $TmpDir "apply.flag"
     $fHosts = Join-Path $TmpDir "hosts.flag"
     $fHttps = Join-Path $TmpDir "https.flag"
@@ -939,6 +942,11 @@ function Cmd-Watch {
                 Start-Process powershell -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'watch')
                 return
             }
+            # Latido. El panel lo usa para saber si hay watcher (ver watcher_alive en index.php):
+            # el PID no vale porque el de SYSTEM no es consultable desde el panel y porque
+            # watch.pid solo guarda el del ultimo watcher arrancado. Lo escribe quien de verdad
+            # esta ejecutando el bucle, que es justo la pregunta que se quiere responder.
+            Set-Content -Path $wBeat -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii
             if (Test-Path $fApply) { Remove-Item $fApply -Force -ErrorAction SilentlyContinue; Cmd-Apply }
             if (Test-Path $fHosts) { Remove-Item $fHosts -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'hosts-sync') }
             if (Test-Path $fHttps) { Remove-Item $fHttps -Force -ErrorAction SilentlyContinue; Start-Process powershell -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'https-setup') }

@@ -1563,6 +1563,23 @@ function render_import_job_card($root, $j){
 // El watcher es un proceso PowerShell independiente (arrancado por 'lua.ps1 start'),
 // no un hijo de Apache: se comprueba igual que hace lua.ps1 (pid en tmp/watch.pid + tasklist).
 function watcher_alive($root){
+    // Se mira el LATIDO (tmp\watch.beat, que el watcher toca en cada vuelta de su bucle) antes
+    // que el PID. El PID no sirve de indicador fiable por dos motivos:
+    //   1. Con "Arrancar con Windows" el watcher corre como SYSTEM, y desde aqui no se puede
+    //      consultar ese proceso -> parecia muerto estando vivo.
+    //   2. watch.pid guarda solo el del ULTIMO watcher que arranco. Con dos vivos (el de SYSTEM
+    //      y el que lanza 'lua.ps1 start') el archivo deja de reflejar la realidad, y si el
+    //      ultimo muere el badge decia "inactivo" mientras el otro seguia procesando jobs.
+    // El latido no tiene ninguno de los dos problemas: lo escribe quien de verdad esta vivo.
+    $bf = $root.'/tmp/watch.beat';
+    if (is_file($bf)) {
+        $beat = (int)trim((string)@file_get_contents($bf));
+        // 15s de margen: el bucle late cada ~1s, pero una vuelta puede tardar si esta aplicando
+        // cambios o reiniciando Apache, y no queremos parpadeos en el badge por eso.
+        if ($beat > 0 && (time() - $beat) <= 15) return true;
+    }
+    // Compatibilidad con watchers arrancados ANTES de que existiera el latido (siguen con su
+    // codigo viejo cargado en memoria y nunca escribiran watch.beat).
     $pf = $root.'/tmp/watch.pid';
     if (!is_file($pf)) return false;
     $pid = (int)trim((string)@file_get_contents($pf));

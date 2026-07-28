@@ -101,6 +101,26 @@ reiniciar nada. La única excepción es un watcher que venga de **antes** de
 este cambio (su código no sabe autorecargarse): ese hay que matarlo una
 vez desde una consola **elevada**.
 
+### El badge "Watcher inactivo" mentía: ahora va por latido, no por PID
+
+Mismo origen. `watcher_alive()` (en `index.php`) miraba `tmp\watch.pid` y
+comprobaba ese PID con `tasklist`. Falla en los dos casos de arriba:
+
+- El watcher de `SYSTEM` **no es consultable** desde el panel → parecía
+  muerto estando vivo y procesando jobs.
+- `watch.pid` guarda solo el del **último** watcher que arrancó. Con dos
+  vivos deja de reflejar la realidad: si moría el último, el badge decía
+  "inactivo" mientras el otro seguía trabajando.
+
+Arreglado con un **latido**: `Cmd-Watch` escribe `tmp\watch.beat` (epoch en
+segundos) en cada vuelta del bucle, y `watcher_alive()` da por vivo al
+watcher si ese archivo tiene menos de 15s (margen para vueltas lentas que
+estén aplicando cambios o reiniciando Apache). Lo escribe **quien de verdad
+está ejecutando el bucle**, que es justo lo que se quiere saber, sin
+depender de la cuenta ni de cuántos haya. `Cmd-Stop` borra el latido para
+que el badge se apague al instante. Se conserva la comprobación del PID
+como respaldo, solo para watchers anteriores al latido.
+
 ## ⚠️ Trampa nº2: `localhost` no es fiable en esta máquina
 
 Docker Desktop (`com.docker.backend`/`wslrelay`) ocupa el puerto 80 en
