@@ -551,7 +551,11 @@ function Set-MariaDbIni {
     $c = $c -replace '(?m)^(\s*socket\s*=).*',        "`$1 $sock"
     $c = $c -replace '(?m)^(\s*log-error\s*=).*',     "`$1 $log"
     $c = $c -replace '(?m)^(\s*bind-address\s*=).*',  '${1} 127.0.0.1'
-    Set-Content -Path $MyIni -Value $c -Encoding Default
+    # -NoNewline: Set-Content añade su propio salto de línea final aunque $c (leído con -Raw)
+    # ya termine en uno -- sin esto, cada ciclo de lectura+escritura deja una línea en blanco
+    # más al final. Con el backoff de 30s reintentando mientras MariaDB no arranca, esto podía
+    # acumular cientos de líneas en blanco en my.ini en unas pocas horas.
+    Set-Content -Path $MyIni -Value $c -Encoding Default -NoNewline
 }
 function MariaDb-Up { [bool](Get-LuaProcess 'mysqld' $MariaDb) }
 function MariaDb-Initialized { Test-Path (Join-Path $MariaDataDir "mysql") }
