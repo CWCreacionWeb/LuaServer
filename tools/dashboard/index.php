@@ -809,6 +809,121 @@ function pgsrv_roles(){
 //  2. RESP es trivial: 5 tipos de respuesta y los comandos son arrays de bulk strings. Salen
 //     ~60 lineas y funciona en cualquier PHP, con o sin extension.
 // La extension sigue siendo util para las APPS del usuario, pero este gestor no la necesita.
+// ---------------- Recursos del sistema (WMI via COM, sin subprocesos) ----------------
+// Igual que term_fresh_machine_path (trampa nº5): nunca shell_exec()/exec() de powershell.exe
+// para leer metricas -- bajo mod_fcgid eso arriesga colgar el worker. Todo via COM winmgmts.
+function sysmon_wmi(){
+    static $w = null;
+    if ($w === null) { $w = new COM('winmgmts://./root/cimv2'); }
+    return $w;
+}
+function sysmon_q($sql){
+    $out = [];
+    foreach (sysmon_wmi()->ExecQuery($sql) as $r) { $out[] = $r; }
+    return $out;
+}
+// Nombres de proceso -> [color de la paleta categorica, etiqueta]. El orden es el de un
+// conjunto de 8 tonos ya validado como seguro para daltonismo (ver skill de dataviz): no se
+// inventan colores a ojo para un grafico con varias series a la vez.
+function sysmon_proc_map(){
+    return [
+        'httpd.exe'        => ['cat-1', 'Apache'],
+        'php-cgi.exe'      => ['cat-2', 'PHP-CGI'],
+        'mysqld.exe'       => ['cat-3', 'MariaDB'],
+        'postgres.exe'     => ['cat-4', 'PostgreSQL'],
+        'mongod.exe'       => ['cat-5', 'MongoDB'],
+        'redis-server.exe' => ['cat-6', 'Redis'],
+        'node.exe'         => ['cat-7', 'Node (mongo-express)'],
+    ];
+}
+if (($_REQUEST['ajax'] ?? '') === 'sysmon') {
+    header('Content-Type: application/json; charset=utf-8');
+    try {
+        $out = ['ok'=>true, 'ts'=>time()];
+
+        // ---- CPU: contador crudo (rapido, ~50ms) + delta contra la muestra anterior ----
+        // La version "Formatted" del mismo contador (la que ya hace el % por ti) tarda ~6s en
+        // esta maquina -- probablemente el proveedor WMI recalcula sobre una ventana de muestreo
+        // propia. El crudo + formula oficial (PERF_100NSEC_TIMER_INV) es case ~50ms y exacta:
+        // %cpu = (1 - (P2-P1)/(T2-T1)) * 100, con P=PercentProcessorTime y T=Timestamp_Sys100NS
+        // de la MISMA instancia de contador en dos lecturas. Sin bloquear la peticion con un
+        // usleep: se guarda la lectura y se compara contra la de la petición anterior (el
+        // cliente ya sondea cada ~2s, que es intervalo de sobra).
+        $cpuPct = null;
+        $prevF = $ROOT.'/tmp/sysmon-prev.json';
+        foreach (sysmon_q("SELECT PercentProcessorTime, Timestamp_Sys100NS FROM Win32_PerfRawData_PerfOS_Processor WHERE Name='_Total'") as $r) {
+            $p2 = (float)$r->PercentProcessorTime; $t2 = (float)$r->Timestamp_Sys100NS;
+            $prev = is_file($prevF) ? json_decode((string)@file_get_contents($prevF), true) : null;
+            if (is_array($prev) && !empty($prev['t']) && (time() - (int)($prev['saved']??0)) <= 30 && ($t2 - (float)$prev['t']) > 0) {
+                $cpuPct = round((1 - (($p2 - (float)$prev['p']) / ($t2 - (float)$prev['t']))) * 100, 1);
+                $cpuPct = max(0, min(100, $cpuPct));
+            }
+            @file_put_contents($prevF, json_encode(['p'=>$p2, 't'=>$t2, 'saved'=>time()]));
+        }
+        $out['cpu'] = ['pct'=>$cpuPct];
+
+        // ---- RAM + hora de arranque (mismo Win32_OperatingSystem, sin consulta aparte) ----
+        foreach (sysmon_q("SELECT TotalVisibleMemorySize, FreePhysicalMemory, LastBootUpTime FROM Win32_OperatingSystem") as $r) {
+            $totKB = (float)$r->TotalVisibleMemorySize; $freeKB = (float)$r->FreePhysicalMemory;
+            $out['ram'] = ['totalGB'=>round($totKB/1048576,1), 'usedGB'=>round(($totKB-$freeKB)/1048576,1), 'pct'=>$totKB>0?round((($totKB-$freeKB)/$totKB)*100,1):0];
+            // LastBootUpTime viene en formato WMI: "20260726093114.500000+120"
+            if (preg_match('/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/', (string)$r->LastBootUpTime, $bm)) {
+                $boot = mktime((int)$bm[4],(int)$bm[5],(int)$bm[6],(int)$bm[2],(int)$bm[3],(int)$bm[1]);
+                $out['uptimeSec'] = max(0, time() - $boot);
+            }
+        }
+
+        // ---- Disco: todas las unidades fijas; se marca la que aloja esta instalacion ----
+        $rootDrive = strtoupper(substr(str_replace('/','\\',$ROOT), 0, 2)); // "C:"
+        $disks = [];
+        foreach (sysmon_q("SELECT DeviceID, Size, FreeSpace FROM Win32_LogicalDisk WHERE DriveType=3") as $r) {
+            $sz = (float)$r->Size; $fr = (float)$r->FreeSpace;
+            $disks[] = ['drive'=>(string)$r->DeviceID, 'totalGB'=>round($sz/1073741824,1), 'freeGB'=>round($fr/1073741824,1), 'pct'=>$sz>0?round((($sz-$fr)/$sz)*100,1):0, 'root'=>(strtoupper((string)$r->DeviceID)===$rootDrive)];
+        }
+        usort($disks, function($a,$b){ return $b['root'] <=> $a['root']; });
+        $out['disks'] = $disks;
+
+        // ---- Red: agregado de todas las interfaces (la "Formatted" de red SI es rapida) ----
+        $rx = 0; $tx = 0;
+        foreach (sysmon_q("SELECT BytesReceivedPersec, BytesSentPersec FROM Win32_PerfFormattedData_Tcpip_NetworkInterface") as $r) {
+            $rx += (float)$r->BytesReceivedPersec; $tx += (float)$r->BytesSentPersec;
+        }
+        $out['net'] = ['rxKBs'=>round($rx/1024,1), 'txKBs'=>round($tx/1024,1)];
+
+        // ---- Huella de la propia plataforma: una sola consulta a Win32_Process combinando
+        // los binarios conocidos + powershell.exe (para el watcher, filtrado despues por
+        // CommandLine -- fusionar en una query en vez de dos evita recorrer Win32_Process
+        // dos veces, que es lo que de verdad cuesta tiempo aqui, no el filtro en si).
+        $map = sysmon_proc_map();
+        $agg = [];
+        $where = [];
+        foreach (array_keys($map) as $n) { $where[] = "Name='".$n."'"; }
+        $where[] = "Name='powershell.exe'";
+        foreach (sysmon_q("SELECT Name, WorkingSetSize, CommandLine FROM Win32_Process WHERE ".implode(' OR ', $where)) as $r) {
+            $n = (string)$r->Name; $mb = (float)$r->WorkingSetSize / 1048576;
+            if ($n === 'powershell.exe') {
+                $cl = (string)$r->CommandLine;
+                if (stripos($cl, 'lua.ps1') === false || stripos($cl, 'watch') === false) continue;
+                $n = '__watcher__';
+            }
+            if (!isset($agg[$n])) { $agg[$n] = ['mb'=>0.0, 'n'=>0]; }
+            $agg[$n]['mb'] += $mb; $agg[$n]['n']++;
+        }
+        $procs = [];
+        foreach ($map as $bin => [$color, $label]) {
+            if (!isset($agg[$bin])) continue;
+            $procs[] = ['label'=>$label, 'color'=>$color, 'mb'=>round($agg[$bin]['mb']), 'count'=>$agg[$bin]['n']];
+        }
+        if (isset($agg['__watcher__'])) { $procs[] = ['label'=>'Watcher (PowerShell)', 'color'=>'cat-8', 'mb'=>round($agg['__watcher__']['mb']), 'count'=>$agg['__watcher__']['n']]; }
+        $out['procs'] = $procs;
+
+        echo json_encode($out);
+    } catch (Throwable $e) {
+        echo json_encode(['error'=>'No se pudo leer WMI: '.$e->getMessage()]);
+    }
+    exit;
+}
+
 // ---------------- Doctor: diagnostico automatico de las trampas conocidas ----------------
 // Convierte el conocimiento acumulado en CLAUDE.md (puertos robados por Docker, watchers
 // fantasma, flags huerfanos, carpetas movidas...) en comprobaciones de un vistazo. Solo LEE:
@@ -3918,6 +4033,10 @@ $jobs = read_jobs($ROOT.'/tmp/jobs');
 $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['running','queued'],true)){$anyJobRun=true;break;} }
 $anyDbImportRun = false; foreach($jobs as $jj){ if(in_array(($jj['type']??''),['db_import_dir','db_import_file'],true) && in_array(($jj['state']??''),['running','queued'],true)){$anyDbImportRun=true;break;} }
 $watcherAlive = watcher_alive($ROOT);
+// Para el icono de terminal global de la cabecera: se calcula aqui (una vez, antes de
+// cualquier pestana) porque la cabecera se pinta para las 14 pestanas por igual, no solo
+// para la pestana "Terminal" (que ya calculaba su propia copia local de este mismo flag).
+$termOnHdr = is_file($ROOT.'/config/terminal.on');
 ?>
 <!doctype html>
 <html lang="es">
@@ -3975,6 +4094,7 @@ setTimeout(ping,1500);})();
   .restartbtn:hover{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.10)}
   .powerbtn{margin-left:6px}
   .powerbtn:hover{color:var(--err);border-color:var(--err);background:rgba(248,81,73,.10)}
+  .gtermbtn.on{color:var(--ac);border-color:var(--ac);background:rgba(110,168,254,.14)}
 
   .tabbar{padding:0 40px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
   .tabs{display:flex;gap:6px}
@@ -4277,6 +4397,38 @@ setTimeout(ping,1500);})();
   .rinfo .b{background:var(--in);border:1px solid var(--line);border-radius:6px;padding:9px 11px}
   .rinfo .b .l{font-size:10.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.3px}
   .rinfo .b .v{font-size:15px;font-weight:600;margin-top:2px;font-family:ui-monospace,Consolas,monospace}
+
+  /* ---- pestaña Recursos: paleta categorica de 8 tonos ya validada como segura para
+     daltonismo (skill de dataviz, orden fijo -- nunca se reordena por serie), mas los
+     estados de siempre (--ok/--warn/--err) para los gauges. Dark/light con las mismas
+     variables --ac/--card/--in/--line/--mut/--tx del resto del panel. ---- */
+  :root{ --cat-1:#2a78d6; --cat-2:#eb6834; --cat-3:#1baf7a; --cat-4:#eda100; --cat-5:#e87ba4; --cat-6:#008300; --cat-7:#4a3aa7; --cat-8:#e34948; }
+  @media (prefers-color-scheme:light){ :root{ --cat-1:#2a78d6; --cat-2:#eb6834; --cat-3:#1baf7a; --cat-4:#eda100; --cat-5:#e87ba4; --cat-6:#008300; --cat-7:#4a3aa7; --cat-8:#e34948; } }
+  .sysgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px}
+  @media (max-width:900px){ .sysgrid{grid-template-columns:1fr} }
+  .gaugecard{display:flex;flex-direction:column;align-items:center;text-align:center;gap:2px}
+  .gaugecard .lbl{font-weight:600;font-size:13px;margin-bottom:8px}
+  .gaugewrap{position:relative;width:132px;height:132px}
+  .gaugewrap svg{transform:rotate(-90deg)}
+  .gaugewrap .track{fill:none;stroke:var(--line);stroke-width:10}
+  .gaugewrap .fill{fill:none;stroke-width:10;stroke-linecap:round;transition:stroke-dashoffset .5s ease,stroke .3s ease}
+  .gaugenum{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+  .gaugenum b{font-size:24px;line-height:1.1;font-family:ui-monospace,Consolas,monospace}
+  .gaugenum span{font-size:10.5px;color:var(--mut);margin-top:1px}
+  .gaugesub{font-size:11.5px;color:var(--mut);margin-top:8px;min-height:15px}
+  .spark{width:100%;height:34px;margin-top:6px;display:block}
+  .spark path.area{opacity:.16}
+  .spark path.line{fill:none;stroke-width:1.6}
+  .netlegend{display:flex;gap:16px;justify-content:center;margin-top:6px;font-size:11.5px}
+  .netlegend .dot{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:1px}
+  .procbars{display:flex;flex-direction:column;gap:9px}
+  .procbar-row{display:flex;align-items:center;gap:10px}
+  .procbar-name{width:150px;flex:0 0 auto;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .procbar-track{flex:1;height:9px;border-radius:5px;background:var(--in);border:1px solid var(--line);overflow:hidden}
+  .procbar-fill{height:100%;border-radius:5px;transition:width .5s ease}
+  .procbar-val{width:64px;flex:0 0 auto;text-align:right;font-size:11.5px;color:var(--mut);font-family:ui-monospace,Consolas,monospace}
+  .sysfoot{display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:var(--mut)}
+
   .sqlgrid{overflow:auto;max-height:60vh;border:1px solid var(--line);border-radius:6px;background:var(--in)}
   table.sqltbl{border-collapse:separate;border-spacing:0;width:100%;font-size:12px;font-family:ui-monospace,Consolas,monospace}
   table.sqltbl th,table.sqltbl td{padding:5px 9px;border-bottom:1px solid var(--line);white-space:nowrap;
@@ -4399,6 +4551,26 @@ setTimeout(ping,1500);})();
   .termin{display:flex;align-items:center;gap:8px;padding:8px 14px;border-top:1px solid var(--line);background:var(--card)}
   .termprompt{color:var(--ac);font-family:ui-monospace,Consolas,monospace;font-weight:700}
   .termcmd-input{flex:1;width:100%;background:transparent;border:none;color:var(--tx);font-family:ui-monospace,Consolas,monospace;font-size:13px;padding:4px 0}
+
+  /* ---- Terminal global de la cabecera: barra persistente entre pestanas (no un modal --
+     no oscurece la pagina ni bloquea clics fuera de su caja, igual que el runner "fijado a
+     la derecha", cuya misma idea de anclaje reutiliza). Dos modos, elegidos por el usuario y
+     recordados en localStorage: abajo a todo el ancho (por defecto) o a la derecha (calcado
+     del modal del runner). ---- */
+  .gtermbar{position:fixed;inset:0;z-index:90;display:flex;pointer-events:none;background:transparent}
+  .gtermbar[hidden]{display:none}
+  .gtermbar .gtermbox{pointer-events:auto;display:flex;flex-direction:column;background:var(--card);border:1px solid var(--line);box-shadow:0 -10px 30px rgba(0,0,0,.35)}
+  .gtermbar .gtermbox .termwrap{flex:1;border:none;border-radius:0;background:transparent}
+  .gtermbar .gtermbox .termout{flex:1 1 auto;height:auto!important}
+  .gtermbar .termbar-top{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);flex:0 0 auto}
+  .gtermbar .termbar-top b{font-size:12.5px}
+  /* Abajo (por defecto al abrir): a todo el ancho, alto ajustable a mano (resize:vertical). */
+  .gtermbar.dock-bottom{align-items:flex-end;justify-content:stretch}
+  .gtermbar.dock-bottom .gtermbox{width:100%;height:320px;min-height:160px;max-height:82vh;border-width:1px 0 0;box-shadow:0 -10px 30px rgba(0,0,0,.35);resize:vertical;overflow:auto}
+  /* Derecha: mismo patron que .modal-box.docked del runner (panel a pantalla completa
+     pegado al borde, ancho fijo, sin poder redimensionar). */
+  .gtermbar.dock-right{align-items:stretch;justify-content:flex-end}
+  .gtermbar.dock-right .gtermbox{width:440px;height:100vh;border-width:0 0 0 1px;box-shadow:-12px 0 34px rgba(0,0,0,.4)}
   .termcmd-input:focus{outline:none}
   .termcmd-input:disabled{opacity:.5}
   .termout .a-prompt{color:var(--ac);font-weight:700}
@@ -4425,6 +4597,15 @@ setTimeout(ping,1500);})();
       <span class="jstate <?= $watcherAlive?'run':'err' ?>"><?= $watcherAlive?'Watcher activo':'Watcher inactivo' ?></span>
       <a class="jstate orange" href="http://<?= e($phpmyadminDom) ?>/" target="_blank" title="Abrir phpMyAdmin">phpMyAdmin &#8599;</a>
     </div>
+    <?php if ($termOnHdr): ?>
+      <button type="button" class="iconbtn gtermbtn" id="gtermToggleBtn" title="Terminal" aria-label="Mostrar/ocultar la terminal">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="6 9 10 12 6 15"/><line x1="12" y1="15" x2="18" y2="15"/></svg>
+      </button>
+    <?php else: ?>
+      <a class="iconbtn gtermbtn" href="?tab=config" title="Terminal desactivada — actívala en Configuración del servidor" aria-label="Terminal desactivada">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="6 9 10 12 6 15"/><line x1="12" y1="15" x2="18" y2="15"/></svg>
+      </a>
+    <?php endif; ?>
     <button type="button" class="iconbtn restartbtn" title="Reiniciar el servidor" aria-label="Reiniciar el servidor" onclick="luaAskRestart()">
       <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg>
     </button>
@@ -4480,6 +4661,7 @@ setTimeout(ping,1500);})();
                "Bases de datos", que queda resaltada tambien dentro de esos gestores. */ ?>
       <a href="?tab=bd" class="<?= in_array($tab,['bd','sqlsrv','redis'],true)?'on':'' ?>">Bases de datos</a>
       <a href="?tab=procs" class="<?= $tab==='procs'?'on':'' ?>">Procesos</a>
+      <a href="?tab=sysmon" class="<?= $tab==='sysmon'?'on':'' ?>">Recursos</a>
       <a href="?tab=doctor" class="<?= $tab==='doctor'?'on':'' ?>">Doctor</a>
       <?php if (docker_installed()): ?>
         <a href="?tab=docker" class="<?= $tab==='docker'?'on':'' ?>">Docker</a>
@@ -6607,6 +6789,183 @@ setTimeout(ping,1500);})();
 
     <?php endif; ?>
 
+  <?php elseif ($tab==='sysmon'): /* ---------- PESTAÑA RECURSOS (WMI en vivo) ---------- */ ?>
+
+    <div class="card row" style="flex-wrap:wrap;gap:8px;margin-bottom:14px">
+      <div style="min-width:260px">
+        <div style="font-weight:600">Recursos del sistema</div>
+        <div class="muted" style="margin-top:4px">La máquina que aloja esta instalación — no solo lo que usa lua-server. Se actualiza solo cada <span id="sysPollTxt">2,5</span>s.</div>
+      </div>
+      <div class="spacer"></div>
+      <span class="muted" id="sysUpdated" style="font-size:11.5px"></span>
+    </div>
+
+    <div class="sysgrid">
+      <div class="card gaugecard">
+        <div class="lbl">CPU</div>
+        <div class="gaugewrap"><svg viewBox="0 0 132 132" width="132" height="132">
+          <circle class="track" cx="66" cy="66" r="56"/>
+          <circle class="fill" id="gCpuFill" cx="66" cy="66" r="56" stroke="var(--ac)"/>
+        </svg><div class="gaugenum"><b id="gCpuNum">—</b><span>%</span></div></div>
+        <div class="gaugesub" id="gCpuSub"></div>
+        <svg class="spark" id="sCpu" viewBox="0 0 300 34" preserveAspectRatio="none"></svg>
+      </div>
+
+      <div class="card gaugecard">
+        <div class="lbl">Memoria</div>
+        <div class="gaugewrap"><svg viewBox="0 0 132 132" width="132" height="132">
+          <circle class="track" cx="66" cy="66" r="56"/>
+          <circle class="fill" id="gRamFill" cx="66" cy="66" r="56" stroke="var(--ac)"/>
+        </svg><div class="gaugenum"><b id="gRamNum">—</b><span>%</span></div></div>
+        <div class="gaugesub" id="gRamSub"></div>
+        <svg class="spark" id="sRam" viewBox="0 0 300 34" preserveAspectRatio="none"></svg>
+      </div>
+
+      <div class="card gaugecard">
+        <div class="lbl" id="gDiskLbl">Disco</div>
+        <div class="gaugewrap"><svg viewBox="0 0 132 132" width="132" height="132">
+          <circle class="track" cx="66" cy="66" r="56"/>
+          <circle class="fill" id="gDiskFill" cx="66" cy="66" r="56" stroke="var(--ac)"/>
+        </svg><div class="gaugenum"><b id="gDiskNum">—</b><span>%</span></div></div>
+        <div class="gaugesub" id="gDiskSub"></div>
+      </div>
+    </div>
+
+    <div class="pgrid2">
+      <div class="card" style="margin-bottom:0">
+        <div style="font-weight:600;margin-bottom:2px">Red (todas las interfaces)</div>
+        <div class="muted" style="font-size:11.5px">Suma de todos los adaptadores, no solo el que usan tus proyectos.</div>
+        <svg class="spark" id="sNet" viewBox="0 0 300 40" preserveAspectRatio="none" style="height:60px;margin-top:10px"></svg>
+        <div class="netlegend">
+          <span><i class="dot" style="background:var(--cat-1)"></i>Bajada <b id="netRx">—</b></span>
+          <span><i class="dot" style="background:var(--cat-2)"></i>Subida <b id="netTx">—</b></span>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:0">
+        <div style="font-weight:600;margin-bottom:2px">Huella de lua-server</div>
+        <div class="muted" style="font-size:11.5px;margin-bottom:10px">Memoria de los motores y el watcher que gestiona esta plataforma (no de tus proyectos PHP en sí).</div>
+        <div class="procbars" id="procBars"><div class="sqlx-empty">cargando…</div></div>
+      </div>
+    </div>
+
+    <div class="card sysfoot" id="sysFoot"></div>
+
+    <script>
+    (function(){
+      var CAT = ['var(--cat-1)','var(--cat-2)','var(--cat-3)','var(--cat-4)','var(--cat-5)','var(--cat-6)','var(--cat-7)','var(--cat-8)'];
+      var hist = { cpu: [], ram: [], rx: [], tx: [] };
+      var MAXH = 90; // ~90 muestras a 2.5s = ~3.75 min de historial, reinicia al recargar la pagina
+      var POLL_MS = 2500;
+
+      // ---- gauge circular: stroke-dasharray sobre un circulo de r=56 (perimetro ~351.86) ----
+      var CIRC = 2 * Math.PI * 56;
+      function setGauge(fillEl, numEl, pct, statusVar) {
+        if (pct === null || pct === undefined) { numEl.textContent = '—'; return; }
+        pct = Math.max(0, Math.min(100, pct));
+        var off = CIRC - (pct/100)*CIRC;
+        fillEl.style.strokeDasharray = CIRC.toFixed(1);
+        fillEl.style.strokeDashoffset = off.toFixed(1);
+        fillEl.style.stroke = statusVar;
+        numEl.textContent = (Math.round(pct*10)/10).toString().replace('.0','');
+      }
+      function statusColor(pct, warnAt, errAt) {
+        if (pct >= errAt) return 'var(--err)';
+        if (pct >= warnAt) return 'var(--warn)';
+        return 'var(--ok)';
+      }
+
+      // ---- sparkline: polilinea + relleno hasta la base, escalada al maximo visto ----
+      function drawSpark(svgEl, series, color) {
+        var w = 300, h = svgEl.viewBox.baseVal.height || 34;
+        if (!series.length) { svgEl.innerHTML = ''; return; }
+        var max = Math.max.apply(null, series.concat([1])) * 1.15;
+        var n = series.length;
+        var pts = series.map(function(v,i){
+          var x = n>1 ? (i/(n-1))*w : w;
+          var y = h - (v/max)*h;
+          return [x, isFinite(y)?y:h];
+        });
+        var line = pts.map(function(p,i){ return (i===0?'M':'L') + p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
+        var area = line + ' L' + w + ',' + h + ' L0,' + h + ' Z';
+        svgEl.innerHTML = '<path class="area" d="' + area + '" fill="' + color + '"></path>'
+                         + '<path class="line" d="' + line + '" stroke="' + color + '"></path>';
+      }
+
+      function fmtKBs(v) { return v >= 1024 ? (v/1024).toFixed(1) + ' MB/s' : Math.round(v) + ' KB/s'; }
+      function fmtUptime(s) {
+        var d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60);
+        if (d > 0) return d + 'd ' + h + 'h';
+        if (h > 0) return h + 'h ' + m + 'm';
+        return m + 'm';
+      }
+
+      function tick() {
+        fetch('?ajax=sysmon').then(function(r){ return r.json(); }).then(function(j){
+          if (!j.ok) { document.getElementById('sysFoot').textContent = j.error || 'Error leyendo WMI.'; return; }
+
+          if (j.cpu.pct !== null) {
+            hist.cpu.push(j.cpu.pct); if (hist.cpu.length > MAXH) hist.cpu.shift();
+            setGauge(document.getElementById('gCpuFill'), document.getElementById('gCpuNum'), j.cpu.pct, statusColor(j.cpu.pct,60,85));
+            drawSpark(document.getElementById('sCpu'), hist.cpu, 'var(--ac)');
+          }
+          document.getElementById('gCpuSub').textContent = hist.cpu.length ? 'media '+Math.round(hist.cpu.reduce(function(a,b){return a+b;},0)/hist.cpu.length)+'%' : 'calculando…';
+
+          hist.ram.push(j.ram.pct); if (hist.ram.length > MAXH) hist.ram.shift();
+          setGauge(document.getElementById('gRamFill'), document.getElementById('gRamNum'), j.ram.pct, statusColor(j.ram.pct,70,90));
+          document.getElementById('gRamSub').textContent = j.ram.usedGB + ' / ' + j.ram.totalGB + ' GB';
+          drawSpark(document.getElementById('sRam'), hist.ram, 'var(--ac)');
+
+          var root = (j.disks||[]).filter(function(d){return d.root;})[0] || j.disks[0];
+          if (root) {
+            document.getElementById('gDiskLbl').textContent = 'Disco ' + root.drive;
+            setGauge(document.getElementById('gDiskFill'), document.getElementById('gDiskNum'), root.pct, statusColor(root.pct,80,93));
+            document.getElementById('gDiskSub').textContent = root.freeGB + ' GB libres de ' + root.totalGB + ' GB';
+          }
+
+          hist.rx.push(j.net.rxKBs); if (hist.rx.length > MAXH) hist.rx.shift();
+          hist.tx.push(j.net.txKBs); if (hist.tx.length > MAXH) hist.tx.shift();
+          document.getElementById('netRx').textContent = fmtKBs(j.net.rxKBs);
+          document.getElementById('netTx').textContent = fmtKBs(j.net.txKBs);
+          var maxNet = Math.max.apply(null, hist.rx.concat(hist.tx).concat([1]));
+          var svgN = document.getElementById('sNet'), h = 40, w = 300;
+          function path(series){
+            var n = series.length; if (!n) return '';
+            return series.map(function(v,i){ var x=n>1?(i/(n-1))*w:w; var y=h-(v/(maxNet*1.15))*h; return (i===0?'M':'L')+x.toFixed(1)+','+(isFinite(y)?y:h).toFixed(1); }).join(' ');
+          }
+          svgN.innerHTML = '<path class="line" d="'+path(hist.rx)+'" stroke="var(--cat-1)"></path>'
+                          + '<path class="line" d="'+path(hist.tx)+'" stroke="var(--cat-2)"></path>';
+
+          var maxMb = Math.max.apply(null, (j.procs||[]).map(function(p){return p.mb;}).concat([1]));
+          var pb = document.getElementById('procBars');
+          if (!j.procs || !j.procs.length) { pb.innerHTML = '<div class="sqlx-empty">Ningún motor propio corriendo ahora mismo.</div>'; }
+          else {
+            pb.innerHTML = j.procs.map(function(p){
+              var w = Math.max(4, Math.round((p.mb/maxMb)*100));
+              return '<div class="procbar-row"><div class="procbar-name">'+p.label+(p.count>1?' ×'+p.count:'')+'</div>'
+                   + '<div class="procbar-track"><div class="procbar-fill" style="width:'+w+'%;background:var(--'+p.color+')"></div></div>'
+                   + '<div class="procbar-val">'+p.mb+' MB</div></div>';
+            }).join('');
+          }
+
+          var foot = [];
+          if (j.uptimeSec !== undefined) { foot.push('Encendido desde hace <b>'+fmtUptime(j.uptimeSec)+'</b>'); }
+          (j.disks||[]).forEach(function(d){ if (!d.root) foot.push('<code>'+d.drive+'</code> '+d.freeGB+'/'+d.totalGB+' GB libres'); });
+          document.getElementById('sysFoot').innerHTML = foot.join(' &middot; ');
+          document.getElementById('sysUpdated').textContent = 'actualizado ' + new Date(j.ts*1000).toLocaleTimeString();
+        }).catch(function(){ document.getElementById('sysUpdated').textContent = 'sin respuesta'; });
+      }
+      tick();
+      var timer = setInterval(tick, POLL_MS);
+      // No seguir sondeando si el usuario se va a otra pestana del navegador (ahorra WMI de
+      // sobra) ni si navega a otra pestana del panel (el script muere con la pagina, pero por
+      // si acaso queda visible en el historial de vuelta atras del navegador).
+      document.addEventListener('visibilitychange', function(){
+        if (document.hidden) { clearInterval(timer); } else { timer = setInterval(tick, POLL_MS); tick(); }
+      });
+    })();
+    </script>
+
   <?php elseif ($tab==='doctor'): /* ---------- PESTAÑA DOCTOR (diagnostico) ---------- */
       // Cada comprobacion apunta [grupo, estado ok|warn|err|info, titulo, detalle]. Se calcula
       // todo en servidor al cargar: son lecturas rapidas (netstat+tasklist ~200ms y ficheros).
@@ -6778,8 +7137,9 @@ setTimeout(ping,1500);})();
       <a class="btn ghost sm" href="?tab=doctor">Volver a comprobar</a>
     </div>
 
+    <div class="pgrid2">
     <?php foreach ($grupos as $gNom => $gChecks): ?>
-      <div class="card">
+      <div class="card" style="margin-bottom:0">
         <div style="font-weight:600;margin-bottom:10px"><?= e($gNom) ?></div>
         <?php foreach ($gChecks as $c): ?>
           <div class="row" style="gap:10px;align-items:flex-start;padding:7px 0;border-top:1px solid var(--line)">
@@ -6800,6 +7160,7 @@ setTimeout(ping,1500);})();
         <?php endforeach; ?>
       </div>
     <?php endforeach; ?>
+    </div>
 
   <?php elseif ($tab==='procs'): /* ---------- PESTAÑA PROCESOS (supervisor) ---------- */
       $procs = procs_load($ROOT);
@@ -8657,6 +9018,74 @@ setTimeout(ping,1500);})();
   <?php endif; ?>
 
   </div>
+
+  <?php if ($termOnHdr): ?>
+  <!-- Terminal global: unica en todo el panel (no depende de la pestana activa), a
+       diferencia del runner de abajo que solo existe en Proyectos. Sesion propia (prefijo
+       "gterm"), independiente de la de la pestana Terminal si tambien esta abierta. -->
+  <div id="gtermBar" class="gtermbar dock-bottom" hidden>
+    <div class="gtermbox">
+      <div class="termbar-top">
+        <b>Terminal</b>
+        <div class="spacer"></div>
+        <button type="button" class="lockbtn" id="gtermDockBtn" title="Fijar a la derecha" aria-label="Fijar a la derecha">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="15" y1="4" x2="15" y2="20"/></svg>
+        </button>
+        <button type="button" class="lockbtn" id="gtermCloseBtn" title="Cerrar" aria-label="Cerrar">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <?= render_terminal_widget('gterm', term_default_cwd($ROOT), false) ?>
+    </div>
+  </div>
+  <script>
+  (function(){
+    var bar=document.getElementById('gtermBar'), box=bar.querySelector('.gtermbox'),
+        toggleBtn=document.getElementById('gtermToggleBtn'), dockBtn=document.getElementById('gtermDockBtn'),
+        closeBtn=document.getElementById('gtermCloseBtn'), input=document.getElementById('gtermcmd'),
+        content=document.querySelector('.content');
+    var OPEN_KEY='lua_gterm_open', DOCK_KEY='lua_gterm_dock';
+    var ro = null;
+
+    // Reserva espacio abajo en el contenido SOLO en modo "abajo" (en modo "derecha" el panel
+    // se superpone al contenido sin desplazarlo, igual que hace el runner fijado a la derecha
+    // -- ese solapamiento ya es el comportamiento aceptado en este panel).
+    function reserveSpace(){
+      if (bar.hidden || !bar.classList.contains('dock-bottom')) { content.style.paddingBottom = ''; return; }
+      content.style.paddingBottom = box.getBoundingClientRect().height + 'px';
+    }
+    if (window.ResizeObserver) { ro = new ResizeObserver(reserveSpace); ro.observe(box); }
+
+    function setDock(mode){
+      bar.classList.toggle('dock-bottom', mode==='right' ? false : true);
+      bar.classList.toggle('dock-right', mode==='right');
+      dockBtn.classList.toggle('on', mode==='right');
+      try{ localStorage.setItem(DOCK_KEY, mode); }catch(e){}
+      reserveSpace();
+    }
+    function setOpen(on, opts){
+      opts = opts || {};
+      bar.hidden = !on;
+      toggleBtn.classList.toggle('on', on);
+      try{ localStorage.setItem(OPEN_KEY, on?'1':'0'); }catch(e){}
+      reserveSpace();
+      if (on && !opts.silent && input) { setTimeout(function(){ input.focus(); }, 30); }
+    }
+    toggleBtn.addEventListener('click', function(){ setOpen(bar.hidden); });
+    closeBtn.addEventListener('click', function(){ setOpen(false); });
+    dockBtn.addEventListener('click', function(){ setDock(bar.classList.contains('dock-right') ? 'bottom' : 'right'); });
+    document.addEventListener('keydown', function(e){ if (e.key==='Escape' && !bar.hidden) setOpen(false); });
+
+    // Restaurar preferencia entre navegaciones (cada pestana es una recarga de pagina
+    // entera): si el usuario la dejo abierta, sigue abierta -- sin robar el foco, que seria
+    // molesto en cada cambio de pestana.
+    var dockSaved='bottom'; try{ dockSaved = localStorage.getItem(DOCK_KEY) || 'bottom'; }catch(e){}
+    setDock(dockSaved);
+    var openSaved='0'; try{ openSaved = localStorage.getItem(OPEN_KEY) || '0'; }catch(e){}
+    if (openSaved==='1') setOpen(true, {silent:true});
+  })();
+  </script>
+  <?php endif; ?>
 
   <?php $luaRunnerOn = is_file($ROOT.'/config/terminal.on'); if ($luaRunnerOn && in_array($tab, ['proyectos','proyecto'], true)): $runPresets = run_presets_load($ROOT); ?>
   <!-- Modal: runner de Composer/NPM/Artisan por proyecto (reutiliza los endpoints de la Terminal).

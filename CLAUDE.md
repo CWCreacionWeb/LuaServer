@@ -575,6 +575,49 @@ si lo lanza el watcher como SYSTEM.
   - Los strings de más de 256 KB se muestran recortados y **con la edición desactivada**, para no
     guardar encima una versión truncada del original.
 
+- **Terminal global en la cabecera** — icono en la barra superior (junto a
+  reiniciar/apagar) que muestra/oculta una terminal persistente **en cualquier pestaña**, no
+  solo en la pestaña "Terminal". Reutiliza `render_terminal_widget()` con un prefijo propio
+  (`gterm`, sesión independiente de la de la pestaña Terminal si también está abierta — no
+  hay colisión de ids porque los prefijos difieren). Dos modos, elegidos por el usuario y
+  recordados en `localStorage` (no hace falta servidor: es una preferencia de UI, como el
+  dock del runner): **abajo a todo el ancho** (por defecto, alto ajustable a mano) o **a la
+  derecha** (calco exacto del patrón ya existente `.modal-box.docked` del runner — incluso
+  reutiliza la clase `.lockbtn` y el icono). Solo el modo "abajo" reserva espacio en
+  `.content` (via `ResizeObserver`, se actualiza solo al redimensionar); el modo "derecha"
+  se superpone al contenido sin desplazarlo, igual que ya hacía el runner. Se abre sola (sin
+  robar el foco) al recargar la página si el usuario la dejó abierta la última vez, porque
+  cada pestaña del panel es una recarga completa, no una SPA. El icono de la cabecera solo
+  se pinta si `config/terminal.on` existe; si no, es un enlace mudo a Configuración.
+
+- **Pestaña Recursos** — CPU/RAM/disco/red del sistema real (no un contenedor) con gauges y
+  sparklines, más la huella de memoria de los propios motores/watcher de lua-server. Todo por
+  **WMI vía COM** (`winmgmts://./root/cimv2`), nunca `shell_exec()` de PowerShell (trampa nº5).
+  Dos decisiones no obvias:
+  - **El contador "Formatted" de CPU tarda ~6s; el "Raw" del mismo dato, ~50ms.**
+    `Win32_PerfFormattedData_PerfOS_Processor` calcula el % él mismo pero es lentísimo en esta
+    máquina (probablemente su proveedor WMI recalcula sobre su propia ventana de muestreo).
+    `Win32_PerfRawData_PerfOS_Processor` da los contadores crudos al instante; el % se calcula
+    con la fórmula oficial `PERF_100NSEC_TIMER_INV`: `(1 - (P2-P1)/(T2-T1)) * 100` entre dos
+    lecturas de `PercentProcessorTime`/`Timestamp_Sys100NS`. Para no bloquear la petición con
+    un `usleep`, la lectura "anterior" es la de la petición AJAX de antes (`tmp/sysmon-prev.json`,
+    caduca a los 30s): con el cliente sondeando cada ~2,5s sale gratis y preciso. **Verificado
+    contra una lectura de la misma clase WMI hecha por PowerShell/CIM en paralelo (sin pasar
+    por PHP): valores coincidentes.** Una "comprobación" ingenua con `Get-Process | Measure
+    TotalProcessorTime` como referencia dio sistemáticamente ~2× menos — es la propia
+    referencia la que está mal: `Get-Process` no expone el tiempo de CPU de `System`/`Idle`
+    (interrupciones, DPCs), así que infravalora el total. El contador de perfmon (lo que usa
+    también el Administrador de tareas) es la fuente correcta.
+  - **La huella de "lua-server"** es una única consulta a `Win32_Process` que combina los
+    binarios conocidos (`httpd.exe`, `php-cgi.exe`, `mysqld.exe`, `postgres.exe`, `mongod.exe`,
+    `redis-server.exe`, `node.exe`) **y** `powershell.exe`, filtrando el watcher después por
+    `CommandLine` (contiene `lua.ps1` y `watch`). Iba a ser una consulta aparte para el
+    watcher, pero fusionarla en la misma query casi duplicó la velocidad (~1,9 s → ~0,75 s):
+    lo caro de `Win32_Process` con filtro es recorrer la tabla de procesos, no el filtro en sí.
+  - Paleta categórica de 8 tonos (`--cat-1`…`--cat-8`) tomada tal cual del set ya validado
+    como seguro para daltonismo de la skill de dataviz, en vez de elegir colores a ojo para un
+    gráfico con varias series a la vez.
+
 - **Pestaña Doctor** — diagnóstico automático que convierte las trampas de este documento en
   comprobaciones de un vistazo: puertos (80/443/motores) con **quién** los ocupa vía
   netstat+tasklist, watcher por latido, motores activados-pero-no-instalados o con el puerto
