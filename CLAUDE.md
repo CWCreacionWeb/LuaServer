@@ -10,9 +10,47 @@ admin salvo cuando hace falta (HTTPS, hosts, servicio de Windows).
 - **`lua.ps1`** — CLI principal (init/start/stop/restart/reload/status/
   add-site/add-external/switch-php/setup/startup-enable/...). Toda la
   lógica de generación de vhosts, php.ini, etc. vive aquí.
-- **`tools/dashboard/index.php`** — el panel web (un solo archivo grande,
-  patrón PRG para POST, sin build step ni JS framework — solo PHP + CSS +
-  JS vanilla inline).
+- **`tools/dashboard/`** — el panel web (patrón PRG para POST, sin build
+  step ni JS framework — solo PHP + CSS + JS vanilla inline). Troceado en
+  2026-07-28 (era un único `index.php` de ~9500 líneas): ahora `index.php`
+  (~1265 líneas) es solo el orquestador —
+  bootstrap → `require_once` de `lib/` → `include` de `ajax/` → dispatch
+  POST (`include` de `actions/`) → render (`include` de `views/`) → layout
+  compartido (header, terminal global, footer, scripts) — y el resto vive
+  en:
+  - **`lib/*.php`** — funciones puras agrupadas por característica (sites,
+    mysql, postgres, redis, sqlsrv, sysmon-doctor, procs, terminal,
+    docker, git, logs, jobs...), cargadas con `require_once` al principio.
+  - **`ajax/*.php`** — endpoints AJAX/GET "crudos" (cover, brandlogo,
+    export_db/pg, pickfolder, árbol de archivos/editor, logs, procs,
+    redis, sqlsrv, terminal, comandos del runner), uno por característica.
+  - **`actions/*.php`** — el dispatch de `$_POST['action']` (patrón PRG),
+    uno por característica (power, proyectos, git/ftp, marca+tarjetas,
+    php/config, servicios, bases de datos, conexiones sqlsrv/redis,
+    procesos, actualizaciones, terminal/docker).
+  - **`views/*.php`** — el render de cada pestaña (`$tab`), uno por
+    pestaña.
+
+  **Gotcha al añadir ficheros nuevos aquí:** la cadena original era un
+  único `if/elseif/.../elseif` (para `$action` o para `$tab`); al partirla
+  en varios ficheros cada uno pasó a ser un `if` independiente (válido
+  porque `$action`/`$tab` nunca se reasignan y las condiciones son
+  mutuamente excluyentes). Dos trampas reales que esto destapó, a vigilar
+  si se vuelve a tocar esta zona:
+  1. **`__DIR__` cambia de valor** al mover código a una subcarpeta (en
+     `lib/`/`ajax/`/`actions/`/`views/` ya NO es `tools/dashboard/`) — usar
+     siempre `$ROOT` (ya en scope, puesto por `index.php`), nunca
+     `__DIR__`/`dirname(__DIR__,N)`, para rutas del proyecto.
+  2. **Una guarda de seguridad o código compartido puede colgar de un
+     `elseif` que "pertenece" a otro fichero.** Antes de cortar un bloque,
+     comprobar que ninguna condición intermedia (algo que no sea
+     `$action === 'x'`/`$tab === 'x'` puro, p.ej. un `in_array(...) && ...`)
+     esté hecha para bloquear/preceder una acción cuyo manejador real cae
+     en OTRO fichero — hay que mover la guarda junto a su manejador. Y
+     comprobar que no haya código compartido (sin condición propia) colgando
+     al final de la cadena original antes de su `}`/`endif` de cierre: ese
+     código es de TODA la cadena, no del último `elseif`, y debe quedarse en
+     `index.php`.
 - **El watcher** (`lua.ps1 watch`) es un **proceso PowerShell aparte**,
   arrancado por `Cmd-Start`, que hace polling cada 1s de archivos-señal en
   `tmp/*.flag` para ejecutar acciones privilegiadas que el panel no puede
