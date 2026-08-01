@@ -3,6 +3,18 @@
 function valid_dbname($n){ return (bool)preg_match('/^[a-zA-Z0-9_]{1,64}$/', (string)$n); }
 function valid_mysql_user($n){ return (bool)preg_match('/^[a-zA-Z0-9_]{1,32}$/', (string)$n); }
 function valid_mysql_host($h){ return in_array($h, ['127.0.0.1','localhost','%'], true); }
+// Whitelist de codificaciones ofrecidas al crear una BD (unica fuente: la usan tanto el
+// desplegable de bd.php como la validacion de db_create en actions/databases.php -- el
+// nombre va suelto en el SQL de CREATE DATABASE, sin poder pasar por un parametro
+// preparado, asi que la whitelist es lo que impide inyectar nada por ahi).
+function mysql_charsets(){
+    return [
+        'utf8mb4' => 'utf8mb4 — Unicode completo (recomendado)',
+        'utf8'    => 'utf8 — Unicode heredado (3 bytes, sin emojis)',
+        'latin1'  => 'latin1 — Europeo occidental',
+        'ascii'   => 'ascii',
+    ];
+}
 // Contraseña de root guardada aparte del sitio (config\mysql_root.pass), fuera de git.
 function mysql_root_pass($root){
     $f = $root.'/config/mysql_root.pass';

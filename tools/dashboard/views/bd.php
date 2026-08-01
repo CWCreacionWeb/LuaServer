@@ -13,7 +13,7 @@
       <a class="btn <?= $dbEngine==='mysql'?'':'ghost' ?> sm" href="?tab=bd&engine=mysql">MySQL / MariaDB<?= $mariaOn?'':' · inactivo' ?></a>
       <a class="btn <?= $dbEngine==='pg'?'':'ghost' ?> sm" href="?tab=bd&engine=pg">PostgreSQL<?= $pgOn?'':' · inactivo' ?></a>
       <?php if ($mongoOn): ?>
-        <a class="btn ghost sm" href="http://127.0.0.1:8081/" target="_blank">MongoDB (mongo-express &#8599;)</a>
+        <a class="btn ghost sm" href="http://127.0.0.1:8081/" target="_blank" title="MongoDB no usa SQL, así que no tiene un listado de bases de datos aquí: gestiónalo desde mongo-express.">MongoDB (mongo-express &#8599;)</a>
       <?php else: ?>
         <a class="btn ghost sm" href="?tab=config">MongoDB · inactivo</a>
       <?php endif; ?>
@@ -22,13 +22,9 @@
         // si hay alguna conexion guardada, igual que en SQL Server.
         $rdConns = redis_servers($ROOT);
       ?>
-      <a class="btn ghost sm" href="?tab=redis">Redis<?= $rdConns ? ' ('.count($rdConns).')' : ' · sin conexiones' ?></a>
+      <a class="btn ghost sm" href="?tab=redis" title="Redis tampoco usa SQL: se gestiona en su propia pestaña Redis (explorador de claves, consola y estado del servidor).">Redis<?= $rdConns ? ' ('.count($rdConns).')' : ' · sin conexiones' ?></a>
       <a class="btn ghost sm" href="?tab=sqlsrv">SQL Server</a>
     </div>
-    <?php if ($mongoOn): ?>
-      <div class="muted" style="margin-bottom:16px;font-size:12px">MongoDB no usa SQL, así que no tiene un listado de bases de datos aquí: gestiónalo desde <b>mongo-express</b> (arriba).</div>
-    <?php endif; ?>
-    <div class="muted" style="margin-bottom:16px;font-size:12px">Redis tampoco usa SQL: se gestiona en su propia pestaña <a href="?tab=redis"><b>Redis</b></a> (explorador de claves, consola y estado del servidor).</div>
 
     <?php if ($dbEngine==='pg'): /* ===== PostgreSQL ===== */ ?>
 
@@ -209,16 +205,6 @@
       </div>
     <?php else: ?>
 
-      <div class="card row">
-        <div>
-          <div style="font-weight:600">Herramientas de administración</div>
-          <div class="muted">phpMyAdmin (con tema propio) y Adminer, ya integrados en la plataforma.</div>
-        </div>
-        <div class="spacer"></div>
-        <a class="btn ghost" href="http://<?= e($phpmyadminDom) ?>/" target="_blank">phpMyAdmin &#8599;</a>
-        <a class="btn ghost" href="/adminer.php?server=127.0.0.1&username=root" target="_blank">Adminer &#8599;</a>
-      </div>
-
       <?php $dbList = mysql_databases();
       // Ultimo job de import de archivo por BD (read_jobs ya viene ordenado por mas reciente).
       $fileJobsByDb = [];
@@ -226,48 +212,9 @@
           if (($jj['type']??'')!=='db_import_file') continue;
           $jjDb = $jj['dbname'] ?? $jj['name'] ?? '';
           if ($jjDb !== '' && !isset($fileJobsByDb[$jjDb])) $fileJobsByDb[$jjDb] = $jj;
-      } ?>
-      <div class="card">
-        <div class="row" style="margin-bottom:12px">
-          <h2 style="margin:0;font-size:15px">Bases de datos</h2>
-          <div class="spacer"></div>
-          <form method="post" class="row" style="gap:6px">
-            <input type="hidden" name="action" value="db_create">
-            <input name="dbname" placeholder="nombre_basedatos" pattern="[a-zA-Z0-9_]{1,64}" style="width:200px" required>
-            <button class="btn ghost sm" type="submit">+ Crear BD</button>
-          </form>
-        </div>
-        <?php if ($dbList === null): ?>
-          <div class="muted">No se pudo conectar con MySQL (¿acaba de activarse? espera unos segundos y recarga).</div>
-        <?php elseif (!$dbList): ?>
-          <div class="muted">No hay bases de datos todavía. Crea la primera arriba.</div>
-        <?php else: foreach ($dbList as $db): ?>
-          <div class="dbrow">
-            <div class="dbname"><?= e($db) ?></div>
-            <div class="spacer"></div>
-            <div class="dbactions">
-              <a class="btn ghost sm no-loader" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
-              <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
-                <input type="hidden" name="action" value="db_import">
-                <input type="hidden" name="dbname" value="<?= e($db) ?>">
-                <label class="filepick">
-                  <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
-                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                  <span class="filepick-name">Elegir .sql&hellip;</span>
-                </label>
-                <button class="btn ghost sm" type="submit">Importar</button>
-              </form>
-              <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
-            </div>
-          </div>
-          <?php if (isset($fileJobsByDb[$db])): ?>
-            <div style="margin:0 0 4px">
-              <?= render_import_job_card($ROOT, $fileJobsByDb[$db]) ?>
-            </div>
-          <?php endif; ?>
-        <?php endforeach; endif; ?>
-      </div>
-
+      }
+      $charsets = mysql_charsets(); ?>
+      <div class="pgrid2">
       <div class="card">
         <div style="font-weight:600">Importar carpeta de dumps</div>
         <div class="muted" style="margin-top:6px">Para exports con un <code>.sql</code> por tabla (en vez de un único dump completo): indica la carpeta en este servidor y la base de datos destino, y se importan todos en orden. Se ejecuta en segundo plano (puede tardar con carpetas grandes).</div>
@@ -304,6 +251,54 @@
           </div>
           <button class="btn" type="submit">Actualizar contraseña</button>
         </form>
+      </div>
+      </div>
+
+      <div class="pgrid2">
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <h2 style="margin:0;font-size:15px">Bases de datos</h2>
+          <div class="spacer"></div>
+          <form method="post" class="row" style="gap:6px">
+            <input type="hidden" name="action" value="db_create">
+            <input name="dbname" placeholder="nombre_basedatos" pattern="[a-zA-Z0-9_]{1,64}" style="width:200px" required>
+            <select name="charset" title="Codificación">
+              <?php foreach ($charsets as $cs => $csLabel): ?><option value="<?= e($cs) ?>" <?= $cs==='utf8mb4'?'selected':'' ?>><?= e($csLabel) ?></option><?php endforeach; ?>
+            </select>
+            <button class="btn ghost sm" type="submit">+ Crear BD</button>
+          </form>
+          <a class="btn ghost sm" href="http://<?= e($phpmyadminDom) ?>/" target="_blank">phpMyAdmin &#8599;</a>
+          <a class="btn ghost sm" href="/adminer.php?server=127.0.0.1&username=root" target="_blank">Adminer &#8599;</a>
+        </div>
+        <?php if ($dbList === null): ?>
+          <div class="muted">No se pudo conectar con MySQL (¿acaba de activarse? espera unos segundos y recarga).</div>
+        <?php elseif (!$dbList): ?>
+          <div class="muted">No hay bases de datos todavía. Crea la primera arriba.</div>
+        <?php else: foreach ($dbList as $db): ?>
+          <div class="dbrow">
+            <div class="dbname"><?= e($db) ?></div>
+            <div class="spacer"></div>
+            <div class="dbactions">
+              <a class="btn ghost sm no-loader" href="?export_db=<?= e(rawurlencode($db)) ?>">Exportar</a>
+              <form method="post" enctype="multipart/form-data" class="dbimport row" style="gap:6px" onsubmit="return luaAskImportDb(event, this, '<?= e($db) ?>')">
+                <input type="hidden" name="action" value="db_import">
+                <input type="hidden" name="dbname" value="<?= e($db) ?>">
+                <label class="filepick">
+                  <input type="file" name="sqlfile" accept=".sql" required onchange="luaFilePickName(this)">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  <span class="filepick-name">Elegir .sql&hellip;</span>
+                </label>
+                <button class="btn ghost sm" type="submit">Importar</button>
+              </form>
+              <button type="button" class="btn danger sm" onclick="luaAskDropDb('<?= e($db) ?>')">Eliminar</button>
+            </div>
+          </div>
+          <?php if (isset($fileJobsByDb[$db])): ?>
+            <div style="margin:0 0 4px">
+              <?= render_import_job_card($ROOT, $fileJobsByDb[$db]) ?>
+            </div>
+          <?php endif; ?>
+        <?php endforeach; endif; ?>
       </div>
 
       <div class="card">
@@ -367,6 +362,7 @@
           </div>
         <?php endforeach; endif; ?>
         <div class="muted" style="margin-top:10px;font-size:12px">Estos credenciales hay que asignarlos a mano en el <code>.env</code>/config de cada proyecto.</div>
+      </div>
       </div>
 
       <!-- Modal de confirmacion de borrado de usuario MySQL -->

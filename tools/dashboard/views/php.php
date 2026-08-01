@@ -25,7 +25,45 @@
           </div>
           <div class="muted" style="margin-bottom:16px;font-size:12px">Depuración paso a paso en el puerto <b>9003</b> (VS Code / PhpStorm)<?= $xnourl?' · <em>sin DLL disponible para esta versión</em>':'' ?>.</div>
 
-          <?php $extraList = extra_extensions($ROOT); sort($extraList); ?>
+          <?php
+            // xdebug tiene su propio interruptor arriba (con descarga por job); opcache se
+            // gestiona solo (auto-activado en 7.2+ si hay .dll, deshabilitado a proposito en
+            // <7.2 -- ver "PHP < 7.2 en Windows" en CLAUDE.md) y activarlo a mano via
+            // extra-extensions.json usaria la directiva generica "extension=" en vez de
+            // "zend_extension=", que es justo el bug ya documentado que colgaba php-cgi bajo
+            // mod_fcgid en PHP viejo: se muestra pero no se deja tocar desde aqui.
+            $availExt = array_values(array_diff(php_ext_scan($PHP_BASE, $v), ['xdebug']));
+            $enabledExt = php_ext_enabled($PHP_BASE, $v);
+            $extraList = extra_extensions($ROOT);
+            $activeCount = count(array_intersect($availExt, array_keys($enabledExt)));
+          ?>
+          <div class="row" style="margin-bottom:4px">
+            <span style="font-weight:600">Extensiones disponibles</span>
+            <span class="muted" style="font-size:12px"><?= $activeCount ?> de <?= count($availExt) ?> activas &middot; clic para activar/desactivar</span>
+          </div>
+          <?php if ($availExt): ?>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px">
+              <?php foreach ($availExt as $en):
+                $isOn = isset($enabledExt[$en]);
+                $isTracked = in_array($en, $extraList, true);
+                $locked = ($en === 'opcache') || ($isOn && !$isTracked); ?>
+                <?php if ($locked): ?>
+                  <span class="jstate <?= $isOn?'ok':'warn' ?>" title="<?= $en==='opcache' ? 'Gestionado automáticamente (no se puede activar/desactivar aquí)' : ($isOn ? 'Activada por defecto — no se puede desactivar desde aquí' : 'Disponible, no activada') ?>"><?= e($en) ?></span>
+                <?php else: ?>
+                  <form method="post" style="display:inline">
+                    <input type="hidden" name="action" value="<?= $isOn?'phpext_remove':'phpext_enable' ?>">
+                    <input type="hidden" name="ver" value="<?= e($v) ?>">
+                    <input type="hidden" name="name" value="<?= e($en) ?>">
+                    <button type="submit" class="jstate <?= $isOn?'ok':'warn' ?>" title="<?= $isOn?'Activada — clic para desactivar':'Clic para activar' ?>"><?= e($en) ?></button>
+                  </form>
+                <?php endif; ?>
+              <?php endforeach; ?>
+            </div>
+          <?php else: ?>
+            <div class="muted" style="margin-bottom:16px;font-size:12px">No se encontraron .dll en la carpeta ext\ de esta versión.</div>
+          <?php endif; ?>
+
+          <?php sort($extraList); ?>
           <div class="row" style="margin-bottom:4px">
             <span style="font-weight:600">Extensiones adicionales</span>
           </div>
@@ -115,7 +153,7 @@
           </svg>
         </div>
         <h3 id="delExtTitle">¿Quitar extensión?</h3>
-        <p class="modal-tx">Se borrará <strong id="delExtName"></strong> de PHP <strong id="delExtVer"></strong> y se aplicarán los cambios.</p>
+        <p class="modal-tx">Se desactivará <strong id="delExtName"></strong> en PHP <strong id="delExtVer"></strong> (el .dll no se borra, solo deja de cargarse) y se aplicarán los cambios.</p>
         <form method="post" class="modal-actions">
           <input type="hidden" name="action" value="phpext_remove">
           <input type="hidden" name="ver" id="delExtVerInput">

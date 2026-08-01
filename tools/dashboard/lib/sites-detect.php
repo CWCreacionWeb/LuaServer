@@ -107,9 +107,25 @@ function detect_project_php($dir, $installedVers){
     if (!is_string($constraint) || $constraint === '') return null;
     return pick_php_for_constraint($constraint, $installedVers);
 }
+// WordPress puede vivir un nivel mas adentro del proyecto (zip descomprimido con su propia
+// carpeta, WordPress metido en public/, etc.), a diferencia de Laravel/Symfony/Node cuyos
+// marcadores (artisan, composer.json, package.json) casi siempre estan en la raiz del repo.
+function has_wp_markers($dir){
+    foreach (['wp-load.php','wp-config.php','wp-config-sample.php'] as $f) {
+        if (is_file("$dir/$f")) return true;
+    }
+    return false;
+}
 function detect_project_type($dir){
     // --- PHP ---
-    if (is_file("$dir/wp-load.php") || is_file("$dir/wp-config.php") || is_file("$dir/wp-config-sample.php")) return 'wordpress';
+    if (has_wp_markers($dir)) return 'wordpress';
+    if (is_dir($dir)) {
+        foreach (scandir($dir) as $sub) {
+            if ($sub[0] === '.') continue;
+            $subDir = "$dir/$sub";
+            if (is_dir($subDir) && has_wp_markers($subDir)) return 'wordpress';
+        }
+    }
     if (is_file("$dir/artisan")) return 'laravel';
     if (is_file("$dir/composer.json")) {
         $data = json_decode((string)@file_get_contents("$dir/composer.json"), true);

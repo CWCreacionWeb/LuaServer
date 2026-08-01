@@ -19,7 +19,13 @@
             $msg='applied:php.ini de PHP '.$ver.' guardado.';
         } else { $msg='error:Versión no válida.'; }
     }
-    elseif ($action === 'hosts') { $tab='config'; lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
+    elseif ($action === 'hosts') {
+        $tab='config';
+        // lua_hosts() solo deja un flag: sin watcher que lo recoja, nunca aparece el UAC y
+        // nada se sincroniza -- avisarlo aqui en vez de prometer un dialogo que no va a salir.
+        if (!watcher_alive($ROOT)) { $msg='error:El watcher no está activo: no se puede sincronizar. Arráncalo con .\lua.ps1 start'; }
+        else { lua_hosts(); $msg='info:Sincronizando dominios: acepta el aviso de Windows (UAC).'; }
+    }
     elseif ($action === 'set_tld') {
         $tab = 'config';
         $new = strtolower(trim($_POST['tld'] ?? ''));
@@ -28,11 +34,17 @@
         } else {
             $cfg['tld'] = $new;
             write_json($CFG_FILE, $cfg);
-            lua_apply();
-            lua_hosts(); // cambia el dominio de TODOS los proyectos: hay que resincronizar hosts si o si
-            $httpsOn = is_file($ROOT.'/config/https.on');
-            if ($httpsOn) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); }
-            $msg = 'applied:Dominio cambiado a "'.$new.'". Sincronizando hosts (acepta el aviso de Windows/UAC que va a aparecer).'.($httpsOn?' El certificado HTTPS se está regenerando.':'');
+            // Igual que en 'hosts': cambia el dominio de TODOS los proyectos sin domain propio,
+            // pero lua_apply()/lua_hosts() no hacen nada de verdad sin un watcher que las recoja.
+            if (!watcher_alive($ROOT)) {
+                $msg = 'error:Dominio guardado ("'.$new.'"), pero el watcher no está activo: los proyectos no cambiarán de dominio hasta que lo arranques con .\lua.ps1 start.';
+            } else {
+                lua_apply();
+                lua_hosts(); // cambia el dominio de TODOS los proyectos: hay que resincronizar hosts si o si
+                $httpsOn = is_file($ROOT.'/config/https.on');
+                if ($httpsOn) { @file_put_contents($ROOT.'/tmp/https.flag',(string)time()); }
+                $msg = 'applied:Dominio cambiado a "'.$new.'". Sincronizando hosts (acepta el aviso de Windows/UAC que va a aparecer).'.($httpsOn?' El certificado HTTPS se está regenerando.':'');
+            }
         }
     }
     elseif ($action === 'https') {

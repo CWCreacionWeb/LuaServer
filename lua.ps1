@@ -143,7 +143,7 @@ $UpdateCfgFile    = Join-Path $Root "config\update.json"
 $UpdateStatusFile = Join-Path $TmpDir "update-status.json"
 
 $SvcApache  = "luaApache"
-$DefaultTld = "lua.test"
+$DefaultTld = "local"
 $HostsBegin = "# === lua-server BEGIN (no editar a mano) ==="
 $HostsEnd   = "# === lua-server END ==="
 
@@ -1871,9 +1871,91 @@ function Run-Job($id, $job) {
                     if ($failCount -gt 0) { $ok=$false; $err="$failCount de $total archivo(s) fallaron (ver log)" }
                 }
             }
+            "export_project" {
+                # Empaqueta el proyecto en un .zip y, si se pidio, mete dentro el volcado .sql
+                # de su base de datos, para que el export sea una sola pieza. Va aqui y no en el
+                # panel porque comprimir miles de archivos + volcar la BD se sale del tiempo de
+                # una peticion bajo mod_fcgid (y lanzar el cliente de dump desde PHP es justo lo
+                # que desaconseja la trampa nº5 de CLAUDE.md).
+                $srcItem = Get-Item -LiteralPath "$($job.dir)" -ErrorAction SilentlyContinue
+                $outZip  = "$($job.out)"
+                $exclude = @("$($job.exclude)" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                $exDb = "$($job.dbname)"; $exEngine = "$($job.dbengine)"
+                $dumpFile = $null; $total = 0
+                if (-not $srcItem) { $ok=$false; $err="No existe la carpeta del proyecto" }
+                else {
+                    $srcDir = $srcItem.FullName.TrimEnd('\')
+                    New-Item -ItemType Directory -Force -Path (Split-Path $outZip -Parent) | Out-Null
+                    if ($exDb -ne '') {
+                        Set-JobStatus $id $name $type "running" "Volcando la base de datos `"$exDb`"..." 5
+                        $dumpFile = Join-Path $TmpDir "export-$id.sql"
+                        if ($exEngine -eq 'pgsql') {
+                            $pgDump = Join-Path $Root "bin\postgres\bin\pg_dump.exe"
+                            if (-not (Test-Path $pgDump)) { $ok=$false; $err="PostgreSQL no esta instalado" }
+                            else {
+                                $pgPassFile = Join-Path $Root "config\postgres_root.pass"
+                                if (Test-Path $pgPassFile) { $env:PGPASSWORD = (Get-Content $pgPassFile -Raw).Trim() }
+                                & $pgDump '--host=127.0.0.1' '--port=5432' '--username=postgres' '--no-password' "--file=$dumpFile" $exDb 2>&1 | Add-Content $log
+                                $env:PGPASSWORD = $null
+                                if ($LASTEXITCODE -ne 0) { $ok=$false; $err="pg_dump fallo (ver log)" }
+                            }
+                        } else {
+                            $mdDump = Join-Path $MariaDb "bin\mariadb-dump.exe"
+                            if (-not (Test-Path $mdDump)) { $ok=$false; $err="MariaDB no esta instalado" }
+                            else {
+                                $rootPassFile = Join-Path $Root "config\mysql_root.pass"
+                                $rootPass = if (Test-Path $rootPassFile) { (Get-Content $rootPassFile -Raw).Trim() } else { "" }
+                                $mdArgs = @('--host=127.0.0.1','--port=3306','--user=root')
+                                if ($rootPass -ne '') { $mdArgs += "--password=$rootPass" }
+                                # --result-file, no "> archivo": la redireccion de PowerShell escribe
+                                # el .sql en UTF-16 y ademas cuela dentro las lineas de stderr.
+                                $mdArgs += @('--single-transaction','--routines','--events','--default-character-set=utf8mb4',"--result-file=$dumpFile",$exDb)
+                                & $mdDump @mdArgs 2>&1 | Add-Content $log
+                                if ($LASTEXITCODE -ne 0) { $ok=$false; $err="mariadb-dump fallo (ver log)" }
+                            }
+                        }
+                    }
+                    if ($ok) {
+                        # Las dos: ZipFile/ZipFileExtensions viven en .FileSystem, pero
+                        # ZipArchiveMode esta en System.IO.Compression a secas.
+                        Add-Type -AssemblyName System.IO.Compression
+                        Add-Type -AssemblyName System.IO.Compression.FileSystem
+                        Remove-Item -LiteralPath $outZip -Force -ErrorAction SilentlyContinue
+                        $files = Get-ChildItem -LiteralPath $srcDir -Recurse -File -Force | Where-Object {
+                            $rel = $_.FullName.Substring($srcDir.Length+1) -replace '\\','/'
+                            $skip = $false
+                            foreach ($pat in $exclude) { if ($rel -like "*$pat*") { $skip = $true; break } }
+                            -not $skip
+                        }
+                        $total = @($files).Count; $i = 0; $skipped = 0
+                        "Comprimiendo $total archivo(s) de $srcDir..." | Add-Content $log
+                        $zip = [System.IO.Compression.ZipFile]::Open($outZip, [System.IO.Compression.ZipArchiveMode]::Create)
+                        try {
+                            foreach ($f in $files) {
+                                $i++
+                                $rel = $f.FullName.Substring($srcDir.Length+1) -replace '\\','/'
+                                # Un archivo suelto no puede tumbar el export: en Windows es normal
+                                # toparse con rutas de mas de 260 caracteres (node_modules) o con
+                                # archivos abiertos por otro proceso. Se anota y se sigue.
+                                try { [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, "$name/$rel") | Out-Null }
+                                catch { $skipped++; "OMITIDO: $rel -> $($_.Exception.Message)" | Add-Content $log }
+                                if ($i % 50 -eq 0 -or $i -eq $total) {
+                                    $pct = if ($total -gt 0) { 10 + [math]::Floor($i*85/$total) } else { 95 }
+                                    Set-JobStatus $id $name $type "running" "Comprimiendo $i/$total..." $pct
+                                }
+                            }
+                            if ($dumpFile -and (Test-Path -LiteralPath $dumpFile)) {
+                                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $dumpFile, "$exDb.sql") | Out-Null
+                            }
+                        } finally { $zip.Dispose() }
+                        if ($skipped -gt 0) { "$skipped archivo(s) omitidos (ver lineas OMITIDO)." | Add-Content $log }
+                    }
+                    if ($dumpFile) { Remove-Item -LiteralPath $dumpFile -Force -ErrorAction SilentlyContinue }
+                }
+            }
             default     { $ok=$false; $err="Tipo desconocido: $type" }
         }
-        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'redis') -and ($type -ne 'ftp_deploy') -and ($type -ne 'db_import_dir') -and ($type -ne 'db_import_file') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
+        if ($ok -and ($type -ne 'xdebug') -and ($type -ne 'phpext') -and ($type -ne 'mailpit') -and ($type -ne 'mariadb') -and ($type -ne 'postgres') -and ($type -ne 'mongodb') -and ($type -ne 'redis') -and ($type -ne 'ftp_deploy') -and ($type -ne 'export_project') -and ($type -ne 'db_import_dir') -and ($type -ne 'db_import_file') -and -not (Test-Path $dir)) { $ok=$false; $err="No se creo la carpeta del proyecto" }
     } catch { $ok=$false; $err=$_.Exception.Message }
     $ErrorActionPreference = $prev
     if ($ok) {
@@ -1918,6 +2000,10 @@ function Run-Job($id, $job) {
             else { Set-JobStatus $id $name $type "error" "Redis se descargo pero no arranco (revisa logs\redis\redis.log)" }
         } elseif ($type -eq 'ftp_deploy') {
             Set-JobStatus $id $name $type "done" "Desplegado por FTP a $ftpHost ($total archivo(s))"
+        } elseif ($type -eq 'export_project') {
+            $zipMb = [math]::Round((Get-Item -LiteralPath $outZip).Length/1MB, 1)
+            $dbNote = if ($exDb -ne '') { " + BD $exDb" } else { "" }
+            Set-JobStatus $id $name $type "done" "Exportado $(Split-Path $outZip -Leaf) ($zipMb MB, $total archivo(s)$dbNote)" 100
         } elseif ($type -eq 'db_import_dir') {
             Set-JobStatus $id $name $type "done" "Importados $total archivo(s) .sql en `"$dbname`"" 100
         } elseif ($type -eq 'db_import_file') {

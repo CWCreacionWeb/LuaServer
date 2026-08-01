@@ -75,22 +75,29 @@
         elseif ($path==='' || !is_dir($pathN)) { $msg='error:La ruta no existe o no es una carpeta: '.$path; }
         elseif ($domain!=='' && !valid_domain($domain)) { $msg='error:Dominio no válido (ej.: portal.ersm.test).'; }
         elseif ($vers && !in_array($php,$vers,true)) { $msg='error:Versión de PHP no instalada.'; }
-        elseif (($clash = domain_in_use($cfg['sites'], ($domain!==''?$domain:$name.'.'.($cfg['tld']??'lua.test')), null, $cfg['tld']??'lua.test')) !== null) { $msg='error:Ese dominio ya lo usa el proyecto "'.$clash.'".'; }
+        elseif (($clash = domain_in_use($cfg['sites'], ($domain!==''?$domain:$name.'.'.($cfg['tld']??'local')), null, $cfg['tld']??'local')) !== null) { $msg='error:Ese dominio ya lo usa el proyecto "'.$clash.'".'; }
         else {
             $entry = ['php'=>$php, 'path'=>$pathN];
             if ($domain!=='') $entry['domain']=$domain;
-            $cfg['sites'][$name]=$entry; write_json($CFG_FILE,$cfg); lua_apply(); lua_hosts();
+            $cfg['sites'][$name]=$entry; write_json($CFG_FILE,$cfg);
             lock_project_dir($pathN); // proyecto externo ya existente: bloqueado por defecto
-            $dom = $domain!=='' ? $domain : $name.'.'.($cfg['tld']??'lua.test');
+            $dom = $domain!=='' ? $domain : $name.'.'.($cfg['tld']??'local');
             $hasPublic = is_dir($pathN.'/public');
-            $msg='applied:Proyecto externo "'.$name.'" registrado y bloqueado -> http://'.$dom.' [PHP '.$php.']'.($hasPublic?' (docroot: public/)':'').'. Sincronizando hosts (acepta el aviso de Windows/UAC).';
+            // lua_apply()/lua_hosts() solo dejan un flag: sin watcher que lo recoja no pasa
+            // nada, y sin este aviso el mensaje de exito engaña (promete un UAC que no llega).
+            if (!watcher_alive($ROOT)) {
+                $msg='error:Proyecto externo "'.$name.'" registrado, pero el watcher no está activo: no se generará el vhost ni se sincronizará el hosts hasta que lo arranques con .\lua.ps1 start.';
+            } else {
+                lua_apply(); lua_hosts();
+                $msg='applied:Proyecto externo "'.$name.'" registrado y bloqueado -> http://'.$dom.' [PHP '.$php.']'.($hasPublic?' (docroot: public/)':'').'. Sincronizando hosts (acepta el aviso de Windows/UAC).';
+            }
         }
     }
     elseif ($action === 'set_domain') {
         $name = $_POST['name'] ?? '';
         $tab = 'proyecto'; $redirName = $name;
         $domain = strtolower(trim($_POST['domain'] ?? ''));
-        $tld = $cfg['tld'] ?? 'lua.test';
+        $tld = $cfg['tld'] ?? 'local';
         $siteKey = resolve_site_key($cfg['sites'], $name);
         if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
         elseif ($domain !== '' && !valid_domain($domain)) { $msg = 'error:Dominio no válido (ej.: portal.'.$tld.').'; }
@@ -100,7 +107,7 @@
             if (!is_array($cfg['sites'][$name])) { $cfg['sites'][$name] = ['php'=>$cfg['sites'][$name]]; }
             if ($domain === '') { unset($cfg['sites'][$name]['domain']); }
             else { $cfg['sites'][$name]['domain'] = $domain; }
-            write_json($CFG_FILE, $cfg); lua_apply(); lua_hosts();
+            write_json($CFG_FILE, $cfg);
             $shownDomain = $domain !== '' ? $domain : $name.'.'.$tld;
             // El certificado HTTPS es un unico wildcard *.$tld, y un comodin cubre UNA sola
             // etiqueta: cubre x.$tld pero NO x.y.$tld. Solo marcamos "cubierto" un dominio
@@ -112,7 +119,14 @@
             $label = $endsTld ? substr($domain, 0, -strlen($suffix)) : '';
             $coveredByWildcard = ($domain === '') || ($domain === $tld) || ($endsTld && $label !== '' && strpos($label, '.') === false);
             $warn = ($httpsOn && !$coveredByWildcard) ? ' Aviso: con HTTPS activo, este dominio no cuelga de ".'.$tld.'" así que el certificado no lo cubrirá (saldrá aviso de certificado no válido en el navegador).' : '';
-            $msg = 'applied:Dominio de "'.$name.'" -> '.$shownDomain.'. Sincronizando hosts (acepta el aviso de Windows/UAC).'.$warn;
+            // lua_apply()/lua_hosts() solo dejan un flag: sin watcher que lo recoja no pasa
+            // nada, y sin este aviso el mensaje de exito engaña (promete un UAC que no llega).
+            if (!watcher_alive($ROOT)) {
+                $msg = 'error:Dominio de "'.$name.'" guardado, pero el watcher no está activo: no se aplicará hasta que lo arranques con .\lua.ps1 start.';
+            } else {
+                lua_apply(); lua_hosts();
+                $msg = 'applied:Dominio de "'.$name.'" -> '.$shownDomain.'. Sincronizando hosts (acepta el aviso de Windows/UAC).'.$warn;
+            }
         }
     }
     elseif ($action === 'clearjobs') {
@@ -175,19 +189,37 @@
         header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
     }
     elseif ($action === 'phpext_remove') {
+        // Solo desregistra (deja de activarse en el proximo apply); el .dll NO se borra --
+        // extra-extensions.json es una lista GLOBAL (Set-PhpInis la aplica a todas las
+        // versiones que tengan el .dll), asi que borrar el archivo aqui apagaria la extension
+        // en todas las demas versiones que la comparten, no solo en la de esta tarjeta. Y para
+        // una extension que viene de fabrica con PHP (no subida/descargada por el panel),
+        // borrar su .dll es irrecuperable sin reinstalar esa version entera.
         $ver = $_POST['ver'] ?? '';
         $name = $_POST['name'] ?? '';
         if (!$vers || !in_array($ver,$vers,true)) { $msg='error:Versión no válida.'; }
         else {
-            @unlink($PHP_BASE.'/'.$ver.'/ext/php_'.$name.'.dll');
-            $stillUsed = false;
-            foreach ($vers as $v2) { if (is_file($PHP_BASE.'/'.$v2.'/ext/php_'.$name.'.dll')) { $stillUsed = true; break; } }
-            if (!$stillUsed) {
-                $list = array_values(array_diff(extra_extensions($ROOT), [$name]));
-                save_extra_extensions($ROOT, $list);
-            }
+            $list = array_values(array_diff(extra_extensions($ROOT), [$name]));
+            save_extra_extensions($ROOT, $list);
             lua_apply();
-            $msg='applied:Extensión "'.$name.'" quitada de PHP '.$ver.'.';
+            $msg='applied:Extensión "'.$name.'" desactivada.';
+        }
+        header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
+    }
+    elseif ($action === 'phpext_enable') {
+        // Activa una extension que YA trae PHP de fabrica (su .dll ya esta en ext\) sin subir
+        // ni descargar nada: solo la registra en extra-extensions.json (misma lista global que
+        // phpext_add) para que Set-PhpInis la incluya en el proximo apply.
+        $ver = $_POST['ver'] ?? '';
+        $name = trim($_POST['name'] ?? '');
+        if (!$vers || !in_array($ver,$vers,true)) { $msg='error:Versión no válida.'; }
+        elseif (!preg_match('/^[a-z][a-z0-9_]*$/', $name)) { $msg='error:Nombre de extensión no válido.'; }
+        elseif (!is_file($PHP_BASE.'/'.$ver.'/ext/php_'.$name.'.dll')) { $msg='error:No hay ningún .dll de "'.$name.'" para PHP '.$ver.'.'; }
+        else {
+            $list = extra_extensions($ROOT);
+            if (!in_array($name,$list,true)) { $list[] = $name; save_extra_extensions($ROOT, $list); }
+            lua_apply();
+            $msg='applied:Extensión "'.$name.'" activada.';
         }
         header('Location: ?tab=php&ver='.urlencode($ver).'&msg='.urlencode($msg)); exit;
     }

@@ -62,6 +62,7 @@ require_once __DIR__.'/lib/terminal.php';
 require_once __DIR__.'/lib/misc-features.php';
 require_once __DIR__.'/lib/logs.php';
 require_once __DIR__.'/lib/jobs.php';
+require_once __DIR__.'/lib/exports.php';
 
 
 // ---------------- Endpoints AJAX y GET crudos (tools/dashboard/ajax/) ----------------
@@ -78,7 +79,7 @@ include __DIR__.'/ajax/runner.php';
 // ---------------- POST (patron PRG) ----------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
-    $cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'lua.test','sites'=>[]];
+    $cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'local','sites'=>[]];
     if(!isset($cfg['sites'])||!is_array($cfg['sites'])) $cfg['sites']=[];
     $vers = php_versions($PHP_BASE);
     $tab='proyectos'; $msg=''; $redirName=null;
@@ -88,6 +89,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     include __DIR__.'/actions/power.php';
     include __DIR__.'/actions/projects.php';
     include __DIR__.'/actions/git-ftp.php';
+    include __DIR__.'/actions/exports.php';
     include __DIR__.'/actions/branding-and-cards.php';
     include __DIR__.'/actions/php-and-config.php';
     include __DIR__.'/actions/services.php';
@@ -124,7 +126,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // ---------------- GET (render) ----------------
-$cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'lua.test','sites'=>[]];
+$cfg = read_json($CFG_FILE) ?: ['defaultPhp'=>'8.4','tld'=>'local','sites'=>[]];
 $brandName = brand_name($cfg);
 $luaVer    = lua_version($ROOT);
 $updSt     = update_status($ROOT);
@@ -132,13 +134,13 @@ $updCfg    = update_config($ROOT);
 $updDetras = (int)($updSt['detras'] ?? 0);
 $updHay    = $updDetras > 0;
 $brandLogo = brand_logo_path($ROOT);      // ruta del logo propio, o null si usa el de por defecto
-$tld = $cfg['tld'] ?? 'lua.test';
+$tld = $cfg['tld'] ?? 'local';
 $sites = $cfg['sites'] ?? [];
 // phpMyAdmin es una herramienta de la plataforma (enlazada en "Bases de datos"),
 // no un proyecto del usuario: se registra igual (vhost, php.ini...) pero se oculta
 // de la lista de proyectos. Sigue contando como "registrado" para unregistered_projects().
 $sitesView = array_diff_key($sites, ['phpmyadmin'=>true]);
-$phpmyadminDom = !empty($sites['phpmyadmin']['domain']) ? $sites['phpmyadmin']['domain'] : 'phpmyadmin.'.($cfg['tld'] ?? 'lua.test');
+$phpmyadminDom = !empty($sites['phpmyadmin']['domain']) ? $sites['phpmyadmin']['domain'] : 'phpmyadmin.'.($cfg['tld'] ?? 'local');
 $defaultPhp = $cfg['defaultPhp'] ?? '8.4';
 $vers = php_versions($PHP_BASE);
 // mod_fcgid mantiene procesos php-cgi vivos entre peticiones: sin esto, is_dir()
@@ -219,8 +221,9 @@ setTimeout(ping,1500);})();
 
   .tabbar{padding:0 40px;background:var(--card);border-bottom:1px solid var(--line);flex-shrink:0}
   .tabs{display:flex;gap:6px}
-  .tabs a{padding:9px 16px;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px;display:inline-block}
+  .tabs a{padding:9px 16px;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px;border-bottom:2px solid transparent;margin-bottom:-1px;display:inline-flex;align-items:center;gap:7px}
   .tabs a.on{color:var(--ac);border-color:var(--ac)}
+  .tabs a svg{flex-shrink:0}
 
   .content{flex:1;overflow-y:auto;padding:28px 40px 48px}
 
@@ -458,6 +461,9 @@ setTimeout(ping,1500);})();
   .jstate.orange{background:rgba(247,127,0,.16);color:#f77f00}
   a.jstate{text-decoration:none;cursor:pointer;transition:filter .12s}
   a.jstate:hover{filter:brightness(1.2)}
+  button.jstate{border:0;font:inherit;letter-spacing:.3px;transition:filter .12s}
+  button.jstate:hover{filter:brightness(1.2)}
+  button.jstate:disabled{cursor:default;opacity:.75}
 
   .joblog{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;max-height:72px;overflow:auto;color:var(--mut)}
   .progressbar{position:relative;height:8px;border-radius:999px;background:var(--in);border:1px solid var(--line);overflow:hidden;margin-top:8px}
@@ -718,6 +724,9 @@ setTimeout(ping,1500);})();
       <span class="jstate <?= $watcherAlive?'run':'err' ?>"><?= $watcherAlive?'Watcher activo':'Watcher inactivo' ?></span>
       <a class="jstate orange" href="http://<?= e($phpmyadminDom) ?>/" target="_blank" title="Abrir phpMyAdmin">phpMyAdmin &#8599;</a>
     </div>
+    <a class="iconbtn" href="?tab=docs" title="Documentación" aria-label="Documentación">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.5 9a2.5 2.5 0 1 1 4 2c-.5.6-1.5 1-1.5 2.5"/><line x1="12" y1="17" x2="12" y2="17.01"/></svg>
+    </a>
     <?php if ($termOnHdr): ?>
       <button type="button" class="iconbtn gtermbtn" id="gtermToggleBtn" title="Terminal" aria-label="Mostrar/ocultar la terminal">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="6 9 10 12 6 15"/><line x1="12" y1="15" x2="18" y2="15"/></svg>
@@ -776,21 +785,40 @@ setTimeout(ping,1500);})();
 
   <div class="tabbar">
     <div class="tabs">
-      <a href="?tab=proyectos" class="<?= ($tab==='proyectos'||$tab==='proyecto')?'on':'' ?>">Proyectos</a>
-      <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">Versiones PHP</a>
+      <a href="?tab=proyectos" class="<?= ($tab==='proyectos'||$tab==='proyecto')?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        Proyectos</a>
+      <a href="?tab=php" class="<?= $tab==='php'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 6 3 12 8 18"/><polyline points="16 6 21 12 16 18"/></svg>
+        Versiones PHP</a>
       <?php /* SQL Server y Redis no tienen pestana propia: se entra por sus enlaces en
                "Bases de datos", que queda resaltada tambien dentro de esos gestores. */ ?>
-      <a href="?tab=bd" class="<?= in_array($tab,['bd','sqlsrv','redis'],true)?'on':'' ?>">Bases de datos</a>
-      <a href="?tab=procs" class="<?= $tab==='procs'?'on':'' ?>">Procesos</a>
-      <a href="?tab=sysmon" class="<?= $tab==='sysmon'?'on':'' ?>">Recursos</a>
-      <a href="?tab=doctor" class="<?= $tab==='doctor'?'on':'' ?>">Doctor</a>
+      <a href="?tab=bd" class="<?= in_array($tab,['bd','sqlsrv','redis'],true)?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.66 3.58 3 8 3s8-1.34 8-3V5"/><path d="M4 11v6c0 1.66 3.58 3 8 3s8-1.34 8-3v-6"/></svg>
+        Bases de datos</a>
+      <a href="?tab=procs" class="<?= $tab==='procs'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="2 12 6 12 9 20 15 4 18 12 22 12"/></svg>
+        Procesos</a>
+      <a href="?tab=sysmon" class="<?= $tab==='sysmon'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1"/><line x1="9" y1="2" x2="9" y2="6"/><line x1="15" y1="2" x2="15" y2="6"/><line x1="9" y1="18" x2="9" y2="22"/><line x1="15" y1="18" x2="15" y2="22"/><line x1="2" y1="9" x2="6" y2="9"/><line x1="2" y1="15" x2="6" y2="15"/><line x1="18" y1="9" x2="22" y2="9"/><line x1="18" y1="15" x2="22" y2="15"/></svg>
+        Recursos</a>
+      <a href="?tab=doctor" class="<?= $tab==='doctor'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        Doctor</a>
       <?php if (docker_installed()): ?>
-        <a href="?tab=docker" class="<?= $tab==='docker'?'on':'' ?>">Docker</a>
+        <a href="?tab=docker" class="<?= $tab==='docker'?'on':'' ?>">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="10" width="6" height="6" rx="1"/><rect x="10" y="10" width="6" height="6" rx="1"/><rect x="10" y="3" width="6" height="6" rx="1"/><path d="M17 13h2a2 2 0 0 1 2 2c0 3-4 6-9 6s-9-3-9-6"/></svg>
+          Docker</a>
       <?php endif; ?>
-      <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">Logs</a>
-      <a href="?tab=terminal" class="<?= $tab==='terminal'?'on':'' ?>">Terminal</a>
-      <a href="?tab=config" class="<?= $tab==='config'?'on':'' ?>">Configuración del servidor</a>
-      <a href="?tab=docs" class="<?= $tab==='docs'?'on':'' ?>">Documentación</a>
+      <a href="?tab=logs" class="<?= $tab==='logs'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
+        Logs</a>
+      <a href="?tab=terminal" class="<?= $tab==='terminal'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="6 9 10 12 6 15"/><line x1="12" y1="15" x2="18" y2="15"/></svg>
+        Terminal</a>
+      <a href="?tab=config" class="<?= $tab==='config'?'on':'' ?>">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Configuración del servidor</a>
     </div>
   </div>
 

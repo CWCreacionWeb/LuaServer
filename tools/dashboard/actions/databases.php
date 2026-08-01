@@ -2,9 +2,11 @@
     if ($action === 'db_create') {
         $tab = 'bd';
         $db = trim($_POST['dbname'] ?? '');
+        $charset = $_POST['charset'] ?? 'utf8mb4';
         if (!valid_dbname($db)) { $msg='error:Nombre de base de datos no válido (letras, números, _).'; }
+        elseif (!array_key_exists($charset, mysql_charsets())) { $msg='error:Codificación no válida.'; }
         else {
-            try { mysql_pdo()->exec('CREATE DATABASE `'.$db.'` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+            try { mysql_pdo()->exec('CREATE DATABASE `'.$db.'` CHARACTER SET '.$charset);
                   $msg='info:Base de datos "'.$db.'" creada.'; }
             catch (Throwable $e) { $msg='error:No se pudo crear: '.$e->getMessage(); }
         }

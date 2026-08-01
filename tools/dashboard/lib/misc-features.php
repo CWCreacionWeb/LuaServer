@@ -1,4 +1,23 @@
 <?php
+// Convierte segundos a una duracion legible ("17 h 53 min", "2 min", "45 s"...). Como mucho
+// dos unidades (la mayor que quepa + la siguiente), para que "hace X" se lea de un vistazo
+// en vez de un numero de segundos en crudo (p.ej. el latido del watcher en la pestana Doctor).
+function human_duration($seconds){
+    $seconds = max(0, (int)$seconds);
+    $units = [['d', 86400], ['h', 3600], ['min', 60], ['s', 1]];
+    $parts = [];
+    foreach ($units as $u) {
+        [$label, $size] = $u;
+        if ($seconds >= $size) {
+            $n = intdiv($seconds, $size);
+            $parts[] = $n.' '.$label;
+            $seconds -= $n * $size;
+            if (count($parts) === 2) break;
+        }
+    }
+    return $parts ? implode(' ', $parts) : '0 s';
+}
+
 // ---------------- Extensiones PHP de terceros (registro) ----------------
 // Nombres registrados desde el panel (p.ej. "pdo_sqlsrv"); lua.ps1 los fusiona
 // con $WantExts en Set-PhpInis. Solo el nombre: la presencia real del .dll

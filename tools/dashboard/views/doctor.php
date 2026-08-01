@@ -21,9 +21,10 @@
       if ($beatAge >= 0 && $beatAge <= 15) {
           $addChk('Watcher','ok','Watcher activo', 'Latido hace '.$beatAge.'s.');
       } else {
-          $d = $beatAge < 0 ? 'Nunca ha latido (o se limpió tmp\).' : 'Último latido hace '.$beatAge.'s.';
-          $d .= ' Sin watcher no hay jobs, ni HTTPS/hosts, ni supervisor de procesos. Arráncalo con <code>.\lua.ps1 start</code>.';
+          $d = $beatAge < 0 ? 'Nunca ha latido (o se limpió tmp\).' : 'Último latido hace '.human_duration($beatAge).'.';
+          $d .= ' Sin watcher no hay jobs, ni HTTPS/hosts, ni supervisor de procesos.';
           if (startup_enabled($ROOT)) { $d .= ' <b>Ojo</b>: "Arrancar con Windows" está activo — puede haber un watcher de SYSTEM con código antiguo (no late). Reinícialo desde una consola elevada: <code>Stop-ScheduledTask -TaskName lua-server-watcher; Start-ScheduledTask -TaskName lua-server-watcher</code> (trampa nº1 de CLAUDE.md).'; }
+          else { $d .= ' <form method="post" class="inline" style="display:inline;margin-top:6px"><input type="hidden" name="action" value="start_watcher"><button class="btn ghost sm" type="submit">Arrancar watcher</button></form>'; }
           $addChk('Watcher','err','Watcher sin latido', $d);
       }
 

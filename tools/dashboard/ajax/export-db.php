@@ -14,6 +14,20 @@ if (isset($_GET['export_db'])) {
     exit;
 }
 
+// ---------------- Descargar un export de proyecto ya generado: ?export_zip=<archivo> ----------------
+if (isset($_GET['export_zip'])) {
+    $zipName = (string)$_GET['export_zip'];
+    if (!valid_export_file($zipName)) { http_response_code(400); exit('Nombre de export no válido.'); }
+    $zipPath = exports_dir($ROOT).'/'.$zipName;
+    if (!is_file($zipPath)) { http_response_code(404); exit('Ese export ya no existe.'); }
+    header('Content-Type: application/zip');
+    header('Content-Length: '.filesize($zipPath));
+    header('Content-Disposition: attachment; filename="'.$zipName.'"');
+    while (ob_get_level()) { ob_end_clean(); }
+    readfile($zipPath);
+    exit;
+}
+
 // ---------------- Exportar base de datos PostgreSQL: ?export_pg=<nombre> ----------------
 if (isset($_GET['export_pg'])) {
     $db = (string)$_GET['export_pg'];

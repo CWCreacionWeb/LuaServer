@@ -86,3 +86,39 @@ function php_versions($base){
     $v=[]; if(is_dir($base)){ foreach(scandir($base) as $d){ if($d[0]==='.')continue; if(is_file("$base/$d/php-cgi.exe")) $v[]=$d; } } natsort($v); return array_values($v);
 }
 
+// Todas las extensiones que trae la instalacion de PHP para una version (bundladas de fabrica
+// + las que el panel ha ido añadiendo a mano en config/php/extra-extensions.json), leyendo
+// literalmente los .dll presentes en bin\php\<ver>\ext\ -- no una lista fija en PHP, para no
+// tener que mantenerla en dos sitios a la vez que $WantExts (lua.ps1).
+function php_ext_scan($base, $ver){
+    $dir = "$base/$ver/ext";
+    $names = [];
+    if (is_dir($dir)) {
+        foreach (scandir($dir) as $f) {
+            if (preg_match('/^php_(.+)\.dll$/i', $f, $m)) $names[] = strtolower($m[1]);
+        }
+    }
+    sort($names);
+    return $names;
+}
+
+// Extensiones realmente activas ahora mismo para una version: se lee el php.ini generado (no
+// $WantExts/extra_extensions en PHP, para no duplicar esa logica) buscando las lineas
+// "extension=..."/"zend_extension=..." SIN comentar que deja Set-PhpInis al final del archivo.
+// Devuelve un array asociativo (nombre => true) para lookup O(1) con isset().
+function php_ext_enabled($base, $ver){
+    $ini = "$base/$ver/php.ini";
+    $enabled = [];
+    $txt = @file_get_contents($ini);
+    if ($txt === false) return $enabled;
+    if (preg_match_all('/^\s*(?:zend_extension|extension)\s*=\s*("?)([^\r\n;"]+)\1/mi', $txt, $ms)) {
+        foreach ($ms[2] as $raw) {
+            $n = strtolower(trim($raw));
+            // Estilo antiguo (PHP < 7.2): "php_curl.dll" en vez de "curl".
+            if (preg_match('/^php_(.+)\.dll$/i', $n, $m2)) $n = strtolower($m2[1]);
+            $enabled[$n] = true;
+        }
+    }
+    return $enabled;
+}
+

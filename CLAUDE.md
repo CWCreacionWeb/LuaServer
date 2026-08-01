@@ -685,6 +685,20 @@ si lo lanza el watcher como SYSTEM.
   claro igual que `mysql_root.pass`). **La edición se desactiva sola** en vistas y en tablas
   sin clave primaria: sin PK no hay `WHERE` que identifique una sola fila. Ver la trampa nº6
   sobre codificación: es lo más delicado de toda la pestaña.
+- **Exportar proyecto** (ficha de proyecto) — genera un `.zip` en `data\exports\` con la
+  carpeta del proyecto y, opcionalmente, el volcado `.sql` de una base de datos (MySQL o
+  PostgreSQL) dentro del mismo archivo. Lo hace el **watcher** (job `export_project`), no el
+  panel: comprimir miles de archivos y volcar la BD se sale del tiempo de una petición bajo
+  mod_fcgid, y lanzar `mariadb-dump.exe` desde PHP es justo lo que desaconseja la trampa nº5.
+  Detalles que costaron un intento: `Add-Type -AssemblyName System.IO.Compression.FileSystem`
+  trae `ZipFile`/`ZipFileExtensions` pero **no** `ZipArchiveMode` (ese está en
+  `System.IO.Compression` a secas, hay que cargar las dos); y el dump se pide con
+  `--result-file`, nunca con `> archivo`, porque la redirección de PowerShell escribe el `.sql`
+  en UTF-16 y además cuela dentro las líneas de stderr. Cada archivo se añade al zip dentro de
+  su propio `try` (en Windows es normal toparse con rutas de más de 260 caracteres o archivos
+  abiertos por otro proceso: se anotan como `OMITIDO` en el log y el export sigue). Los
+  exclusos son por subcadena de la ruta relativa, igual que en "Desplegar por FTP".
+
 - **Actualización de la plataforma** — la versión sale junto al título del panel (etiqueta de
   git si existe, si no `r<nº commits> <sha>`), y se vuelve ámbar cuando hay novedades. El
   **watcher** hace `git fetch` cada X horas (`config\update.json`, fuera de git) y deja el

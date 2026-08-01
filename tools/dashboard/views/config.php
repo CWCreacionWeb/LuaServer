@@ -118,7 +118,7 @@
         </button>
         <div class="cfg3-body">
           <div class="cardsave-title" style="font-weight:600;margin-bottom:4px">Dominio local</div>
-          <div class="muted" style="margin-bottom:12px">Tus proyectos se sirven en <code>&lt;nombre&gt;.<?= e($tld) ?></code>. Recomendado <code>test</code> (reservado para pruebas). Evita <code>dev</code> (Chrome fuerza HTTPS) y <code>local</code> (lo usa mDNS de Windows).</div>
+          <div class="muted" style="margin-bottom:12px">Tus proyectos se sirven en <code>&lt;nombre&gt;.<?= e($tld) ?></code>. Alternativa reservada oficialmente para pruebas: <code>test</code>. Evita <code>dev</code> (Chrome fuerza HTTPS). <code>local</code> lo usa mDNS de Windows (resolución algo menos fiable), pero funciona.</div>
           <form method="post" id="tldForm">
             <input type="hidden" name="action" value="set_tld">
             <label>Dominio (TLD)</label>

@@ -37,6 +37,22 @@
         exit;
     }
 
+    if ($action === 'start_watcher') {
+        // A diferencia de restart/shutdown, aqui Apache no se toca: 'lua.ps1 start' es
+        // idempotente (Start-Watcher mira Watcher-Alive antes de lanzar nada, y el resto de
+        // motores solo arrancan si su flag ya estaba puesto), asi que esta peticion sobrevive
+        // normal -- no hace falta la pagina de "reiniciando" con retraso de restart/shutdown.
+        $tab = 'doctor';
+        $luaWin = str_replace('/', '\\', $ROOT).'\\lua.ps1';
+        $cmdf = $ROOT.'/tmp/_startwatcher.cmd';
+        @mkdir($ROOT.'/tmp', 0777, true);
+        $wr  = "@echo off\r\n";
+        $wr .= "powershell -NoProfile -ExecutionPolicy Bypass -File \"".$luaWin."\" start\r\n";
+        @file_put_contents($cmdf, $wr);
+        try { $sh = new COM('WScript.Shell'); $sh->Run('cmd /c "'.str_replace('/', '\\', $cmdf).'"', 0, false); } catch (Throwable $e) {}
+        $msg = 'info:Arrancando el watcher… la página se recargará sola en unos segundos.';
+    }
+
     if ($action === 'restart') {
         // Reiniciar Apache. El proceso PHP muere al reiniciar; lo lanzamos desatendido
         // y devolvemos una página que se recarga sola cuando Apache vuelve.

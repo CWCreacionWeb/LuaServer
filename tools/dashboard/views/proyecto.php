@@ -229,6 +229,76 @@
       </div>
       </div>
 
+      <?php
+        $pExports = exports_list($ROOT, $pName);
+        $pExportJobs = array_values(array_filter($jobs, function($j) use ($pName){ return ($j['type']??'')==='export_project' && ($j['name']??'')===$pName; }));
+        $pExportJob = $pExportJobs[0] ?? null;
+        // La BD anotada en sites.json (la que creo la plataforma con el proyecto) se preselecciona;
+        // el resto del desplegable deja elegir cualquier otra, o ninguna.
+        $pSiteDb = is_array($pInfo) ? (string)($pInfo['db'] ?? '') : '';
+        $pMyDbs = mysql_databases() ?: [];
+        $pPgDbs = pgsrv_databases() ?: [];
+        // Sin anotacion en sites.json (proyectos integrados a mano) se preselecciona la BD que
+        // se llama igual que el proyecto. Aqui adivinar por nombre es inofensivo -- es solo el
+        // valor por defecto de un desplegable que el usuario ve y puede cambiar -- al contrario
+        // que al ELIMINAR un proyecto, donde solo se toca la BD anotada (ver action 'delete').
+        if ($pSiteDb === '' && in_array($pName, $pMyDbs, true)) { $pSiteDb = $pName; }
+      ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:10px">Exportar proyecto</div>
+        <form method="post" class="inline">
+          <input type="hidden" name="action" value="export_project">
+          <input type="hidden" name="name" value="<?= e($pName) ?>">
+          <div style="flex:1;min-width:240px">
+            <label>Excluir (coincide con parte de la ruta)</label>
+            <input name="exclude" value=".git, node_modules, .idea" style="width:100%">
+          </div>
+          <div>
+            <label>Base de datos a incluir</label>
+            <select name="db" style="min-width:220px">
+              <option value="">Ninguna (solo archivos)</option>
+              <?php if ($pMyDbs): ?>
+                <optgroup label="MySQL / MariaDB">
+                  <?php foreach ($pMyDbs as $d): ?>
+                    <option value="mysql:<?= e($d) ?>" <?= $d===$pSiteDb?'selected':'' ?>><?= e($d) ?><?= $d===$pSiteDb?' (la de este proyecto)':'' ?></option>
+                  <?php endforeach; ?>
+                </optgroup>
+              <?php endif; ?>
+              <?php if ($pPgDbs): ?>
+                <optgroup label="PostgreSQL">
+                  <?php foreach ($pPgDbs as $d): ?>
+                    <option value="pgsql:<?= e($d) ?>"><?= e($d) ?></option>
+                  <?php endforeach; ?>
+                </optgroup>
+              <?php endif; ?>
+            </select>
+          </div>
+          <button class="btn" type="submit" data-loading-text="Exportando…">Exportar</button>
+        </form>
+        <div class="muted" style="margin-top:10px;font-size:12px">Genera un <code>.zip</code> en <code>data\exports\</code> con la carpeta del proyecto y, si eliges una, el volcado <code>.sql</code> de su base de datos dentro. Lo hace el watcher en segundo plano.</div>
+        <?php if ($pExportJob): ?>
+          <?= render_import_job_card($ROOT, $pExportJob) ?>
+        <?php endif; ?>
+        <?php if ($pExports): ?>
+          <div style="margin-top:14px">
+            <?php foreach ($pExports as $ex): ?>
+              <div class="row" style="gap:10px;padding:6px 0;border-bottom:1px solid var(--line)">
+                <code style="font-size:12px"><?= e($ex['file']) ?></code>
+                <span class="muted" style="font-size:12px"><?= e(export_size_human($ex['size'])) ?> &middot; <?= e(date('d/m/Y H:i', $ex['time'])) ?></span>
+                <div class="spacer"></div>
+                <a class="btn ghost sm" href="?export_zip=<?= e(rawurlencode($ex['file'])) ?>">Descargar</a>
+                <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar el export <?= e($ex['file']) ?>?')">
+                  <input type="hidden" name="action" value="export_delete">
+                  <input type="hidden" name="name" value="<?= e($pName) ?>">
+                  <input type="hidden" name="file" value="<?= e($ex['file']) ?>">
+                  <button type="submit" class="btn danger sm">Eliminar</button>
+                </form>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        <?php endif; ?>
+      </div>
+
       <?php $pTermOn = term_enabled($ROOT); ?>
       <?php if ($pTermOn && is_dir($pDir)): ?>
         <div class="card">

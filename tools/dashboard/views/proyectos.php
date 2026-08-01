@@ -258,10 +258,11 @@
     </details>
     <?php endif; ?>
 
+    <?php $sitesUnpinned = array_filter($sitesView, function($i){ return !(is_array($i) && !empty($i['pinned'])); }); ?>
     <?php $sitesSinTipo = 0; foreach ($sitesView as $sInfo) { if (is_array($sInfo) && empty($sInfo['type']) && empty($sInfo['typeChecked'])) $sitesSinTipo++; } ?>
     <?php $sitesFaltantes = missing_projects($WWW, $sitesView); ?>
     <details class="sectioncollapse" id="secProyectos" open>
-      <summary>Proyectos <span class="op">(<?= count($sitesView) ?>)</span>
+      <summary>Proyectos <span class="op">(<?= count($sitesUnpinned) ?>)</span>
         <?php if ($sitesSinTipo > 0): ?>
         <form method="post" title="Detecta el framework (PHP, JavaScript o Python) de los proyectos ya registrados">
           <input type="hidden" name="action" value="detect_types">
@@ -284,11 +285,11 @@
         <span class="arrow"></span>
       </summary>
       <div class="pane">
-    <?php if (!$sitesView): ?>
-      <div class="card muted">Aún no hay proyectos. Crea el primero arriba.</div>
+    <?php if (!$sitesUnpinned): ?>
+      <div class="card muted"><?= $sitesPinned ? 'El resto de proyectos está destacado arriba.' : 'Aún no hay proyectos. Crea el primero arriba.' ?></div>
     <?php else: ?>
       <div class="sitegrid">
-        <?php foreach ($sitesView as $name => $info): render_site_card($name, $info); endforeach; ?>
+        <?php foreach ($sitesUnpinned as $name => $info): render_site_card($name, $info); endforeach; ?>
       </div>
     <?php endif; ?>
       </div>
