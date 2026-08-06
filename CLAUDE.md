@@ -159,6 +159,61 @@ depender de la cuenta ni de cuántos haya. `Cmd-Stop` borra el latido para
 que el badge se apague al instante. Se conserva la comprobación del PID
 como respaldo, solo para watchers anteriores al latido.
 
+### Y la detección de motores "por ruta del binario" mentía por lo mismo
+
+Corregido el 2026-08-06. Tercera víctima del mismo origen, ahora en
+`Get-LuaProcess` (`lua.ps1`), que identificaba nuestras instancias filtrando
+por `$_.Path`:
+
+```powershell
+$exe = $null; try { $exe = $_.Path } catch {}
+$exe -and $exe.StartsWith($dirN, ...)
+```
+
+**`$_.Path` vale `$null` para un proceso de otra cuenta** — y ni siquiera
+lanza, así que el `try{}catch{}` no se entera: la `ScriptProperty` de
+PowerShell se traga el acceso denegado y devuelve nada. Vienen igual de
+vacíos `MainModule.FileName` y el `ExecutablePath`/`CommandLine` de
+`Win32_Process` (con `GetOwner` devolviendo `ReturnValue=2`). Con "Arrancar
+con Windows" los motores los lanza el watcher como SYSTEM, o sea que son
+exactamente ese caso, y el comentario original ("quedan excluidos, que es
+justo lo deseado") era **falso**: se estaba excluyendo un proceso propio.
+
+Lo confuso es que **depende de quién pregunta**: el watcher de SYSTEM sí lee
+la ruta del mysqld que él mismo lanzó, pero la consola del usuario no. De ahí
+el síntoma imposible de `.\lua.ps1 status` diciendo "MySQL (MariaDB):
+apagado" con la BD sirviendo consultas. Y cuando el que no puede leerla es el
+watcher, es peor: relanza otro `mysqld` cada 30s contra el mismo datadir, que
+aborta solo con `InnoDB: The data file './ibdata1' must be writable`
+(6422 de esos errores, a 30s exactos, entre el 2026-07-27 y el 2026-07-30).
+Además dejaba `Stop-MariaDb` en un no-op silencioso y hacía que
+`New-ProjectDb` se saltara la creación de la BD del proyecto.
+
+**Arreglo:** `MariaDb-Up` pasa por `Get-MariaDbProcess`, que prueba la ruta y,
+si no, **el `.pid` que mysqld escribe dentro de nuestro datadir** (por defecto
+`<datadir>\<hostname>.pid`, no hay que configurar nada). Quien escribió ese
+archivo está usando NUESTRO datadir, así que es nuestro por definición, y
+leerlo no necesita permisos sobre el proceso — mismo criterio que
+`Postgres-Up`/`MongoDb-Up`/`Redis-Up`. Se recorren todos los `*.pid` (el
+nombre depende del hostname) validando que el PID siga vivo y siga siendo un
+`mysqld`.
+
+Dos cosas que hay que respetar si se toca esto:
+
+- **El puerto NO se consulta en `*-Up`.** `Get-NetTCPConnection` cuesta
+  **~1-4s** en esta máquina (medido) y el watcher llama a `MariaDb-Up` hasta
+  3 veces por vuelta, cada segundo. Esa comprobación vive en `Start-MariaDb`,
+  detrás del backoff de 30s: si algo ya escucha, no lanza un mysqld condenado.
+- **Solo cuenta el listener de `127.0.0.1`.** En el 3306 de esta máquina hay
+  tres a la vez (`::` de Docker, `::1` de wslrelay, `127.0.0.1` del mysqld
+  nativo) y para `127.0.0.1` gana el bind más específico, así que los de
+  Docker no ocupan el puerto ni deben colar como falso positivo.
+
+**Pendiente, mismo bug:** `Mailpit-Up`/`Stop-Mailpit` siguen usando
+`Get-LuaProcess` a secas y el mailpit de esta máquina ya tiene la ruta
+ilegible. Mailpit no escribe pidfile, así que su arreglo no es simétrico
+(haría falta un `.pid` propio al lanzarlo, como mongo-express).
+
 ## ⚠️ Trampa nº2: `localhost` no es fiable en esta máquina
 
 Docker Desktop (`com.docker.backend`/`wslrelay`) ocupa el puerto 80 en
@@ -429,6 +484,56 @@ invocación de git sobre `$Root`, sin tocar ninguna config global: `$GitSafeDir`
 llamadas usan `& git -c $GitSafeDir -C "$Root" ...` en vez de `& git -C "$Root" ...`.
 Así funciona sin setup extra tanto si `lua.ps1` lo lanza el usuario interactivo como
 si lo lanza el watcher como SYSTEM.
+
+## ⚠️ Trampa nº9: un comodín `*.<tld>` NO vale como certificado (HTTPS nunca funcionó)
+
+Corregido el 2026-08-06. `Cmd-HttpsSetup` emitía **un solo certificado comodín**:
+
+```powershell
+& $Mkcert -cert-file ... "*.$tld" "$tld" "localhost" "127.0.0.1" "::1"
+```
+
+Eso no cubría **ningún** proyecto. Dos reglas del validador, y la primera es la que
+hacía daño de verdad:
+
+1. **Un comodín exige al menos DOS etiquetas a su derecha.** `*.local` y `*.test` son
+   comodines sobre un TLD entero, y Schannel/CryptoAPI (el validador de Windows, que usan
+   el navegador, `curl` y .NET) **los rechaza de plano**. O sea que fallaba hasta
+   `alergenator.local`, el caso "fácil" para el que estaba pensado el comodín.
+2. **Un comodín casa UNA sola etiqueta.** Aun sin la regla anterior, `*.local` no cubre
+   `app.ersm.local` ni `ueb_buceo.lua.local`, y no cubre nada de otro TLD como
+   `portal.ersm.test`. Tampoco las variantes `www.<dominio>` que el vhost :80 y el `hosts`
+   sí declaran.
+
+Medido con un servidor TLS local (sin Apache ni antivirus de por medio, para aislar): con
+el certificado viejo **los 7 proyectos daban `RemoteCertificateNameMismatch`** y solo
+validaba `localhost` (que estaba como nombre explícito). Con los nombres explícitos, los 7
+validan. El panel decía "candado verde" desde el primer día y nunca lo hubo.
+
+**Arreglo:** `Get-SslNames` construye la lista a partir de los dominios **reales** de
+`sites.json` (cada `Get-SiteDomain` + su `www.`) más los del panel, y `Update-SslCert`
+reemite el certificado si esa lista ya no casa con `data\ssl\names.txt`. Se llama desde
+`Cmd-Apply`, así que un proyecto nuevo o un dominio editado entran solos — antes el
+certificado se emitía **solo** al activar HTTPS y cualquier proyecto posterior se quedaba
+fuera para siempre. Emitir una hoja **no necesita admin** (solo lo necesita
+`mkcert -install`, que toca el almacén de confianza), por eso puede hacerlo el watcher sin
+UAC. Se emite a `.new` y se mueve encima solo si mkcert va bien, para que un fallo no deje
+al servidor sin certificado.
+
+Dos cosas que hay que respetar si se vuelve a tocar esto:
+
+- **`CAROOT` hay que fijarlo a mano.** mkcert guarda su CA en `%LOCALAPPDATA%\mkcert`, que
+  es **una ruta distinta por cuenta**: el watcher como SYSTEM no ve la del usuario y mkcert
+  se inventaría una CA nueva **en silencio** — y esa nadie la ha instalado en el almacén, o
+  sea certificados rechazados por CA desconocida (peor que el aviso original). `Use-MkcertCaRoot`
+  fija `CAROOT` a `data\ssl\ca` (igual para todas las cuentas) y migra la del usuario la
+  primera vez para no volver a pedir UAC. Y `Update-SslCert` **se niega a emitir** si ahí no
+  hay CA, en vez de dejar que mkcert cree una.
+- **Al medir, espera a que Apache acabe de reiniciar.** ESET hace MITM del HTTPS local
+  (trampa nº7) y re-firma la hoja preservando los SAN; si mides justo durante el reinicio,
+  su filtro devuelve un momento la hoja re-firmada **anterior** y salen
+  `RemoteCertificateChainErrors`/`NameMismatch` falsos. Un par de segundos después sale
+  `None`. Casi se dio por regresión un cambio que estaba bien.
 
 ## Gotchas de PowerShell
 

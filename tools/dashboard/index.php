@@ -63,6 +63,8 @@ require_once __DIR__.'/lib/misc-features.php';
 require_once __DIR__.'/lib/logs.php';
 require_once __DIR__.'/lib/jobs.php';
 require_once __DIR__.'/lib/exports.php';
+require_once __DIR__.'/lib/env-editor.php';
+require_once __DIR__.'/lib/wordpress.php';
 
 
 // ---------------- Endpoints AJAX y GET crudos (tools/dashboard/ajax/) ----------------
@@ -90,6 +92,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     include __DIR__.'/actions/projects.php';
     include __DIR__.'/actions/git-ftp.php';
     include __DIR__.'/actions/exports.php';
+    include __DIR__.'/actions/env.php';
+    include __DIR__.'/actions/wordpress.php';
     include __DIR__.'/actions/branding-and-cards.php';
     include __DIR__.'/actions/php-and-config.php';
     include __DIR__.'/actions/services.php';

@@ -22,12 +22,27 @@
         $pHasComposer = is_file($pDir.'/composer.json');
         $pHasNpm = is_file($pDir.'/package.json');
         $pHasArtisan = is_file($pDir.'/artisan');
+        $pWpRoot = wp_root_dir($pDir);
         $termOn = is_file($ROOT.'/config/terminal.on');
         $pGit = is_dir($pDir) ? git_info($pDir) : null;
         $pErrLog = tail_file($ROOT.'/logs/apache/'.$pName.'-error.log', 200);
         $pType = is_array($pInfo) ? ($pInfo['type'] ?? null) : null;
-        $pTypeLabel = project_type_label($pType); ?>
+        $pTypeLabel = project_type_label($pType);
+        $pExports = exports_list($ROOT, $pName);
+        $pExportJobs = array_values(array_filter($jobs, function($j) use ($pName){ return ($j['type']??'')==='export_project' && ($j['name']??'')===$pName; }));
+        $pExportJob = $pExportJobs[0] ?? null;
+        // La BD anotada en sites.json (la que creo la plataforma con el proyecto) se preselecciona;
+        // el resto del desplegable deja elegir cualquier otra, o ninguna.
+        $pSiteDb = is_array($pInfo) ? (string)($pInfo['db'] ?? '') : '';
+        $pMyDbs = mysql_databases() ?: [];
+        $pPgDbs = pgsrv_databases() ?: [];
+        // Sin anotacion en sites.json (proyectos integrados a mano) se preselecciona la BD que
+        // se llama igual que el proyecto. Aqui adivinar por nombre es inofensivo -- es solo el
+        // valor por defecto de un desplegable que el usuario ve y puede cambiar -- al contrario
+        // que al ELIMINAR un proyecto, donde solo se toca la BD anotada (ver action 'delete').
+        if ($pSiteDb === '' && in_array($pName, $pMyDbs, true)) { $pSiteDb = $pName; } ?>
 
+      <div class="pgrid2">
       <div class="card row" style="align-items:flex-start;flex-wrap:wrap;gap:16px">
         <?php if ($pCoverFile): ?>
           <div style="width:110px;height:74px;border-radius:6px;flex:0 0 auto;background-size:cover;background-position:center;background-image:url('?cover=<?= e(rawurlencode($pName)) ?>&t=<?= filemtime($pCoverFile) ?>')"></div>
@@ -60,6 +75,62 @@
             <?php if ($pGit): ?><span class="tag">git &middot; <?= e($pGit['branch']) ?></span><?php endif; ?>
           </div>
         </div>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:10px">Exportar proyecto</div>
+        <form method="post" class="inline">
+          <input type="hidden" name="action" value="export_project">
+          <input type="hidden" name="name" value="<?= e($pName) ?>">
+          <div style="flex:1;min-width:240px">
+            <label>Excluir (coincide con parte de la ruta)</label>
+            <input name="exclude" value=".git, node_modules, .idea" style="width:100%">
+          </div>
+          <div>
+            <label>Base de datos a incluir</label>
+            <select name="db" style="min-width:220px">
+              <option value="">Ninguna (solo archivos)</option>
+              <?php if ($pMyDbs): ?>
+                <optgroup label="MySQL / MariaDB">
+                  <?php foreach ($pMyDbs as $d): ?>
+                    <option value="mysql:<?= e($d) ?>" <?= $d===$pSiteDb?'selected':'' ?>><?= e($d) ?><?= $d===$pSiteDb?' (la de este proyecto)':'' ?></option>
+                  <?php endforeach; ?>
+                </optgroup>
+              <?php endif; ?>
+              <?php if ($pPgDbs): ?>
+                <optgroup label="PostgreSQL">
+                  <?php foreach ($pPgDbs as $d): ?>
+                    <option value="pgsql:<?= e($d) ?>"><?= e($d) ?></option>
+                  <?php endforeach; ?>
+                </optgroup>
+              <?php endif; ?>
+            </select>
+          </div>
+          <button class="btn" type="submit" data-loading-text="Exportando…">Exportar</button>
+        </form>
+        <div class="muted" style="margin-top:10px;font-size:12px">Genera un <code>.zip</code> en <code>data\exports\</code> con la carpeta del proyecto y, si eliges una, el volcado <code>.sql</code> de su base de datos dentro. Lo hace el watcher en segundo plano.</div>
+        <?php if ($pExportJob): ?>
+          <?= render_import_job_card($ROOT, $pExportJob) ?>
+        <?php endif; ?>
+        <?php if ($pExports): ?>
+          <div style="margin-top:14px">
+            <?php foreach ($pExports as $ex): ?>
+              <div class="row" style="gap:10px;padding:6px 0;border-bottom:1px solid var(--line)">
+                <code style="font-size:12px"><?= e($ex['file']) ?></code>
+                <span class="muted" style="font-size:12px"><?= e(export_size_human($ex['size'])) ?> &middot; <?= e(date('d/m/Y H:i', $ex['time'])) ?></span>
+                <div class="spacer"></div>
+                <a class="btn ghost sm" href="?export_zip=<?= e(rawurlencode($ex['file'])) ?>">Descargar</a>
+                <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar el export <?= e($ex['file']) ?>?')">
+                  <input type="hidden" name="action" value="export_delete">
+                  <input type="hidden" name="name" value="<?= e($pName) ?>">
+                  <input type="hidden" name="file" value="<?= e($ex['file']) ?>">
+                  <button type="submit" class="btn danger sm">Eliminar</button>
+                </form>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        <?php endif; ?>
+      </div>
       </div>
 
       <div class="pgrid2">
@@ -229,88 +300,129 @@
       </div>
       </div>
 
-      <?php
-        $pExports = exports_list($ROOT, $pName);
-        $pExportJobs = array_values(array_filter($jobs, function($j) use ($pName){ return ($j['type']??'')==='export_project' && ($j['name']??'')===$pName; }));
-        $pExportJob = $pExportJobs[0] ?? null;
-        // La BD anotada en sites.json (la que creo la plataforma con el proyecto) se preselecciona;
-        // el resto del desplegable deja elegir cualquier otra, o ninguna.
-        $pSiteDb = is_array($pInfo) ? (string)($pInfo['db'] ?? '') : '';
-        $pMyDbs = mysql_databases() ?: [];
-        $pPgDbs = pgsrv_databases() ?: [];
-        // Sin anotacion en sites.json (proyectos integrados a mano) se preselecciona la BD que
-        // se llama igual que el proyecto. Aqui adivinar por nombre es inofensivo -- es solo el
-        // valor por defecto de un desplegable que el usuario ve y puede cambiar -- al contrario
-        // que al ELIMINAR un proyecto, donde solo se toca la BD anotada (ver action 'delete').
-        if ($pSiteDb === '' && in_array($pName, $pMyDbs, true)) { $pSiteDb = $pName; }
+      <div class="pgrid2">
+      <?php if ($pHasArtisan):
+        $pEnvData = env_read_lines($pDir);
+        $pEnvExample = is_file(env_example_path($pDir));
       ?>
       <div class="card">
-        <div style="font-weight:600;margin-bottom:10px">Exportar proyecto</div>
-        <form method="post" class="inline">
-          <input type="hidden" name="action" value="export_project">
-          <input type="hidden" name="name" value="<?= e($pName) ?>">
-          <div style="flex:1;min-width:240px">
-            <label>Excluir (coincide con parte de la ruta)</label>
-            <input name="exclude" value=".git, node_modules, .idea" style="width:100%">
-          </div>
-          <div>
-            <label>Base de datos a incluir</label>
-            <select name="db" style="min-width:220px">
-              <option value="">Ninguna (solo archivos)</option>
-              <?php if ($pMyDbs): ?>
-                <optgroup label="MySQL / MariaDB">
-                  <?php foreach ($pMyDbs as $d): ?>
-                    <option value="mysql:<?= e($d) ?>" <?= $d===$pSiteDb?'selected':'' ?>><?= e($d) ?><?= $d===$pSiteDb?' (la de este proyecto)':'' ?></option>
-                  <?php endforeach; ?>
-                </optgroup>
+        <div class="row" style="margin-bottom:10px">
+          <div style="font-weight:600">Variables de entorno (.env)</div>
+          <?php if ($pEnvData): ?><span class="muted" style="font-size:12px"><?= count(env_parse_rows($pEnvData['lines'])) ?> variables</span><?php endif; ?>
+        </div>
+        <?php if (!$pEnvData && !$pEnvExample): ?>
+          <div class="muted">Este proyecto no tiene <code>.env</code> ni <code>.env.example</code>.</div>
+        <?php elseif (!$pEnvData): ?>
+          <div class="muted" style="margin-bottom:10px">No hay <code>.env</code> todavía, pero sí <code>.env.example</code>.</div>
+          <form method="post">
+            <input type="hidden" name="action" value="env_from_example">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+            <button class="btn" type="submit">Crear .env desde .env.example</button>
+          </form>
+        <?php else: ?>
+          <!-- Las filas KEY=VALOR viven fuera de <form id=envSaveForm> (no se pueden anidar
+               formularios): cada input de valor se asocia al form por id via el atributo
+               form=, y el mini-form de borrado de cada fila convive como hermano suyo. -->
+          <form method="post" id="envSaveForm">
+            <input type="hidden" name="action" value="env_save">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+          </form>
+          <div style="display:flex;flex-direction:column;gap:3px;max-height:50vh;overflow:auto;margin-bottom:14px">
+            <?php foreach ($pEnvData['lines'] as $i => $line):
+              $m = env_match_kv($line); ?>
+              <?php if ($m): ?>
+                <div class="row" style="gap:8px;flex-wrap:nowrap">
+                  <label style="min-width:220px;max-width:220px;margin:0;font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= e($m['key']) ?>"><?= e($m['key']) ?></label>
+                  <input form="envSaveForm" name="val[<?= (int)$i ?>]" value="<?= e($m['value']) ?>" style="flex:1;font-family:ui-monospace,Consolas,monospace;font-size:12.5px">
+                  <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar <?= e($m['key']) ?> de .env?')">
+                    <input type="hidden" name="action" value="env_delete">
+                    <input type="hidden" name="name" value="<?= e($pName) ?>">
+                    <input type="hidden" name="line" value="<?= (int)$i ?>">
+                    <button type="submit" class="trashbtn" title="Eliminar variable" aria-label="Eliminar variable">
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                    </button>
+                  </form>
+                </div>
+              <?php elseif (trim($line) === ''): ?>
+                <div style="height:6px"></div>
+              <?php else: ?>
+                <div class="muted" style="font-family:ui-monospace,Consolas,monospace;font-size:11.5px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= e($line) ?></div>
               <?php endif; ?>
-              <?php if ($pPgDbs): ?>
-                <optgroup label="PostgreSQL">
-                  <?php foreach ($pPgDbs as $d): ?>
-                    <option value="pgsql:<?= e($d) ?>"><?= e($d) ?></option>
-                  <?php endforeach; ?>
-                </optgroup>
-              <?php endif; ?>
-            </select>
-          </div>
-          <button class="btn" type="submit" data-loading-text="Exportando…">Exportar</button>
-        </form>
-        <div class="muted" style="margin-top:10px;font-size:12px">Genera un <code>.zip</code> en <code>data\exports\</code> con la carpeta del proyecto y, si eliges una, el volcado <code>.sql</code> de su base de datos dentro. Lo hace el watcher en segundo plano.</div>
-        <?php if ($pExportJob): ?>
-          <?= render_import_job_card($ROOT, $pExportJob) ?>
-        <?php endif; ?>
-        <?php if ($pExports): ?>
-          <div style="margin-top:14px">
-            <?php foreach ($pExports as $ex): ?>
-              <div class="row" style="gap:10px;padding:6px 0;border-bottom:1px solid var(--line)">
-                <code style="font-size:12px"><?= e($ex['file']) ?></code>
-                <span class="muted" style="font-size:12px"><?= e(export_size_human($ex['size'])) ?> &middot; <?= e(date('d/m/Y H:i', $ex['time'])) ?></span>
-                <div class="spacer"></div>
-                <a class="btn ghost sm" href="?export_zip=<?= e(rawurlencode($ex['file'])) ?>">Descargar</a>
-                <form method="post" style="margin:0" onsubmit="return confirm('¿Eliminar el export <?= e($ex['file']) ?>?')">
-                  <input type="hidden" name="action" value="export_delete">
-                  <input type="hidden" name="name" value="<?= e($pName) ?>">
-                  <input type="hidden" name="file" value="<?= e($ex['file']) ?>">
-                  <button type="submit" class="btn danger sm">Eliminar</button>
-                </form>
-              </div>
             <?php endforeach; ?>
           </div>
+          <button class="btn" type="submit" form="envSaveForm">Guardar cambios</button>
+          <form method="post" class="row" style="gap:8px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)">
+            <input type="hidden" name="action" value="env_add">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+            <div style="flex:0 0 220px"><label>Nueva variable</label><input name="key" placeholder="NUEVA_VARIABLE" pattern="[A-Za-z_][A-Za-z0-9_]*" style="width:100%;font-family:ui-monospace,Consolas,monospace" required></div>
+            <div style="flex:1"><label>Valor</label><input name="value" placeholder="valor" style="width:100%;font-family:ui-monospace,Consolas,monospace"></div>
+            <button class="btn ghost sm" type="submit" style="margin-top:22px">Añadir variable</button>
+          </form>
+          <div class="muted" style="margin-top:10px;font-size:12px">Edita <code>.env</code> directamente en disco. Si la configuración de Laravel está cacheada (<code>artisan config:cache</code>), regénerala para que estos cambios surtan efecto.</div>
         <?php endif; ?>
       </div>
 
-      <?php $pTermOn = term_enabled($ROOT); ?>
+      <?php elseif ($pWpRoot !== null):
+        $pWpCfgFile = wp_config_file($pWpRoot);
+        $pWpHasConfig = is_file($pWpCfgFile);
+        $pWpContent = $pWpHasConfig ? (string)@file_get_contents($pWpCfgFile) : '';
+        $pWpLog = tail_file(wp_debug_log_path($pWpRoot), 200);
+      ?>
+      <div class="card">
+        <div style="font-weight:600;margin-bottom:10px">WordPress</div>
+        <?php if (!$pWpHasConfig): ?>
+          <div class="muted">No se encontró <code>wp-config.php</code> en este proyecto (solo hay <code>wp-config-sample.php</code>: complétalo a mano con los datos de la base de datos para poder gestionar estas opciones).</div>
+        <?php else: ?>
+          <div class="muted" style="margin-bottom:8px;font-size:12px">Depuración (constantes de <code>wp-config.php</code>) &middot; clic para activar/desactivar</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px">
+            <?php foreach (wp_debug_constants() as $k=>$label):
+              $val = wp_config_get_bool($pWpContent, $k);
+              $custom = !is_bool($val) && $val !== null;
+              $on = $val === true; ?>
+              <?php if ($custom): ?>
+                <span class="jstate warn" title="<?= e($label) ?> — valor personalizado en wp-config.php (<?= e($val) ?>): no se toca desde aquí"><?= e($k) ?>: personalizado</span>
+              <?php else: ?>
+                <form method="post" style="display:inline">
+                  <input type="hidden" name="action" value="wp_debug_toggle">
+                  <input type="hidden" name="name" value="<?= e($pName) ?>">
+                  <input type="hidden" name="key" value="<?= e($k) ?>">
+                  <input type="hidden" name="enable" value="<?= $on?'0':'1' ?>">
+                  <button type="submit" class="jstate <?= $on?'ok':'warn' ?>" title="<?= e($label) ?> — clic para <?= $on?'desactivar':'activar' ?>"><?= e($k) ?></button>
+                </form>
+              <?php endif; ?>
+            <?php endforeach; ?>
+          </div>
+          <?php if ($pWpLog !== ''): ?>
+            <div class="row" style="margin-bottom:8px">
+              <span class="muted" style="font-size:12px">wp-content/debug.log</span>
+              <div class="spacer"></div>
+              <form method="post" onsubmit="return confirm('¿Vaciar debug.log de WordPress?')">
+                <input type="hidden" name="action" value="wp_debug_log_clear">
+                <input type="hidden" name="name" value="<?= e($pName) ?>">
+                <button type="submit" class="btn ghost sm">Vaciar</button>
+              </form>
+            </div>
+            <pre class="logview"><?= highlight_error_log($pWpLog) ?></pre>
+          <?php elseif (wp_config_get_bool($pWpContent, 'WP_DEBUG_LOG') === true): ?>
+            <div class="muted" style="font-size:12px">WP_DEBUG_LOG está activado, pero <code>debug.log</code> todavía está vacío o no existe.</div>
+          <?php endif; ?>
+        <?php endif; ?>
+      </div>
+      <?php endif; ?>
+
+      <?php $pTermOn = term_enabled($ROOT); $pLeftCard = $pHasArtisan || $pWpRoot !== null; ?>
       <?php if ($pTermOn && is_dir($pDir)): ?>
-        <div class="card">
+        <div class="card"<?= $pLeftCard ? '' : ' style="grid-column:1/-1"' ?>>
           <div style="font-weight:600;margin-bottom:10px">Terminal <span class="muted" style="font-weight:400;font-size:12px">— arranca ya en la carpeta de este proyecto</span></div>
           <?= render_terminal_widget('pterm', $pDir, false) ?>
         </div>
       <?php elseif (!$pTermOn): ?>
-        <div class="card">
+        <div class="card"<?= $pLeftCard ? '' : ' style="grid-column:1/-1"' ?>>
           <div style="font-weight:600;margin-bottom:6px">Terminal</div>
           <div class="muted">Actívala en <a href="?tab=config">Configuración del servidor</a> para ejecutar comandos aquí mismo, arrancando directamente en la carpeta de este proyecto.</div>
         </div>
       <?php endif; ?>
+      </div>
 
       <!-- Editor de codigo (CodeMirror 5, autoalojado: sin CDN ni build step) -->
       <link rel="stylesheet" href="assets/codemirror/lib/codemirror.css">

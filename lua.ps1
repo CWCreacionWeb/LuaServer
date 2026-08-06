@@ -63,6 +63,10 @@ $HttpsFlag  = Join-Path $Root "config\https.on"
 $SslConf    = Join-Path $Root "config\apache\ssl.conf"
 $SslCert    = Join-Path $SslDir "lua.pem"
 $SslKey     = Join-Path $SslDir "lua-key.pem"
+# CA propia del repo (no la de %LOCALAPPDATA%, que es distinta por cuenta) y lista de
+# nombres del ultimo certificado emitido, para saber si hay que reemitirlo. Ver Get-SslNames.
+$SslCaRoot  = Join-Path $SslDir "ca"
+$SslNames   = Join-Path $SslDir "names.txt"
 # --- Mailpit (captura de correo) ---
 $Mailpit     = Join-Path $Bin  "mailpit\mailpit.exe"
 $MailpitFlag = Join-Path $Root "config\mailpit.on"
@@ -368,6 +372,94 @@ function Set-PhpInis {
     Ok "php.ini regenerados ($((Get-PhpVersions) -join ', '))"
 }
 
+# mkcert guarda su CA en %LOCALAPPDATA%\mkcert, que es una ruta DISTINTA por cuenta. Con
+# "Arrancar con Windows" el watcher corre como SYSTEM: ahi mkcert no encontraria la CA del
+# usuario y se crearia una nueva (que nadie ha instalado en el almacen de confianza), o sea
+# certificados firmados por una CA desconocida para el navegador. Se fija CAROOT a una ruta
+# del repo, igual para todas las cuentas; la primera vez se migra la CA que ya tenga el
+# usuario para no volver a pedir UAC por un "mkcert -install" que ya se hizo.
+function Use-MkcertCaRoot {
+    New-Item -ItemType Directory -Force -Path $SslCaRoot | Out-Null
+    if (-not (Test-Path (Join-Path $SslCaRoot "rootCA-key.pem"))) {
+        $old = Join-Path $env:LOCALAPPDATA "mkcert"
+        if ((Test-Path (Join-Path $old "rootCA.pem")) -and (Test-Path (Join-Path $old "rootCA-key.pem"))) {
+            Copy-Item (Join-Path $old "rootCA.pem")     $SslCaRoot -Force -ErrorAction SilentlyContinue
+            Copy-Item (Join-Path $old "rootCA-key.pem") $SslCaRoot -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $env:CAROOT = $SslCaRoot
+}
+# Nombres que debe cubrir el certificado.
+#
+# NO vale un unico "*.$tld", que es lo que se generaba antes: un comodin exige al menos DOS
+# etiquetas a su derecha, asi que "*.local"/"*.test" (comodin sobre un TLD entero) los
+# RECHAZA de plano el validador de Windows (Schannel/CryptoAPI) -> NameMismatch en TODOS los
+# proyectos, no solo en los de dominio raro. Medido con un servidor TLS local: con "*.local"
+# fallaban hasta "alergenator.local" y "phpmyadmin.local"; solo validaba "localhost" (que
+# estaba como nombre explicito). Y un comodin casa UNA sola etiqueta, asi que tampoco cubria
+# los dominios de 2+ etiquetas (app.ersm.local, ueb_buceo.lua.local) ni los de otro TLD
+# (portal.ersm.test). Por eso aqui se enumeran los dominios REALES de sites.json con su
+# variante www (que el vhost :80 y el hosts ya declaran) mas los nombres del panel.
+function Get-SslNames {
+    $tld = Get-Tld
+    $dns = [System.Collections.Generic.List[string]]::new()
+    foreach ($n in @("localhost", "localhost.$tld", $tld, "lua.$tld", "lua.test")) { $dns.Add($n) }
+    try { $cfg = Get-Config } catch { $cfg = $null }
+    if ($cfg) {
+        foreach ($p in $cfg.sites.PSObject.Properties.Name) {
+            $dom = ([string](Get-SiteDomain $cfg $p)).ToLower()
+            if ($dom) { $dns.Add($dom); $dns.Add("www.$dom") }
+        }
+    }
+    # Orden estable (Sort-Object -Unique) para que la comparacion con names.txt no reemita
+    # el certificado solo porque sites.json haya cambiado de orden.
+    return @($dns | Where-Object { $_ } | Sort-Object -Unique) + @("127.0.0.1", "::1")
+}
+# Reemite el certificado si la lista de nombres ha cambiado (proyecto nuevo, dominio editado,
+# TLD distinto) o si falta. Firmar una hoja NO necesita admin -- solo lo necesita
+# "mkcert -install" para tocar el almacen de confianza -- asi que esto corre desde Cmd-Apply
+# (y por tanto desde el watcher) sin pedir UAC.
+function Update-SslCert([switch]$Force) {
+    if (-not (Test-Path $HttpsFlag)) { return $false }
+    if (-not (Test-Path $Mkcert))    { return $false }
+    $want = Get-SslNames
+    $have = @()
+    if (Test-Path $SslNames) { $have = @(Get-Content $SslNames -ErrorAction SilentlyContinue | Where-Object { $_ }) }
+    $upToDate = (Test-Path $SslCert) -and (Test-Path $SslKey) -and (($want -join '|') -eq ($have -join '|'))
+    if ($upToDate -and -not $Force) { return $false }
+    Use-MkcertCaRoot
+    # Sin CA en el repo, mkcert se inventaria una nueva en silencio -- y esa NO esta en el
+    # almacen de confianza, asi que firmaria certificados que el navegador rechaza por CA
+    # desconocida (peor que el aviso actual). Pasa si esto lo ejecuta el watcher como SYSTEM en
+    # una instalacion anterior a $SslCaRoot: la CA vive en el %LOCALAPPDATA% del USUARIO y desde
+    # SYSTEM no se ve, asi que no hay nada que migrar. Se conserva el certificado que haya y se
+    # pide reactivar HTTPS, que es lo unico que puede instalar una CA en el almacen (necesita UAC).
+    if (-not (Test-Path (Join-Path $SslCaRoot "rootCA-key.pem"))) {
+        Warn "No hay CA local en data\ssl\ca: vuelve a activar HTTPS en el panel (Configuracion) para instalarla. No se reemite el certificado."
+        return $false
+    }
+    # mkcert escribe su salida normal en stderr: con ErrorActionPreference=Stop (global en este
+    # script) eso lanza excepcion terminante aunque haya ido bien. Se aisla como en Cmd-HttpsSetup.
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    # Se emite a ficheros .new y solo se mueven encima si mkcert va bien: asi un fallo nunca
+    # deja el servidor sin certificado (antes se borraba el viejo ANTES de intentar reemitir).
+    $tmpCert = "$SslCert.new"; $tmpKey = "$SslKey.new"
+    Remove-Item $tmpCert,$tmpKey -Force -ErrorAction SilentlyContinue
+    $null = & $Mkcert -cert-file "$tmpCert" -key-file "$tmpKey" @want 2>&1
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $prev
+    if ($code -ne 0 -or -not (Test-Path $tmpCert) -or -not (Test-Path $tmpKey)) {
+        Remove-Item $tmpCert,$tmpKey -Force -ErrorAction SilentlyContinue
+        Warn "No se pudo reemitir el certificado HTTPS (mkcert codigo $code): se conserva el anterior."
+        return $false
+    }
+    Move-Item $tmpCert $SslCert -Force
+    Move-Item $tmpKey  $SslKey  -Force
+    Write-Utf8NoBom $SslNames $want
+    Ok ("Certificado HTTPS emitido para {0} nombres ({1} dominios + localhost/IPs)." -f $want.Count, ($want.Count - 3))
+    return $true
+}
+
 # Escribe config\apache\ssl.conf: carga mod_ssl + Listen 443 solo si HTTPS esta activo.
 function Set-Ssl {
     $on = (Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)
@@ -378,8 +470,10 @@ function Set-Ssl {
         # inalcanzable por HTTPS y cualquier Host desconocido (incl. desde LAN si se expone
         # 443) caia en ese proyecto SIN el filtro de IP del panel. Replica la restriccion a
         # loopback del vhost :80 del panel (httpd-lua.conf) y añade SSL. Heredoc @'...'@
-        # (literal): ${LUAROOT} se escribe tal cual para que lo expanda Apache.
-        Write-Utf8NoBom $SslConf @'
+        # (literal): ${LUAROOT} se escribe tal cual para que lo expanda Apache; {TLD} si lo
+        # sustituimos nosotros abajo (el alias del panel era "lua.test" fijo, que con otro TLD
+        # no esta ni en el hosts ni en el certificado).
+        $sslTpl = @'
 # Generado por lua.ps1 -- HTTPS activo
 LoadModule ssl_module modules/mod_ssl.so
 LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
@@ -392,7 +486,7 @@ SSLSessionCacheTimeout 300
 # Vhost :443 por defecto: el panel (solo localhost). Debe ir el PRIMERO en :443.
 <VirtualHost *:443>
     ServerName localhost
-    ServerAlias lua.test 127.0.0.1
+    ServerAlias localhost.{TLD} {TLD} lua.{TLD} lua.test 127.0.0.1
     DocumentRoot "${LUAROOT}/tools/dashboard"
     FcgidInitialEnv PHPRC "${LUAROOT}/bin/php/8.4"
     SSLEngine on
@@ -410,6 +504,7 @@ SSLSessionCacheTimeout 300
     </Directory>
 </VirtualHost>
 '@
+        Write-Utf8NoBom $SslConf ($sslTpl.Replace('{TLD}', (Get-Tld)))
     } else {
         Write-Utf8NoBom $SslConf "# HTTPS desactivado"
     }
@@ -429,6 +524,7 @@ function New-VhostFile($name, $php, $domain, $base) {
 
 <VirtualHost *:443>
     ServerName $domain
+    ServerAlias www.$domain
     DocumentRoot "$docroot"
     FcgidInitialEnv PHPRC "$phpdir"
     SSLEngine on
@@ -520,8 +616,14 @@ function Start-Watcher {
 # Procesos cuyo ejecutable cuelga de $dir: identifica NUESTRAS instancias por ruta del
 # binario, no por nombre de proceso global. Asi el watcher nunca toca un mysqld/mailpit
 # ajeno del sistema (XAMPP, servicio propio del usuario, etc.). Mismo espiritu que
-# Postgres-Up (que usa postmaster.pid). Nota: $_.Path puede ser inaccesible para procesos
-# de otra cuenta; en ese caso quedan excluidos, que es justo lo deseado (no son nuestros).
+# Postgres-Up (que usa postmaster.pid).
+#
+# OJO: esto NO vale por si solo para decidir "esta arriba". $_.Path es ILEGIBLE (vale $null,
+# sin lanzar siquiera: la ScriptProperty de PowerShell se traga el acceso denegado) para un
+# proceso de OTRA cuenta -- y con "Arrancar con Windows" activo los motores los arranca el
+# watcher como SYSTEM, o sea que son justo eso. Un proceso NUESTRO se queda entonces fuera
+# del filtro: falso negativo, no exclusion deseada. Usar siempre una segunda via que no
+# dependa de permisos (un .pid en nuestro datadir, como MariaDb-Up/Postgres-Up/MongoDb-Up).
 function Get-LuaProcess($name, $dir) {
     $dirN = ([string]$dir).TrimEnd('\','/')
     Get-Process $name -ErrorAction SilentlyContinue | Where-Object {
@@ -557,7 +659,43 @@ function Set-MariaDbIni {
     # acumular cientos de líneas en blanco en my.ini en unas pocas horas.
     Set-Content -Path $MyIni -Value $c -Encoding Default -NoNewline
 }
-function MariaDb-Up { [bool](Get-LuaProcess 'mysqld' $MariaDb) }
+# "Up" de MariaDB por DOS vias, porque la ruta del binario sola daba falso negativo:
+#   1. Ruta del binario (Get-LuaProcess): instantanea y precisa... mientras $_.Path sea
+#      legible. Con "Arrancar con Windows" el mysqld lo arranca el watcher como SYSTEM y
+#      desde una sesion normal $_.Path vale $null (y tambien vienen vacios
+#      MainModule.FileName y el ExecutablePath/CommandLine de Win32_Process). Quien lo sufre
+#      es la sesion que EVALUA: el watcher de SYSTEM si lee la ruta del mysqld que el mismo
+#      lanzo, pero una consola normal del usuario no. De ahi el sintoma raro de "`lua.ps1
+#      status` dice apagado mientras la BD sirve". Y cuando el que no puede leerla es el
+#      watcher, es peor: relanza OTRO mysqld cada 30s contra el MISMO datadir, que aborta
+#      solo ("InnoDB: The data file './ibdata1' must be writable") gastando CPU/IO y tocando
+#      el datadir de una BD viva -- pasó de verdad (6422 de esos errores, a 30s exactos,
+#      entre 2026-07-27 y 2026-07-30). Ademas MariaDb-Up en falso dejaba Stop-MariaDb en un
+#      no-op silencioso y hacia que New-ProjectDb se saltara la creacion de la BD del proyecto.
+#   2. El .pid que mysqld escribe DENTRO de nuestro datadir (por defecto
+#      <datadir>\<hostname>.pid, no hace falta configurarlo). Quien lo escribio esta usando
+#      NUESTRO datadir, asi que es nuestro por definicion, y leer el archivo no necesita
+#      permisos sobre el proceso. Mismo criterio que Postgres-Up (postmaster.pid),
+#      MongoDb-Up y Redis-Up. Se recorren TODOS los *.pid porque el nombre depende del
+#      hostname (y puede quedar el de un equipo anterior); se valida que el PID siga vivo y
+#      siga siendo un mysqld, asi que un .pid huerfano no cuela.
+# Aqui NO se mira el puerto a proposito: Get-NetTCPConnection cuesta ~1-4s en esta maquina y
+# el watcher llama a MariaDb-Up hasta 3 veces por vuelta (cada segundo). Esa comprobacion
+# vive en Start-MariaDb, que va detras del backoff de 30s.
+function Get-MariaDbProcess {
+    $p = Get-LuaProcess 'mysqld' $MariaDb | Select-Object -First 1
+    if ($p) { return $p }
+    foreach ($f in @(Get-ChildItem $MariaDataDir -Filter *.pid -File -ErrorAction SilentlyContinue)) {
+        $raw = "$(Get-Content $f.FullName -TotalCount 1 -ErrorAction SilentlyContinue)".Trim()
+        # Un .pid corrupto o leido a medio escribir no puede reventar el bucle del watcher:
+        # con $ErrorActionPreference = "Stop" un cast [int] fallido es excepcion terminante.
+        if ($raw -notmatch '^\d+$') { continue }
+        $q = Get-Process -Id ([int]$raw) -ErrorAction SilentlyContinue
+        if ($q -and $q.ProcessName -eq 'mysqld') { return $q }
+    }
+    return $null
+}
+function MariaDb-Up { [bool](Get-MariaDbProcess) }
 function MariaDb-Initialized { Test-Path (Join-Path $MariaDataDir "mysql") }
 function Initialize-MariaDb {
     if (MariaDb-Initialized) { return $true }
@@ -571,6 +709,23 @@ function Initialize-MariaDb {
 function Start-MariaDb {
     if (-not (Test-Path $Mysqld)) { return }
     if (MariaDb-Up) { return }
+    # Si algo YA escucha en 127.0.0.1:3306, lanzar otro mysqld no puede salir bien: o no
+    # conseguira el puerto, o -- si resulta ser un mysqld nuestro que no hemos sabido
+    # identificar -- chocara contra el datadir ya bloqueado. Se sale sin lanzarlo, que es lo
+    # unico util que se puede hacer (mismo criterio que Start-MongoDb con su puerto).
+    # Solo cuenta el listener de 127.0.0.1: en Windows conviven varios listeners en el mismo
+    # puerto (aqui el 3306 lo escuchan ademas Docker en :: y wslrelay en ::1) y para
+    # 127.0.0.1 gana el bind mas especifico, asi que esos no estorban ni deben contar como
+    # ocupado. Esta consulta cuesta ~1-4s: por eso vive aqui, detras del backoff de 30s del
+    # watcher, y no en MariaDb-Up (que se llama varias veces por segundo).
+    $busy = Get-NetTCPConnection -LocalPort 3306 -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1
+    if ($busy) {
+        $who = Get-Process -Id $busy.OwningProcess -ErrorAction SilentlyContinue
+        $whoTxt = if ($who) { $who.ProcessName } else { "otro proceso" }
+        Warn "MariaDB: 127.0.0.1:3306 ya lo tiene $whoTxt (PID $($busy.OwningProcess)); no se lanza otro mysqld."
+        return
+    }
     Set-MariaDbIni
     if (-not (Initialize-MariaDb)) { return }
     Start-Process -FilePath $Mysqld -WindowStyle Hidden -ArgumentList @("--defaults-file=`"$MyIni`"")
@@ -582,7 +737,18 @@ function Stop-MariaDb {
         $ErrorActionPreference = $prev
         for ($i=0; $i -lt 20; $i++) { if (-not (MariaDb-Up)) { break }; Start-Sleep -Milliseconds 250 }
     }
-    Get-LuaProcess 'mysqld' $MariaDb | Stop-Process -Force -ErrorAction SilentlyContinue
+    $p = Get-MariaDbProcess
+    if ($p) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        # Stop-Process no espera a que el proceso termine de morir: sin esta espera el aviso
+        # de abajo saltaria en falso en un stop que si ha funcionado.
+        for ($i=0; $i -lt 20; $i++) { if (-not (MariaDb-Up)) { break }; Start-Sleep -Milliseconds 250 }
+    }
+    # Avisar si sigue vivo en vez de callarselo: a un mysqld arrancado por el watcher como
+    # SYSTEM no lo puede matar una consola normal, y el silencio hacia creer que el stop fue
+    # bien (mismo fallo que ya se corrigio en Cmd-Stop con el watcher y en Stop-MongoDb).
+    $p = Get-MariaDbProcess
+    if ($p) { Warn "No se pudo detener MariaDB (PID $($p.Id)): puede requerir una consola elevada." }
 }
 
 # ---------------- PostgreSQL (portable, mismo patron que MariaDB) ----------------
@@ -1303,6 +1469,13 @@ function Cmd-Apply {
     New-Item -ItemType Directory -Force -Path $bak | Out-Null
     if (Test-Path $VhostDir) { Copy-Item $VhostDir (Join-Path $bak "vhosts") -Recurse -Force -ErrorAction SilentlyContinue }
     if (Test-Path $SslConf)  { Copy-Item $SslConf  (Join-Path $bak "ssl.conf") -Force -ErrorAction SilentlyContinue }
+    # Reemitir el certificado si la lista de dominios ya no casa con la del certificado actual
+    # (proyecto nuevo/borrado, dominio editado, TLD cambiado). Va ANTES de Set-Ssl, que decide
+    # si HTTPS esta activo con un Test-Path del certificado. Es no-op si nada ha cambiado, y no
+    # necesita admin (solo lo necesitaria "mkcert -install", que ya se hizo al activar HTTPS),
+    # asi que tambien funciona cuando esto lo ejecuta el watcher. Antes el certificado solo se
+    # emitia al activar HTTPS: cualquier proyecto anadido despues se quedaba fuera para siempre.
+    Update-SslCert | Out-Null
     Set-Ssl
     Regenerate-Vhosts
     if (-not (Test-HttpdConfig)) {
@@ -2182,26 +2355,30 @@ function Cmd-Hosts {
 function Cmd-Logs { Get-Content (Join-Path $ApacheLog "error.log") -Tail 40 -ErrorAction SilentlyContinue }
 function Cmd-HttpsSetup {
     $tld = Get-Tld
-    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     New-Item -ItemType Directory -Force -Path $SslDir | Out-Null
-    if (-not (Test-Path $Mkcert)) { Err "Falta mkcert (bin\mkcert\mkcert.exe). Ejecuta bootstrap.ps1."; $ErrorActionPreference=$prev; return }
+    if (-not (Test-Path $Mkcert)) { Err "Falta mkcert (bin\mkcert\mkcert.exe). Ejecuta bootstrap.ps1."; return }
+    Use-MkcertCaRoot
     Info "Instalando CA local de confianza (mkcert -install)..."
+    # mkcert escribe su salida normal en stderr: con EAP=Stop (global) eso lanzaria excepcion.
+    $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     & $Mkcert -install
-    Info "Generando certificado para *.$tld ..."
-    # Borrar el cert anterior ANTES de regenerar: si mkcert falla, no debe quedar en disco
-    # un cert viejo (p.ej. del TLD anterior tras cambiar de dominio) que el guard Test-Path
-    # daria por bueno, dejando HTTPS "activo" con un certificado que no casa -> aviso de
-    # certificado en el navegador mientras el panel dice "activado".
-    Remove-Item $SslCert,$SslKey -Force -ErrorAction SilentlyContinue
-    & $Mkcert -cert-file "$SslCert" -key-file "$SslKey" "*.$tld" "$tld" "localhost" "127.0.0.1" "::1"
-    if ($LASTEXITCODE -ne 0) { Err "mkcert fallo (codigo $LASTEXITCODE); HTTPS no activado."; $ErrorActionPreference=$prev; return }
+    $instCode = $LASTEXITCODE
     $ErrorActionPreference = $prev
-    if ((Test-Path $SslCert) -and (Test-Path $SslKey)) {
-        Set-Content -Path $HttpsFlag -Value "1" -Encoding ascii
-        Set-Ssl; Regenerate-Vhosts
-        if (Test-HttpdConfig) { Restart-Apache; Ok "HTTPS activado: los sitios responden en https://<proyecto>.$tld con candado verde." }
-        else { Err "La config SSL no es valida; revisa .\lua.ps1 logs" }
-    } else { Err "No se genero el certificado." }
+    if ($instCode -ne 0) { Err "mkcert -install fallo (codigo $instCode); HTTPS no activado."; return }
+    # El flag se escribe ANTES de emitir porque es la guarda de "HTTPS activo" que mira
+    # Update-SslCert; si la emision falla se retira, para no dejar HTTPS "activado" sin
+    # certificado (Set-Ssl lo daria por apagado y el panel diria lo contrario).
+    $had = Test-Path $HttpsFlag
+    Set-Content -Path $HttpsFlag -Value "1" -Encoding ascii
+    Info "Emitiendo certificado para los dominios de sites.json..."
+    if (-not (Update-SslCert -Force)) {
+        if (-not $had) { Remove-Item $HttpsFlag -Force -ErrorAction SilentlyContinue }
+        Err "No se emitio el certificado; HTTPS no activado."
+        return
+    }
+    Set-Ssl; Regenerate-Vhosts
+    if (Test-HttpdConfig) { Restart-Apache; Ok "HTTPS activado: los sitios responden en https://<proyecto>.$tld con candado verde." }
+    else { Err "La config SSL no es valida; revisa .\lua.ps1 logs" }
 }
 function Cmd-HttpsOff {
     Remove-Item $HttpsFlag -Force -ErrorAction SilentlyContinue

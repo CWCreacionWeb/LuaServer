@@ -109,16 +109,13 @@
             else { $cfg['sites'][$name]['domain'] = $domain; }
             write_json($CFG_FILE, $cfg);
             $shownDomain = $domain !== '' ? $domain : $name.'.'.$tld;
-            // El certificado HTTPS es un unico wildcard *.$tld, y un comodin cubre UNA sola
-            // etiqueta: cubre x.$tld pero NO x.y.$tld. Solo marcamos "cubierto" un dominio
-            // que sea exactamente una etiqueta bajo $tld (o vacio/= $tld). Antes bastaba con
-            // que terminara en .$tld, marcando por error subdominios de 2+ etiquetas.
+            // El certificado ya NO es un comodin *.$tld (un comodin exige dos etiquetas a su
+            // derecha, asi que Windows rechazaba *.local/*.test de plano, y ademas casa una sola
+            // etiqueta): ahora lua.ps1 lo emite con la lista literal de dominios de sites.json y
+            // lo reemite en cada apply si esa lista cambia. O sea que cualquier dominio queda
+            // cubierto, sea del TLD que sea y con las etiquetas que tenga -- no hay aviso que dar.
             $httpsOn = is_file($ROOT.'/config/https.on');
-            $suffix = '.'.$tld;
-            $endsTld = (strlen($domain) > strlen($suffix)) && (substr($domain, -strlen($suffix)) === $suffix);
-            $label = $endsTld ? substr($domain, 0, -strlen($suffix)) : '';
-            $coveredByWildcard = ($domain === '') || ($domain === $tld) || ($endsTld && $label !== '' && strpos($label, '.') === false);
-            $warn = ($httpsOn && !$coveredByWildcard) ? ' Aviso: con HTTPS activo, este dominio no cuelga de ".'.$tld.'" así que el certificado no lo cubrirá (saldrá aviso de certificado no válido en el navegador).' : '';
+            $warn = $httpsOn ? ' El certificado HTTPS se reemite con el dominio nuevo.' : '';
             // lua_apply()/lua_hosts() solo dejan un flag: sin watcher que lo recoja no pasa
             // nada, y sin este aviso el mensaje de exito engaña (promete un UAC que no llega).
             if (!watcher_alive($ROOT)) {
