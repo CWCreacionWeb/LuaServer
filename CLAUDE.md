@@ -804,6 +804,30 @@ Dos cosas que hay que respetar si se vuelve a tocar esto:
   abiertos por otro proceso: se anotan como `OMITIDO` en el log y el export sigue). Los
   exclusos son por subcadena de la ruta relativa, igual que en "Desplegar por FTP".
 
+- **Notas tipo post-it** (ficha de proyecto) — tablero de notas por proyecto para lo que no
+  cabe en `sites.json` ni vive en el código: accesos al backoffice, avisos, pasos de
+  despliegue. `lib/notes.php` + `actions/notes.php` + una tarjeta en `views/proyecto.php`,
+  con los estilos (`.pnwall`/`.pnote`) en el bloque CSS de `index.php` como el resto de
+  componentes. Decisiones con motivo:
+  - **Viven en `data\notes\<proyecto>.json`, NO en `config\`.** Una nota puede llevar
+    contraseñas, y `/data/` está en `.gitignore` **entero**; `config\` solo está ignorado
+    archivo a archivo, así que ahí era cuestión de tiempo que una regla nueva se dejara esta
+    fuera y acabara publicada en un commit. Un archivo por proyecto: guardar una nota no
+    reescribe las de los demás y borrar un proyecto es borrar su archivo.
+  - El nombre de archivo sale de la clave del proyecto, pero solo si casa con
+    `[A-Za-z0-9][A-Za-z0-9._-]{0,60}`; si no, cae a un `sha1`. La barrera de verdad contra
+    un `../` es que la acción exige que el proyecto exista en `sites.json`
+    (`resolve_site_key`), pero el saneado del nombre se queda como segunda línea.
+  - El papel lleva **tinta oscura también en tema oscuro** (un post-it es papel de color:
+    invertirlo lo convierte en otra cosa); lo que cambia en oscuro es la saturación del
+    papel, para que la pared no deslumbre. El giro de cada nota va por `nth-child`, así que
+    es estable entre recargas en vez de saltar.
+  - Guardar sin cambios reales es un no-op explícito (`info:La nota no ha cambiado.`): no
+    reescribe el archivo ni mueve la fecha de "Editada".
+  - El botón de copiar necesita respaldo con `execCommand`: `navigator.clipboard` solo existe
+    en contexto seguro y `http://lua.test` —la URL que recomienda la trampa nº2— **no** lo es
+    (127.0.0.1 y localhost sí).
+
 - **Actualización de la plataforma** — la versión sale junto al título del panel (etiqueta de
   git si existe, si no `r<nº commits> <sha>`), y se vuelve ámbar cuando hay novedades. El
   **watcher** hace `git fetch` cada X horas (`config\update.json`, fuera de git) y deja el

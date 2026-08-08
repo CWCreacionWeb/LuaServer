@@ -65,6 +65,7 @@ require_once __DIR__.'/lib/jobs.php';
 require_once __DIR__.'/lib/exports.php';
 require_once __DIR__.'/lib/env-editor.php';
 require_once __DIR__.'/lib/wordpress.php';
+require_once __DIR__.'/lib/notes.php';
 
 
 // ---------------- Endpoints AJAX y GET crudos (tools/dashboard/ajax/) ----------------
@@ -94,6 +95,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     include __DIR__.'/actions/exports.php';
     include __DIR__.'/actions/env.php';
     include __DIR__.'/actions/wordpress.php';
+    include __DIR__.'/actions/notes.php';
     include __DIR__.'/actions/branding-and-cards.php';
     include __DIR__.'/actions/php-and-config.php';
     include __DIR__.'/actions/services.php';
@@ -425,6 +427,66 @@ setTimeout(ping,1500);})();
   .sitegrid.list .sitecard .btn{width:auto}
   .sitegrid.list .sitecard .cardfooter{margin:0;padding:0;border:0;flex:0 0 auto}
   .sitegrid.list .sitecard select.phpsel{width:auto}
+
+  /* ---------- Notas tipo post-it (ficha de proyecto) ---------- */
+  /* El papel lleva SIEMPRE tinta oscura, tambien en tema oscuro: un post-it es papel de color,
+     y darle la vuelta a los colores para "adaptarlo" lo convertiria en otra cosa. Lo que si
+     cambia en oscuro es la saturacion del papel (--pn-dim), para que la pared de notas no
+     deslumbre al lado de un panel oscuro. */
+  .pnwall{display:grid;grid-template-columns:repeat(auto-fill,minmax(212px,1fr));gap:16px;align-items:start}
+  .pnote{--pn-dim:1;position:relative;display:flex;flex-direction:column;min-height:170px;padding:12px 13px 8px;border:0;border-radius:2px 2px 3px 3px;
+         background:var(--pn-bg);color:var(--pn-ink);filter:saturate(var(--pn-dim));
+         box-shadow:0 1px 1px rgba(0,0,0,.16), 0 8px 16px -8px rgba(0,0,0,.42);
+         transition:transform .16s ease, box-shadow .16s ease}
+  /* Cada post-it pegado con un angulo ligeramente distinto (y siempre el mismo para la misma
+     posicion, por nth-child: no salta al recargar). Al enfocarlo se endereza. */
+  .pnote:nth-child(4n+1){transform:rotate(-.9deg)}
+  .pnote:nth-child(4n+2){transform:rotate(.7deg)}
+  .pnote:nth-child(4n+3){transform:rotate(-.35deg)}
+  .pnote:nth-child(4n){transform:rotate(1.05deg)}
+  .pnote:hover,.pnote:focus-within{transform:rotate(0) translateY(-3px);box-shadow:0 2px 2px rgba(0,0,0,.18), 0 16px 26px -10px rgba(0,0,0,.5);z-index:2}
+  /* Esquina doblada */
+  .pnote::after{content:"";position:absolute;right:0;bottom:0;width:16px;height:16px;
+                background:linear-gradient(135deg,transparent 50%,rgba(0,0,0,.10) 50%);border-radius:0 0 3px 0}
+  .pnote-amber {--pn-bg:#fef0a5;--pn-ink:#4a3c07;--pn-line:rgba(74,60,7,.18)}
+  .pnote-lime  {--pn-bg:#dcf5a8;--pn-ink:#31450c;--pn-line:rgba(49,69,12,.18)}
+  .pnote-sky   {--pn-bg:#c7e8fb;--pn-ink:#0e3a52;--pn-line:rgba(14,58,82,.18)}
+  .pnote-rose  {--pn-bg:#fdd0dd;--pn-ink:#5a1230;--pn-line:rgba(90,18,48,.18)}
+  .pnote-violet{--pn-bg:#e0d4fb;--pn-ink:#3a2065;--pn-line:rgba(58,32,101,.18)}
+  @media (prefers-color-scheme:dark){ .pnote{--pn-dim:.82} }
+  /* Los campos son el propio papel: sin caja ni fondo, para que la nota se lea como una nota
+     y no como un formulario. El foco solo subraya. */
+  .pnote input.pnote-title,.pnote textarea.pnote-body{width:100%;background:transparent;border:0;padding:0;margin:0;color:inherit;font-family:inherit;box-shadow:none;border-radius:0}
+  .pnote input.pnote-title{font-size:13.5px;font-weight:700;line-height:1.35;padding-bottom:5px;border-bottom:1px solid var(--pn-line);margin-bottom:7px}
+  .pnote textarea.pnote-body{flex:1;resize:vertical;min-height:88px;font-size:12.5px;line-height:1.5;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow:auto}
+  .pnote input.pnote-title:focus,.pnote textarea.pnote-body:focus{outline:0;border-color:currentColor}
+  .pnote input.pnote-title::placeholder,.pnote textarea.pnote-body::placeholder{color:var(--pn-ink);opacity:.45}
+  .pnote-foot{display:flex;align-items:center;gap:6px;margin-top:8px;padding-top:7px;border-top:1px solid var(--pn-line);min-height:26px}
+  .pnote-when{font-size:10.5px;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* La barra de acciones solo aparece al pasar por encima o al editar: en reposo la pared se
+     ve como notas, no como una rejilla de botones. Siempre visible con el teclado (focus). */
+  .pnote-acts{display:flex;gap:4px;margin-left:auto;opacity:0;transition:opacity .14s}
+  .pnote:hover .pnote-acts,.pnote:focus-within .pnote-acts{opacity:1}
+  .pnote-act{display:flex;align-items:center;justify-content:center;width:23px;height:23px;padding:0;border:1px solid var(--pn-line);border-radius:5px;
+             background:rgba(255,255,255,.45);color:var(--pn-ink);cursor:pointer;transition:filter .12s,transform .12s}
+  .pnote-act:hover{filter:brightness(1.06);background:rgba(255,255,255,.75)}
+  .pnote-act:active{transform:scale(.93)}
+  .pnote-act.del:hover{background:var(--err);border-color:var(--err);color:#fff}
+  /* Selector de color: radios nativos pintados como puntos de papel (sin JS, entra en el POST
+     como un campo mas del formulario de la nota). */
+  .pnote-dots{display:flex;gap:4px}
+  .pnote-dots input{position:absolute;opacity:0;width:0;height:0}
+  .pnote-dot{display:block;width:13px;height:13px;border-radius:999px;cursor:pointer;border:1px solid rgba(0,0,0,.22);transition:transform .12s}
+  .pnote-dot:hover{transform:scale(1.18)}
+  .pnote-dots input:checked + .pnote-dot{box-shadow:0 0 0 2px var(--pn-bg),0 0 0 3.5px currentColor}
+  .pnote-dots input:focus-visible + .pnote-dot{outline:2px solid currentColor;outline-offset:2px}
+  .pnd-amber{background:#fef0a5}.pnd-lime{background:#dcf5a8}.pnd-sky{background:#c7e8fb}.pnd-rose{background:#fdd0dd}.pnd-violet{background:#e0d4fb}
+  /* Post-it "nuevo": mismo tamano y sitio que los demas, pero de papel en blanco */
+  .pnote.pnew{background:transparent;color:var(--tx);border:1.5px dashed var(--line);box-shadow:none;transform:none!important}
+  .pnote.pnew::after{display:none}
+  .pnote.pnew:hover{border-color:var(--ac);box-shadow:none}
+  .pnote.pnew{--pn-line:var(--line)}
+  .pnote.pnew .pnote-act{background:transparent;color:var(--mut)}
 
   /* ---------- Modal de confirmacion ---------- */
   .modal-overlay{position:fixed;inset:0;background:rgba(6,7,10,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}

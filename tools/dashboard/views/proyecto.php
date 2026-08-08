@@ -133,6 +133,129 @@
       </div>
       </div>
 
+      <?php $pNotes = notes_read($ROOT, $pName); ?>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <div style="font-weight:600">Notas</div>
+          <?php if ($pNotes): ?><span class="muted" style="font-size:12px"><?= count($pNotes) ?> nota<?= count($pNotes)===1?'':'s' ?></span><?php endif; ?>
+          <div class="spacer"></div>
+          <span class="muted" style="font-size:12px">Accesos, avisos, lo que sea. Se guardan en <code>data\notes\</code>, fuera de git.</span>
+        </div>
+        <div class="pnwall">
+          <!-- Post-it nuevo. Va el primero (no al final) para que anadir no obligue a bajar
+               hasta el fondo del tablero cuando ya hay muchas notas. -->
+          <form method="post" class="pnote pnew">
+            <input type="hidden" name="action" value="note_add">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+            <input class="pnote-title" name="title" maxlength="<?= NOTES_MAX_TITLE ?>" placeholder="Título de la nota" autocomplete="off">
+            <textarea class="pnote-body" name="body" maxlength="<?= NOTES_MAX_BODY ?>" placeholder="Escribe aquí…&#10;usuario / contraseña, notas de despliegue…" spellcheck="false" autocomplete="off"></textarea>
+            <div class="pnote-foot">
+              <div class="pnote-dots">
+                <?php foreach (notes_colors() as $ck=>$cl): ?>
+                  <label title="<?= e($cl) ?>">
+                    <input type="radio" name="color" value="<?= e($ck) ?>" <?= $ck==='amber'?'checked':'' ?>>
+                    <span class="pnote-dot pnd-<?= e($ck) ?>"></span>
+                  </label>
+                <?php endforeach; ?>
+              </div>
+              <div class="pnote-acts" style="opacity:1">
+                <button type="submit" class="pnote-act" title="Añadir nota" aria-label="Añadir nota">
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <?php foreach ($pNotes as $n): ?>
+            <form method="post" class="pnote pnote-<?= e($n['color']) ?>" id="noteF<?= e($n['id']) ?>">
+              <input type="hidden" name="action" value="note_save">
+              <input type="hidden" name="name" value="<?= e($pName) ?>">
+              <input type="hidden" name="id" value="<?= e($n['id']) ?>">
+              <input class="pnote-title" name="title" maxlength="<?= NOTES_MAX_TITLE ?>" value="<?= e($n['title']) ?>" placeholder="Sin título" autocomplete="off">
+              <textarea class="pnote-body" name="body" maxlength="<?= NOTES_MAX_BODY ?>" placeholder="Vacía" spellcheck="false" autocomplete="off"><?= e($n['body']) ?></textarea>
+              <div class="pnote-foot">
+                <div class="pnote-dots">
+                  <?php foreach (notes_colors() as $ck=>$cl): ?>
+                    <label title="<?= e($cl) ?>">
+                      <input type="radio" name="color" value="<?= e($ck) ?>" <?= $ck===$n['color']?'checked':'' ?>>
+                      <span class="pnote-dot pnd-<?= e($ck) ?>"></span>
+                    </label>
+                  <?php endforeach; ?>
+                </div>
+                <span class="pnote-when"><?= e(notes_when($n)) ?></span>
+                <div class="pnote-acts">
+                  <button type="button" class="pnote-act lua-note-copy" title="Copiar el contenido" aria-label="Copiar el contenido">
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  </button>
+                  <button type="submit" class="pnote-act" title="Guardar cambios" aria-label="Guardar cambios">
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                  </button>
+                  <!-- Borrar necesita su propio form (no se pueden anidar): vive fuera del
+                       tablero y se enlaza por el atributo form=, mismo truco que el editor
+                       de .env de mas abajo. -->
+                  <button type="submit" form="noteD<?= e($n['id']) ?>" class="pnote-act del" title="Eliminar nota" aria-label="Eliminar nota"
+                          onclick="return confirm('¿Eliminar esta nota? No se puede deshacer.')">
+                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                  </button>
+                </div>
+              </div>
+            </form>
+          <?php endforeach; ?>
+        </div>
+        <?php foreach ($pNotes as $n): ?>
+          <form method="post" id="noteD<?= e($n['id']) ?>" style="display:none">
+            <input type="hidden" name="action" value="note_delete">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+            <input type="hidden" name="id" value="<?= e($n['id']) ?>">
+          </form>
+        <?php endforeach; ?>
+        <script>
+          (function(){
+            // Copiar: navigator.clipboard solo existe en contexto seguro, y el panel se sirve
+            // por http -- en 127.0.0.1/localhost cuenta como seguro, pero en http://lua.test NO
+            // (ver trampa nº2 de CLAUDE.md, que recomienda justo esa URL). De ahi el respaldo
+            // con execCommand, que ahi sigue siendo la unica via.
+            function copy(text, btn){
+              var done = function(ok){
+                var old = btn.getAttribute('title');
+                btn.setAttribute('title', ok ? 'Copiado' : 'No se pudo copiar');
+                btn.style.color = ok ? '' : 'var(--err)';
+                setTimeout(function(){ btn.setAttribute('title', old); btn.style.color=''; }, 1400);
+              };
+              if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(function(){ done(true); }, function(){ done(false); });
+                return;
+              }
+              var ta = document.createElement('textarea');
+              ta.value = text;
+              ta.setAttribute('readonly','');
+              ta.style.position='fixed'; ta.style.top='-1000px';
+              document.body.appendChild(ta);
+              ta.select();
+              var ok = false;
+              try { ok = document.execCommand('copy'); } catch(e){ ok = false; }
+              document.body.removeChild(ta);
+              done(ok);
+            }
+            document.addEventListener('click', function(ev){
+              var btn = ev.target.closest ? ev.target.closest('.lua-note-copy') : null;
+              if (!btn) return;
+              var note = btn.closest('.pnote');
+              if (!note) return;
+              var body = note.querySelector('.pnote-body');
+              copy(body ? body.value : '', btn);
+            });
+            // El alto del textarea se ajusta al contenido al cargar, para que una nota corta no
+            // deje medio post-it vacio y una larga no obligue a hacer scroll dentro del papel.
+            document.querySelectorAll('.pnote-body').forEach(function(ta){
+              if (!ta.value) return;
+              ta.style.height = 'auto';
+              ta.style.height = Math.min(ta.scrollHeight + 2, 420) + 'px';
+            });
+          })();
+        </script>
+      </div>
+
       <div class="pgrid2">
         <?php if ($pGit): ?>
           <div class="card">
