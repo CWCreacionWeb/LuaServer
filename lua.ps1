@@ -401,15 +401,19 @@ function Use-MkcertCaRoot {
 # (portal.ersm.test). Por eso aqui se enumeran los dominios REALES de sites.json con su
 # variante www (que el vhost :80 y el hosts ya declaran) mas los nombres del panel.
 function Get-SslNames {
-    $tld = Get-Tld
+    # UNA sola lectura de sites.json, y $null si no se puede parsear. Antes se leia dos veces
+    # (Get-Tld por dentro vuelve a leerlo) y el try/catch de esta funcion era codigo muerto: con
+    # el JSON corrupto reventaba ya en Get-Tld, con $ErrorActionPreference = "Stop", asi que la
+    # excepcion se escapaba hasta abortar el Cmd-Apply entero en vez de tratarse aqui. Devolver
+    # $null deja que Update-SslCert distinga "no hay dominios" de "no he podido leerlos" y
+    # conserve el certificado actual en el segundo caso.
+    try { $cfg = Get-Config } catch { return $null }
+    $tld = if ($cfg.tld) { $cfg.tld } else { $DefaultTld }
     $dns = [System.Collections.Generic.List[string]]::new()
     foreach ($n in @("localhost", "localhost.$tld", $tld, "lua.$tld", "lua.test")) { $dns.Add($n) }
-    try { $cfg = Get-Config } catch { $cfg = $null }
-    if ($cfg) {
-        foreach ($p in $cfg.sites.PSObject.Properties.Name) {
-            $dom = ([string](Get-SiteDomain $cfg $p)).ToLower()
-            if ($dom) { $dns.Add($dom); $dns.Add("www.$dom") }
-        }
+    foreach ($p in $cfg.sites.PSObject.Properties.Name) {
+        $dom = ([string](Get-SiteDomain $cfg $p)).ToLower()
+        if ($dom) { $dns.Add($dom); $dns.Add("www.$dom") }
     }
     # Orden estable (Sort-Object -Unique) para que la comparacion con names.txt no reemita
     # el certificado solo porque sites.json haya cambiado de orden.
@@ -423,6 +427,9 @@ function Update-SslCert([switch]$Force) {
     if (-not (Test-Path $HttpsFlag)) { return $false }
     if (-not (Test-Path $Mkcert))    { return $false }
     $want = Get-SslNames
+    # sites.json ilegible: reemitir ahora daria un certificado con localhost y nada mas, es
+    # decir dejaria fuera TODOS los proyectos. Mejor conservar el que hay y no tocar nada.
+    if (-not $want) { Warn "No se pudo leer sites.json: no se reemite el certificado (se conserva el actual)."; return $false }
     $have = @()
     if (Test-Path $SslNames) { $have = @(Get-Content $SslNames -ErrorAction SilentlyContinue | Where-Object { $_ }) }
     $upToDate = (Test-Path $SslCert) -and (Test-Path $SslKey) -and (($want -join '|') -eq ($have -join '|'))
@@ -560,6 +567,20 @@ function Regenerate-Vhosts {
     # vhosts actuales. Antes se borraban todos y luego fallaba el parseo -> cero vhosts ->
     # todos los proyectos caian al vhost por defecto hasta arreglar el JSON.
     try { $cfg = Get-Config } catch { Warn "sites.json invalido: se conservan los vhosts actuales ($($_.Exception.Message))"; return }
+    # El certificado se refresca AQUI, no solo en Cmd-Apply, porque este es el unico punto por
+    # el que pasan TODOS los caminos que cambian dominios. Antes solo lo hacia Cmd-Apply, asi
+    # que las ediciones desde el panel entraban en el certificado pero la CREACION de proyectos
+    # no: tanto el job 'site' del panel como los comandos del CLI (add-site/add-external/
+    # remove-site/switch-php, todos via Cmd-Reload) llaman a Regenerate-Vhosts directamente.
+    # Resultado: cada proyecto nuevo se quedaba con su vhost :443 generado pero SIN estar en el
+    # certificado -> el navegador lo rechazaba por nombre no coincidente, para siempre (asi se
+    # detecto, con ps802.local). Es no-op barato si la lista no ha cambiado (leer sites.json y
+    # comparar cadenas), y quien llama aqui reinicia Apache despues, que es lo que hace falta
+    # para que recoja el certificado nuevo.
+    # Va DESPUES de la guarda de arriba a proposito: si sites.json no se puede leer, aqui ya se
+    # ha salido y no se toca el certificado (Update-SslCert tiene ademas su propia guarda, pero
+    # asi no depende de ella).
+    Update-SslCert | Out-Null
     Get-ChildItem $VhostDir -Filter *.conf -ErrorAction SilentlyContinue | Remove-Item -Force
     foreach ($p in $cfg.sites.PSObject.Properties.Name) {
         $s = $cfg.sites.$p; $dom = $null
@@ -1475,6 +1496,9 @@ function Cmd-Apply {
     # necesita admin (solo lo necesitaria "mkcert -install", que ya se hizo al activar HTTPS),
     # asi que tambien funciona cuando esto lo ejecuta el watcher. Antes el certificado solo se
     # emitia al activar HTTPS: cualquier proyecto anadido despues se quedaba fuera para siempre.
+    # Regenerate-Vhosts (mas abajo) lo repite por su cuenta para cubrir los caminos que no pasan
+    # por aqui; esta llamada se queda porque tiene que ir ANTES de Set-Ssl, y la segunda es
+    # entonces un no-op (la lista ya casa con names.txt).
     Update-SslCert | Out-Null
     Set-Ssl
     Regenerate-Vhosts

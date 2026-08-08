@@ -36,9 +36,17 @@ if ($__ta==='term_run' || $__ta==='term_poll' || $__ta==='term_stop' || $__ta===
         $homeDir = $ROOT.'/tmp/home';
         @mkdir($homeDir.'/AppData/Roaming', 0777, true);
         @mkdir($homeDir.'/composer', 0777, true);
+        // git (invocado por composer, o a mano) resuelve su config global via %HOME% en
+        // Windows -- sin fijarlo aqui hereda el perfil real de la cuenta que lanza Apache
+        // (SYSTEM si esta instalado como servicio), perfil que ni el usuario ni este panel
+        // pueden editar. Al fijar HOME a esta carpeta autocontenida, "safe.directory = *"
+        // en su .gitconfig cubre cualquier proyecto sin pedir admin ni depender de la cuenta.
+        $gitConfigFile = $homeDir.'/.gitconfig';
+        if (!file_exists($gitConfigFile)) { @file_put_contents($gitConfigFile, "[safe]\n\tdirectory = *\n"); }
         $wr  = "@echo off\r\n";
         $wr .= "title lua_".$runid."\r\n";
         $wr .= "chcp 65001 >NUL\r\n";
+        $wr .= "set \"HOME=".term_win($homeDir)."\"\r\n";
         $wr .= "set \"APPDATA=".term_win($homeDir)."\\AppData\\Roaming\"\r\n";
         $wr .= "set \"COMPOSER_HOME=".term_win($homeDir)."\\composer\"\r\n";
         // Si el runner conoce la version de PHP del proyecto (pasada desde luaOpenRunner), su
