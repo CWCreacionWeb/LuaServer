@@ -516,7 +516,7 @@ SSLSessionCacheTimeout 300
         Write-Utf8NoBom $SslConf "# HTTPS desactivado"
     }
 }
-function New-VhostFile($name, $php, $domain, $base) {
+function New-VhostFile($name, $php, $domain, $base, $httpsRedirect) {
     if (-not $domain) { $domain = "$name.$(Get-Tld)" }
     if (-not $base)   { $base = Join-Path $Www $name }
     $docroot = Fwd (Get-DocRoot $base)
@@ -525,7 +525,32 @@ function New-VhostFile($name, $php, $domain, $base) {
     $logdir  = Fwd $ApacheLog
     $tpl = Get-Content $Template -Raw
     $out = $tpl.Replace('{NAME}',$name).Replace('{DOMAIN}',$domain).Replace('{PHPVER}',$php).Replace('{DOCROOT}',$docroot).Replace('{PHPDIR}',$phpdir).Replace('{PHPCGI}',$phpcgi).Replace('{LOGDIR}',$logdir)
-    if ((Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)) {
+    $httpsReady = (Test-Path $HttpsFlag) -and (Test-Path $SslCert) -and (Test-Path $SslKey)
+    # Redireccion a HTTPS, opcional por proyecto ("httpsRedirect" en sites.json, se activa
+    # desde la ficha del proyecto en el panel). Se inyecta en el bloque :80 -- que en este
+    # punto es TODO lo que hay en $out, porque el de :443 se anade despues -- anclando en su
+    # ServerAlias en vez de con un token {...} en la plantilla: asi la plantilla sigue siendo
+    # valida por si sola si un watcher con codigo viejo la regenera, mismo motivo que la
+    # restriccion a loopback de phpMyAdmin de mas abajo.
+    #
+    # Solo se emite si HTTPS esta REALMENTE listo: con el flag quitado o sin certificado, el
+    # :443 no se genera, asi que redirigir ahi dejaria el proyecto muerto en ambos puertos.
+    if ($httpsRedirect -and $httpsReady) {
+        $anchor = "    ServerAlias www.$domain"
+        $out = $out.Replace($anchor, @"
+$anchor
+
+    # Redirigir a HTTPS (opcion de este proyecto en el panel).
+    # 302 y NO 301 a proposito: el 301 se queda cacheado en el navegador y seguiria forzando
+    # https aunque se desactive aqui, lo que parece "el panel no hace nada" y solo se arregla
+    # limpiando la cache del navegador. En un servidor de desarrollo eso no compensa.
+    # %{HTTP_HOST} conserva el www. del ServerAlias (el certificado cubre las dos formas).
+    RewriteEngine On
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=302,L]
+
+"@)
+    }
+    if ($httpsReady) {
         $cert = Fwd $SslCert; $key = Fwd $SslKey
         $out = $out + @"
 
@@ -586,7 +611,8 @@ function Regenerate-Vhosts {
         $s = $cfg.sites.$p; $dom = $null
         if (($s.PSObject.Properties.Name -contains 'domain') -and $s.domain) { $dom = $s.domain }
         $base = Get-SiteBase $s $p
-        New-VhostFile $p $s.php $dom $base
+        $red = ($s.PSObject.Properties.Name -contains 'httpsRedirect') -and $s.httpsRedirect
+        New-VhostFile $p $s.php $dom $base $red
     }
 }
 function Get-SiteDomain($cfg, $name) {

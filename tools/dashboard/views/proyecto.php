@@ -60,7 +60,32 @@
               </button>
             <?php endif; ?>
           </div>
-          <a class="url" href="http://<?= e($pDom) ?>" target="_blank" style="display:inline-block;margin-top:6px">http://<?= e($pDom) ?> &#8599;</a>
+          <?php
+            $pHttpsOn = is_file($ROOT.'/config/https.on');
+            $pRedir   = is_array($pInfo) && !empty($pInfo['httpsRedirect']);
+            // Si el proyecto redirige, enlazar a http:// solo para que el navegador rebote:
+            // se enlaza ya a https.
+            $pScheme  = ($pRedir && $pHttpsOn) ? 'https' : 'http';
+          ?>
+          <a class="url" href="<?= $pScheme ?>://<?= e($pDom) ?>" target="_blank" style="display:inline-block;margin-top:6px"><?= $pScheme ?>://<?= e($pDom) ?> &#8599;</a>
+          <div class="row" style="gap:8px;margin-top:6px">
+            <?php if ($pHttpsOn): ?>
+              <form method="post" style="margin:0">
+                <input type="hidden" name="action" value="set_https_redirect">
+                <input type="hidden" name="name" value="<?= e($pName) ?>">
+                <input type="hidden" name="enable" value="<?= $pRedir?'0':'1' ?>">
+                <button type="submit" class="jstate <?= $pRedir?'ok':'warn' ?>" title="<?= $pRedir?'Ahora http:// redirige a https:// (302, temporal). Clic para desactivarlo.':'Ahora http:// y https:// responden por separado. Clic para que http:// redirija a https:// con un 302 temporal.' ?>">
+                  Redirección a HTTPS: <?= $pRedir?'activada':'desactivada' ?>
+                </button>
+              </form>
+              <!-- El bucle es el fallo tipico de esta opcion y no lo puede evitar el servidor:
+                   si la app manda a http por su cuenta, http->https->http->... para siempre. -->
+              <span class="muted" style="font-size:11.5px" title="El servidor manda de http a https, pero si la aplicación devuelve a http por su cuenta se quedan rebotando. En WordPress son WP_HOME/WP_SITEURL; en PrestaShop, PS_SSL_ENABLED.">Si la app fuerza <code>http</code> por su cuenta, se crea un bucle.</span>
+            <?php else: ?>
+              <span class="jstate" title="La redirección necesita HTTPS activo: sin certificado, el puerto 443 de este proyecto ni siquiera se genera.">Redirección a HTTPS: no disponible</span>
+              <a class="muted" style="font-size:12px" href="?tab=config">Activar HTTPS</a>
+            <?php endif; ?>
+          </div>
           <form method="post" class="inline" style="margin-top:6px;gap:6px">
             <input type="hidden" name="action" value="set_domain">
             <input type="hidden" name="name" value="<?= e($pName) ?>">

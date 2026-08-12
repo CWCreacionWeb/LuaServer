@@ -93,6 +93,36 @@
             }
         }
     }
+    elseif ($action === 'set_https_redirect') {
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        $on = ($_POST['enable'] ?? '') === '1';
+        $httpsOn = is_file($ROOT.'/config/https.on');
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
+        // Activarla sin HTTPS dejaria el proyecto inaccesible por los dos puertos: el :80
+        // redirigiendo a un :443 que no se genera. Apagarla si que se permite siempre.
+        elseif ($on && !$httpsOn) { $msg = 'error:Activa HTTPS en Configuración del servidor antes de forzar la redirección.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            if (!is_array($cfg['sites'][$name])) { $cfg['sites'][$name] = ['php'=>$cfg['sites'][$name]]; }
+            // Se quita la clave en vez de guardar false: sites.json se lee a mano a menudo y
+            // asi solo aparece en los proyectos que de verdad la tienen puesta.
+            if ($on) { $cfg['sites'][$name]['httpsRedirect'] = true; }
+            else { unset($cfg['sites'][$name]['httpsRedirect']); }
+            write_json($CFG_FILE, $cfg);
+            // lua_apply() solo deja un flag: sin watcher que lo recoja el vhost no se
+            // regenera y la opcion no haria nada, asi que no se anuncia como aplicada.
+            if (!watcher_alive($ROOT)) {
+                $msg = 'error:Guardado, pero el watcher no está activo: el vhost no se regenerará hasta que lo arranques con .\lua.ps1 start.';
+            } else {
+                lua_apply();
+                $msg = $on
+                    ? 'applied:"'.$name.'" redirigirá a HTTPS. Si tu navegador ya tiene cacheada la versión http, recárgala con Ctrl+F5.'
+                    : 'applied:"'.$name.'" ya no redirige a HTTPS. Seguirá respondiendo por https:// si entras a mano.';
+            }
+        }
+    }
     elseif ($action === 'set_domain') {
         $name = $_POST['name'] ?? '';
         $tab = 'proyecto'; $redirName = $name;

@@ -828,6 +828,29 @@ Dos cosas que hay que respetar si se vuelve a tocar esto:
     en contexto seguro y `http://lua.test` —la URL que recomienda la trampa nº2— **no** lo es
     (127.0.0.1 y localhost sí).
 
+- **Redirección a HTTPS por proyecto** (ficha de proyecto) — interruptor que hace que el
+  `:80` de ese proyecto mande a `https://`. Se guarda como `httpsRedirect: true` en
+  `sites.json` (la clave se **quita** al desactivar, en vez de guardar `false`: ese archivo se
+  lee a mano a menudo) y lo materializa `New-VhostFile` con `mod_rewrite` —ya cargado, se
+  comprobó con `httpd.exe -M`, no con el `httpd-lua.conf` generado, que solo es un fragmento
+  incluido y no lleva los `LoadModule`—. Cuatro decisiones con motivo:
+  - **302, no 301.** Un 301 se queda cacheado en el navegador y sigue forzando `https`
+    aunque se desactive la opción, lo que parece "el panel no hace nada" y solo se arregla
+    limpiando la caché. En un servidor de desarrollo, donde esto se enciende y se apaga para
+    probar, no compensa.
+  - **Solo se emite si HTTPS está listo de verdad** (`https.on` + certificado + clave, la
+    misma condición que genera el bloque `:443`). Sin eso el `:443` no existe y redirigir ahí
+    dejaría el proyecto muerto en los dos puertos. La acción del panel tampoco deja activarlo
+    sin HTTPS, pero **sí** deja desactivarlo siempre.
+  - `RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI}` conserva el host (`www.` incluido, que
+    el certificado ya cubre), la ruta y la query. Verificado con `/admin/login?x=1&y=2`.
+  - Se **inyecta anclando en el `ServerAlias`** del bloque `:80`, no con un token `{...}` en
+    `vhost.tpl`: así la plantilla sigue siendo válida por sí sola si un watcher con código
+    viejo la regenera (mismo motivo que la restricción a loopback de phpMyAdmin).
+  - El fallo típico que el servidor **no** puede evitar: si la propia app devuelve a `http`
+    (WordPress con `WP_HOME`/`WP_SITEURL`, PrestaShop con `PS_SSL_ENABLED=0`) se monta un
+    bucle infinito. Hay un aviso en la ficha, junto al interruptor.
+
 - **Actualización de la plataforma** — la versión sale junto al título del panel (etiqueta de
   git si existe, si no `r<nº commits> <sha>`), y se vuelve ámbar cuando hay novedades. El
   **watcher** hace `git fetch` cada X horas (`config\update.json`, fuera de git) y deja el
