@@ -48,9 +48,21 @@ function notes_read($root, $name){
             'color'   => notes_valid_color($n['color'] ?? 'amber'),
             'created' => (int)($n['created'] ?? 0),
             'updated' => (int)($n['updated'] ?? 0),
+            'locked'  => !empty($n['locked']),
+            'hash'    => (string)($n['hash'] ?? ''),
         ];
     }
     return $out;
+}
+
+// Contraseña del candado de una nota: NUNCA en claro, solo su hash (password_hash ya se
+// encarga de la sal). No pretende ser un boveda -- data\notes\ ya vive fuera de git y en
+// texto plano por diseno -- pero evita que el contenido de una nota bloqueada se pueda leer
+// con "ver codigo fuente" durante una captura de pantalla, que es la amenaza real que pide
+// este candado (quien tenga acceso al disco ya podia leer sites.json/ftp/etc. igual de claro).
+function notes_hash_pass($pass){ return password_hash((string)$pass, PASSWORD_DEFAULT); }
+function notes_check_pass($note, $pass){
+    return $note['hash'] !== '' && password_verify((string)$pass, $note['hash']);
 }
 
 function notes_write($root, $name, $notes){

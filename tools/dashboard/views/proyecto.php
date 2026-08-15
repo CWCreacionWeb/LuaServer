@@ -191,14 +191,34 @@
             </div>
           </form>
 
-          <?php foreach ($pNotes as $n): ?>
-            <form method="post" class="pnote pnote-<?= e($n['color']) ?>" id="noteF<?= e($n['id']) ?>">
+          <?php foreach ($pNotes as $n): $nLocked = !empty($n['locked']); ?>
+            <form method="post" class="pnote pnote-<?= e($n['color']) ?><?= $nLocked?' locked':'' ?>" id="noteF<?= e($n['id']) ?>" data-note-id="<?= e($n['id']) ?>">
               <input type="hidden" name="action" value="note_save">
               <input type="hidden" name="name" value="<?= e($pName) ?>">
               <input type="hidden" name="id" value="<?= e($n['id']) ?>">
-              <input class="pnote-title" name="title" maxlength="<?= NOTES_MAX_TITLE ?>" value="<?= e($n['title']) ?>" placeholder="Sin título" autocomplete="off">
-              <textarea class="pnote-body" name="body" maxlength="<?= NOTES_MAX_BODY ?>" placeholder="Vacía" spellcheck="false" autocomplete="off"><?= e($n['body']) ?></textarea>
+              <div class="pnote-content">
+                <!-- Bloqueada: el titulo/cuerpo reales NUNCA se imprimen aqui (ver ajax/notes.php),
+                     asi que estos campos quedan vacios y deshabilitados (no viajan en el POST:
+                     "Guardar" no puede pisar la nota real con blanco) hasta revelarla. -->
+                <input class="pnote-title" name="title" maxlength="<?= NOTES_MAX_TITLE ?>" value="<?= $nLocked?'':e($n['title']) ?>" placeholder="<?= $nLocked?'':'Sin título' ?>" autocomplete="off" <?= $nLocked?'disabled':'' ?>>
+                <textarea class="pnote-body" name="body" maxlength="<?= NOTES_MAX_BODY ?>" placeholder="<?= $nLocked?'':'Vacía' ?>" spellcheck="false" autocomplete="off" <?= $nLocked?'disabled':'' ?>><?= $nLocked?'':e($n['body']) ?></textarea>
+                <?php if ($nLocked): ?>
+                  <div class="pnote-lock-overlay">
+                    <div class="pnote-lock-fake" aria-hidden="true">
+                      <span style="width:78%"></span><span style="width:52%"></span><span style="width:66%"></span><span style="width:38%"></span>
+                    </div>
+                    <button type="button" class="pnote-unlock-btn lua-note-unlock" data-note-id="<?= e($n['id']) ?>" title="Ver contenido">
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                      Ver contenido
+                    </button>
+                  </div>
+                <?php endif; ?>
+              </div>
               <div class="pnote-foot">
+                <span class="pnote-drag" draggable="true" title="Arrastrar para reordenar" aria-label="Arrastrar para reordenar">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg>
+                </span>
+                <?php if (!$nLocked): ?>
                 <div class="pnote-dots">
                   <?php foreach (notes_colors() as $ck=>$cl): ?>
                     <label title="<?= e($cl) ?>">
@@ -207,14 +227,24 @@
                     </label>
                   <?php endforeach; ?>
                 </div>
+                <?php endif; ?>
                 <span class="pnote-when"><?= e(notes_when($n)) ?></span>
                 <div class="pnote-acts">
+                  <button type="button" class="pnote-act lua-note-lock" data-note-id="<?= e($n['id']) ?>" data-locked="<?= $nLocked?'1':'0' ?>" title="<?= $nLocked?'Desbloquear nota':'Bloquear con contraseña' ?>" aria-label="<?= $nLocked?'Desbloquear nota':'Bloquear con contraseña' ?>">
+                    <?php if ($nLocked): ?>
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                    <?php else: ?>
+                      <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
+                    <?php endif; ?>
+                  </button>
+                  <?php if (!$nLocked): ?>
                   <button type="button" class="pnote-act lua-note-copy" title="Copiar el contenido" aria-label="Copiar el contenido">
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                   </button>
                   <button type="submit" class="pnote-act" title="Guardar cambios" aria-label="Guardar cambios">
                     <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
                   </button>
+                  <?php endif; ?>
                   <!-- Borrar necesita su propio form (no se pueden anidar): vive fuera del
                        tablero y se enlaza por el atributo form=, mismo truco que el editor
                        de .env de mas abajo. -->
@@ -234,6 +264,28 @@
             <input type="hidden" name="id" value="<?= e($n['id']) ?>">
           </form>
         <?php endforeach; ?>
+
+        <!-- Modal compartido de contraseña: bloquear, ver contenido y desbloquear reusan el
+             mismo dialogo (solo cambian titulo/texto/accion), igual que el resto de modales
+             de la ficha (overlay + box, Escape para cerrar). -->
+        <div id="notePassModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseNotePass()">
+          <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="notePassTitle">
+            <div class="modal-ic">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            </div>
+            <h3 id="notePassTitle">Nota bloqueada</h3>
+            <p class="modal-tx" id="notePassText"></p>
+            <form onsubmit="return luaNotePassSubmit(event)">
+              <input type="password" id="notePassInput" placeholder="Contraseña" autocomplete="new-password" style="width:100%;margin-bottom:8px" required>
+              <div class="muted" id="notePassErr" style="color:var(--err);font-size:12px;margin-bottom:8px;display:none"></div>
+              <div class="modal-actions">
+                <button type="button" class="btn ghost" onclick="luaCloseNotePass()">Cancelar</button>
+                <button type="submit" class="btn" id="notePassBtn">Continuar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
         <script>
           (function(){
             // Copiar: navigator.clipboard solo existe en contexto seguro, y el panel se sirve
@@ -276,6 +328,135 @@
               if (!ta.value) return;
               ta.style.height = 'auto';
               ta.style.height = Math.min(ta.scrollHeight + 2, 420) + 'px';
+            });
+
+            // ---------------- Reordenar por arrastre (drag&drop nativo, sin libreria) ----------------
+            var wall = document.querySelector('.pnwall');
+            var dragEl = null;
+            if (wall) {
+              wall.addEventListener('dragstart', function(ev){
+                var handle = ev.target.closest ? ev.target.closest('.pnote-drag') : null;
+                var card = handle ? handle.closest('.pnote') : null;
+                if (!card || card.classList.contains('pnew')) { ev.preventDefault(); return; }
+                dragEl = card;
+                setTimeout(function(){ card.classList.add('dragging'); }, 0); // tras el "snapshot" del ghost de arrastre
+                ev.dataTransfer.effectAllowed = 'move';
+                try { ev.dataTransfer.setData('text/plain', card.getAttribute('data-note-id') || ''); } catch(e){}
+              });
+              wall.addEventListener('dragover', function(ev){
+                if (!dragEl) return;
+                ev.preventDefault();
+                ev.dataTransfer.dropEffect = 'move';
+                var target = ev.target.closest ? ev.target.closest('.pnote') : null;
+                if (!target || target === dragEl || target.classList.contains('pnew')) return;
+                var rect = target.getBoundingClientRect();
+                var before = (ev.clientY - rect.top) < rect.height / 2;
+                wall.insertBefore(dragEl, before ? target : target.nextSibling);
+              });
+              wall.addEventListener('dragend', function(){
+                if (!dragEl) return;
+                dragEl.classList.remove('dragging');
+                var ids = Array.prototype.slice.call(wall.querySelectorAll('.pnote:not(.pnew)'))
+                            .map(function(f){ return f.getAttribute('data-note-id'); });
+                dragEl = null;
+                fetch('?', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                  body:'action=note_reorder&ajax=1&name='+encodeURIComponent(<?= json_encode($pName) ?>)+'&order='+encodeURIComponent(ids.join(','))})
+                  .catch(function(){});
+              });
+            }
+
+            // ---------------- Candado con contraseña ----------------
+            var ppModal, ppTitle, ppText, ppInput, ppErr, ppBtn;
+            var ppMode = null, ppId = null, ppCard = null;
+            function ppInit(){
+              ppModal = document.getElementById('notePassModal');
+              ppTitle = document.getElementById('notePassTitle');
+              ppText  = document.getElementById('notePassText');
+              ppInput = document.getElementById('notePassInput');
+              ppErr   = document.getElementById('notePassErr');
+              ppBtn   = document.getElementById('notePassBtn');
+            }
+            function ppEsc(e){ if (e.key === 'Escape') luaCloseNotePass(); }
+            function ppOpen(mode, id, card){
+              if (!ppModal) ppInit();
+              ppMode = mode; ppId = id; ppCard = card;
+              ppErr.style.display = 'none'; ppInput.value = '';
+              if (mode === 'lock') {
+                ppTitle.textContent = 'Bloquear nota';
+                ppText.textContent = 'Elige una contraseña. Hará falta para ver o editar el contenido de esta nota (recuerda que data\\notes\\ ya está fuera de git, esto solo evita que se vea a simple vista).';
+                ppBtn.textContent = 'Bloquear';
+              } else if (mode === 'view') {
+                ppTitle.textContent = 'Nota bloqueada';
+                ppText.textContent = 'Introduce la contraseña para ver el contenido.';
+                ppBtn.textContent = 'Ver';
+              } else {
+                ppTitle.textContent = 'Desbloquear nota';
+                ppText.textContent = 'Introduce la contraseña para quitar el bloqueo.';
+                ppBtn.textContent = 'Desbloquear';
+              }
+              ppModal.hidden = false;
+              document.addEventListener('keydown', ppEsc);
+              setTimeout(function(){ ppInput.focus(); }, 30);
+            }
+            window.luaCloseNotePass = function(){
+              if (ppModal) ppModal.hidden = true;
+              document.removeEventListener('keydown', ppEsc);
+            };
+            function ppShowErr(t){ ppErr.textContent = t; ppErr.style.display = 'block'; ppInput.focus(); ppInput.select(); }
+            function ppReveal(card, title, body){
+              card.classList.remove('locked');
+              var t = card.querySelector('.pnote-title'), b = card.querySelector('.pnote-body');
+              if (t) { t.value = title; t.placeholder = 'Sin título'; t.disabled = false; }
+              if (b) {
+                b.value = body; b.placeholder = 'Vacía'; b.disabled = false;
+                b.style.height = 'auto'; b.style.height = Math.min(b.scrollHeight + 2, 420) + 'px';
+              }
+              var ov = card.querySelector('.pnote-lock-overlay');
+              if (ov) ov.remove();
+              // Nota: esto solo dura mientras esta pagina siga cargada. Recargar la ficha vuelve
+              // a pedir la contraseña -- "visto" no se guarda en ningun sitio.
+            }
+            window.luaNotePassSubmit = function(ev){
+              ev.preventDefault();
+              var pass = ppInput.value;
+              var name = <?= json_encode($pName) ?>;
+              ppBtn.disabled = true;
+              if (ppMode === 'view') {
+                fetch('?ajax=note_reveal', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                  body:'name='+encodeURIComponent(name)+'&id='+encodeURIComponent(ppId)+'&password='+encodeURIComponent(pass)})
+                  .then(function(r){ return r.json(); })
+                  .then(function(j){
+                    ppBtn.disabled = false;
+                    if (j.ok) { ppReveal(ppCard, j.title, j.body); luaCloseNotePass(); }
+                    else { ppShowErr(j.error || 'Contraseña incorrecta.'); }
+                  })
+                  .catch(function(){ ppBtn.disabled = false; ppShowErr('Error de red.'); });
+              } else {
+                var action = ppMode === 'lock' ? 'note_lock_set' : 'note_lock_remove';
+                fetch('?', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                  body:'action='+action+'&ajax=1&name='+encodeURIComponent(name)+'&id='+encodeURIComponent(ppId)+'&password='+encodeURIComponent(pass)})
+                  .then(function(r){ return r.json(); })
+                  .then(function(j){
+                    ppBtn.disabled = false;
+                    if (j.ok) { location.reload(); }
+                    else { ppShowErr(j.msg || 'No se pudo completar la operación.'); }
+                  })
+                  .catch(function(){ ppBtn.disabled = false; ppShowErr('Error de red.'); });
+              }
+              return false;
+            };
+            document.addEventListener('click', function(ev){
+              var lockBtn = ev.target.closest ? ev.target.closest('.lua-note-lock') : null;
+              if (lockBtn) {
+                var card = lockBtn.closest('.pnote');
+                var id = lockBtn.getAttribute('data-note-id');
+                ppOpen(lockBtn.getAttribute('data-locked') === '1' ? 'remove' : 'lock', id, card);
+                return;
+              }
+              var unlockBtn = ev.target.closest ? ev.target.closest('.lua-note-unlock') : null;
+              if (unlockBtn) {
+                ppOpen('view', unlockBtn.getAttribute('data-note-id'), unlockBtn.closest('.pnote'));
+              }
             });
           })();
         </script>

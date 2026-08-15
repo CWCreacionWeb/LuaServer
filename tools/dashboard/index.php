@@ -73,6 +73,7 @@ include __DIR__.'/ajax/cover-brand.php';
 include __DIR__.'/ajax/export-db.php';
 include __DIR__.'/ajax/pickfolder.php';
 include __DIR__.'/ajax/file-tree.php';
+include __DIR__.'/ajax/notes.php';
 include __DIR__.'/ajax/logs.php';
 include __DIR__.'/ajax/procs.php';
 include __DIR__.'/ajax/redis.php';
@@ -156,6 +157,12 @@ $unreg = unregistered_projects($WWW, $sites);
 $tab = $_GET['tab'] ?? 'proyectos';
 $msg = $_GET['msg'] ?? '';
 [$mtype,$mtext] = array_pad(explode(':',$msg,2),2,'');
+// Recarga automatica (banners 'applied'/'info' mas abajo): tiene que volver a la MISMA vista,
+// no solo a la misma pestana -- '?tab=proyecto' sin '&name=' pierde la ficha de proyecto y manda
+// a una pagina "No se encontro el proyecto". Se reconstruye toda la query string actual (que ya
+// trae name/ver/log/engine... segun la pestana) quitando solo 'msg', que es lo unico que no debe
+// repetirse en la recarga.
+$reloadTarget = '?'.http_build_query(array_diff_key($_GET, ['msg'=>true]));
 $reopenNewProject = ($_GET['reopen'] ?? '') === 'newproject';
 $curPhp = PHP_VERSION;
 $jobs = read_jobs($ROOT.'/tmp/jobs');
@@ -178,13 +185,13 @@ $termOnHdr = is_file($ROOT.'/config/terminal.on');
 // Recarga resiliente: en vez de un temporizador fijo (que caia sobre Apache mientras se
 // reiniciaba -> connection refused), sondeamos ?ping=1 hasta que responda y solo entonces
 // navegamos. Tope ~31s por si algo se atasca (recarga igualmente).
-(function(){var t='?tab=<?= e($tab) ?>',n=0;
+(function(){var t=<?= json_encode($reloadTarget) ?>,n=0;
 function go(){location.href=t;}
 function ping(){fetch('?ping=1',{cache:'no-store'}).then(function(r){if(r.ok){go();}else{retry();}}).catch(retry);}
 function retry(){if(++n>60){go();return;}setTimeout(ping,500);}
 setTimeout(ping,1500);})();
 </script><?php endif; ?>
-<?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href='?tab=<?= e($tab) ?>';},7000);</script><?php endif; ?>
+<?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href=<?= json_encode($reloadTarget) ?>;},7000);</script><?php endif; ?>
 <?php if (($tab==='proyectos' || $tab==='config' || $tab==='proyecto') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='bd' && ($anyDbImportRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
@@ -456,12 +463,28 @@ setTimeout(ping,1500);})();
   @media (prefers-color-scheme:dark){ .pnote{--pn-dim:.82} }
   /* Los campos son el propio papel: sin caja ni fondo, para que la nota se lea como una nota
      y no como un formulario. El foco solo subraya. */
+  .pnote-content{display:flex;flex-direction:column;flex:1;min-height:0;position:relative}
   .pnote input.pnote-title,.pnote textarea.pnote-body{width:100%;background:transparent;border:0;padding:0;margin:0;color:inherit;font-family:inherit;box-shadow:none;border-radius:0}
   .pnote input.pnote-title{font-size:13.5px;font-weight:700;line-height:1.35;padding-bottom:5px;border-bottom:1px solid var(--pn-line);margin-bottom:7px}
   .pnote textarea.pnote-body{flex:1;resize:vertical;min-height:88px;font-size:12.5px;line-height:1.5;font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;overflow:auto}
   .pnote input.pnote-title:focus,.pnote textarea.pnote-body:focus{outline:0;border-color:currentColor}
   .pnote input.pnote-title::placeholder,.pnote textarea.pnote-body::placeholder{color:var(--pn-ink);opacity:.45}
+  /* Candado: el titulo/cuerpo de una nota bloqueada llegan VACIOS del servidor (nunca se manda
+     el contenido real, ver ajax/notes.php) -- esta capa es solo la "textura" de nota tapada:
+     lineas falsas desenfocadas + boton para pedir la contraseña y revelar el contenido real. */
+  .pnote-lock-overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;
+                       padding:10px;border-radius:3px;background:rgba(255,255,255,.32);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+  .pnote-lock-fake{display:flex;flex-direction:column;gap:8px;width:100%;filter:blur(2px);opacity:.5;pointer-events:none}
+  .pnote-lock-fake span{display:block;height:9px;border-radius:5px;background:currentColor;opacity:.4}
+  .pnote-unlock-btn{display:flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--pn-line);border-radius:7px;
+                     background:rgba(255,255,255,.5);color:inherit;font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:filter .12s}
+  .pnote-unlock-btn:hover{filter:brightness(1.05);background:rgba(255,255,255,.75)}
   .pnote-foot{display:flex;align-items:center;gap:6px;margin-top:8px;padding-top:7px;border-top:1px solid var(--pn-line);min-height:26px}
+  /* Asa de arrastre: icono propio (nunca toda la tarjeta) para no pelearse con la seleccion de
+     texto del titulo/cuerpo -- solo esta zona inicia el drag&drop de reordenar. */
+  .pnote-drag{display:flex;align-items:center;justify-content:center;width:20px;height:20px;color:var(--pn-ink);opacity:.55;cursor:grab;flex:0 0 auto}
+  .pnote-drag:hover{opacity:.9}
+  .pnote.dragging{opacity:.35}
   .pnote-when{font-size:10.5px;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   /* La barra de acciones solo aparece al pasar por encima o al editar: en reposo la pared se
      ve como notas, no como una rejilla de botones. Siempre visible con el teclado (focus). */
@@ -1125,8 +1148,19 @@ setTimeout(ping,1500);})();
           setTimeout(function(){ pollRun(p); }, 700);
         });
       }
+      // Los botones de fabrica ya hacen este truco (la etiqueta dice "artisan migrate" pero
+      // en realidad lanzan "php artisan migrate", ver luaOpenRunner): "artisan" por si solo
+      // no es nada ejecutable en Windows (es un script PHP, no un .exe/.bat), asi que sin
+      // esto un comando personalizado escrito igual que las etiquetas de los botones ("artisan
+      // db:seed --class=X") fallaba con "'artisan' no se reconoce...". Se antepone "php " a
+      // cualquier comando que empiece por "artisan" (guardado o de un solo uso), venga de
+      // donde venga, para que se comporte igual que los botones de fabrica.
+      function normalizeCmd(cmd){
+        return /^artisan(\s|$)/i.test(cmd) ? 'php '+cmd : cmd;
+      }
       function startRun(p, name, phpVer, cmd){
         if(runs[p]) return;
+        cmd=normalizeCmd(cmd);
         var sid=(function(){var a=new Uint8Array(10);crypto.getRandomValues(a);return Array.from(a).map(b=>b.toString(16).padStart(2,'0')).join('');})();
         runs[p]={sid:sid, runid:null, name:name, phpVer:phpVer, cmd:cmd, off:0,
           html:'<span class="a-prompt">&gt; </span>'+esc(cmd)+'\n'};
