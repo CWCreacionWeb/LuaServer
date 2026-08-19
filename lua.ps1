@@ -329,6 +329,18 @@ function Set-PhpInis {
         if ($hasOp -and -not $oldStyle) { $b.Add("zend_extension=$(& $extName 'opcache')"); $b.Add("opcache.enable = 1"); $b.Add("opcache.enable_cli = 0"); $b.Add("opcache.validate_timestamps = 1"); $b.Add("opcache.revalidate_freq = 0") }
         $b.Add("cgi.fix_pathinfo = 1")
         $b.Add("upload_tmp_dir = `"$tmpF`""); $b.Add("sys_temp_dir = `"$tmpF`""); $b.Add("session.save_path = `"$tmpF`"")
+        # El curl de PHP en Windows va enlazado con OpenSSL (no Schannel): no consulta el
+        # almacen de certificados de Windows, asi que sin esto cualquier llamada HTTPS
+        # saliente (APIs de IA, composer, etc.) falla con "cURL error 60: unable to get local
+        # issuer certificate". Calculado con Fwd $Root (nunca una ruta fija) para que funcione
+        # igual sea cual sea la carpeta donde cada maquina tenga instalado el servidor -- si
+        # esto se hubiera escrito a mano en config\php\*.overrides.ini, la ruta se habria
+        # quedado fija a la carpeta de quien lo escribiera y habria fallado en cualquier otra.
+        $cacertFile = Join-Path $Root "config\php\cacert.pem"
+        if (Test-Path $cacertFile) {
+            $cacertF = Fwd $cacertFile
+            $b.Add("curl.cainfo = `"$cacertF`""); $b.Add("openssl.cafile = `"$cacertF`"")
+        }
         # --- overrides editables desde el panel (sobreviven a las regeneraciones) ---
         $ovrDir = Join-Path $Root "config\php"; New-Item -ItemType Directory -Force -Path $ovrDir | Out-Null
         $ovr = Join-Path $ovrDir "$ver.overrides.ini"
@@ -1411,43 +1423,6 @@ function Cmd-Watch {
                 Write-Utf8NoBom (Join-Path $ProcsRunDir "state.json") $stJson
                 $procState = $stJson
             }
-            # Dialogo nativo "Elegir carpeta": el panel corre bajo el servicio de Apache (sesion 0,
-            # sin escritorio), asi que no puede mostrar UI el mismo -- lo pide aqui, en el watcher,
-            # que corre en la sesion interactiva del usuario. El panel solo espera el resultado
-            # haciendo polling AJAX sobre el .res que se escribe abajo.
-            $pfDir = Join-Path $TmpDir "pickfolder"
-            if (Test-Path $pfDir) {
-                foreach ($pfReq in (Get-ChildItem $pfDir -Filter *.req -ErrorAction SilentlyContinue)) {
-                    $pfId = [System.IO.Path]::GetFileNameWithoutExtension($pfReq.Name)
-                    Remove-Item $pfReq.FullName -Force -ErrorAction SilentlyContinue
-                    $pfOut = try {
-                        Add-Type -AssemblyName System.Windows.Forms | Out-Null
-                        # Formulario invisible "topmost" solo para forzar que el dialogo salga al
-                        # frente -- sin owner, ShowDialog() desde un host sin ventana visible a
-                        # veces se abre detras de otras ventanas y parece que "no ha pasado nada".
-                        $pfOwner = New-Object System.Windows.Forms.Form
-                        $pfOwner.TopMost = $true; $pfOwner.ShowInTaskbar = $false
-                        $pfOwner.StartPosition = 'CenterScreen'; $pfOwner.Width = 0; $pfOwner.Height = 0
-                        $pfOwner.Show(); $pfOwner.Activate()
-                        $pfDlg = New-Object System.Windows.Forms.FolderBrowserDialog
-                        $pfDlg.Description = "Elige la carpeta con los archivos .sql"
-                        $pfDlg.ShowNewFolderButton = $false
-                        $pfResult = $pfDlg.ShowDialog($pfOwner)
-                        $pfOwner.Close()
-                        if ($pfResult -eq [System.Windows.Forms.DialogResult]::OK) {
-                            @{ status = 'done'; path = $pfDlg.SelectedPath } | ConvertTo-Json -Compress
-                        } else {
-                            @{ status = 'cancelled' } | ConvertTo-Json -Compress
-                        }
-                    } catch {
-                        @{ status = 'error'; msg = $_.Exception.Message } | ConvertTo-Json -Compress
-                    }
-                    # Write-Utf8NoBom, no Set-Content -Encoding utf8: este metia BOM y el
-                    # json_decode() del lado PHP fallaba con el JSON perfectamente valido que
-                    # tenia detras ("respuesta ilegible") -- mismo gotcha ya conocido en .env.
-                    Write-Utf8NoBom (Join-Path $pfDir "$pfId.res") $pfOut
-                }
-            }
             # --- Actualizaciones ---
             # Comprobacion periodica + peticiones puntuales del panel. Si el propio lua.ps1 se
             # ha actualizado, este proceso relanza uno nuevo y termina: seguir vivo significaria
@@ -1649,6 +1624,14 @@ function Set-JobStatus($id, $name, $type, $state, $msg, $pct=$null) {
     $o = @{ id=$id; name=$name; type=$type; state=$state; msg=$msg; time=(Get-Date -Format "HH:mm:ss") }
     if ($null -ne $pct) { $o.pct = $pct }
     [System.IO.File]::WriteAllText((Join-Path $jd "$id.status"), ($o | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    # Un job largo (import de una carpeta con muchos .sql, un archivo enorme...) corre DENTRO de
+    # la misma vuelta del bucle de Cmd-Watch -- Process-Jobs no es asincrono, asi que mientras
+    # dura, el bucle nunca vuelve a su cabecera y tmp\watch.beat deja de tocarse. Pasados sus 15s
+    # de margen, watcher_alive() empezaba a decir "Watcher inactivo" con el watcher trabajando a
+    # maxima capacidad -- justo el falso "inactivo" que el latido se invento para evitar (ver
+    # CLAUDE.md, trampa nº1). Cada actualizacion de progreso de un job es, por definicion, prueba
+    # de que el watcher sigue vivo, asi que se aprovecha para refrescar el latido tambien.
+    try { Set-Content -Path (Join-Path $TmpDir "watch.beat") -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii -ErrorAction Stop } catch {}
 }
 function Add-SiteToConfig($name, $php) {
     $cfg = Get-Config
@@ -1998,8 +1981,8 @@ function Run-Job($id, $job) {
                     else {
                         $total = $sqlFiles.Count; $i = 0; $failCount = 0
                         "Importando $total archivo(s) .sql en `"$dbname`" desde $srcDir..." | Add-Content $log
-                        $mdArgs = @('--host=127.0.0.1','--port=3306','--user=root')
-                        if ($rootPass -ne '') { $mdArgs += "--password=$rootPass" }
+                        $mdArgParts = @('--host=127.0.0.1','--port=3306','--user=root')
+                        if ($rootPass -ne '') { $mdArgParts += (Quote-Win32Arg "--password=$rootPass") }
                         # "source <ruta>" (en vez de piping por stdin) deja que sea el propio cliente
                         # mariadb.exe quien lea el fichero -- evita cargar el .sql entero en memoria de
                         # PowerShell para luego canalizarlo (algunos dumps de esta carpeta pasan de 80 MB).
@@ -2007,8 +1990,26 @@ function Run-Job($id, $job) {
                             $i++
                             Set-JobStatus $id $name $type "running" "Importando $i/$total`: $($f.Name)" ([math]::Floor(($i-1)*100/$total))
                             $fFwd = $f.FullName -replace '\\','/'
-                            $out = & $mariadbExe @mdArgs -e "source $fFwd" $dbname 2>&1
-                            if ($LASTEXITCODE -ne 0) { $failCount++; "[$i/$total] FALLO: $($f.Name) -> $out" | Add-Content $log }
+                            # Lanzado con Process.Start (no "&") para poder esperar SIN bloquear del
+                            # todo: una sola tabla grande puede tardar mas de un minuto en "source", y
+                            # con "&" el proceso de PowerShell (y con el, el bucle entero de Cmd-Watch)
+                            # se queda congelado hasta que vuelve -- comprobado con una tabla de 6M
+                            # filas: tmp\watch.beat estuvo mas de 30s sin tocarse de una sentada, y
+                            # watcher_alive() decia "Watcher inactivo" con el watcher trabajando a
+                            # maxima capacidad. WaitForExit(1000) en bucle deja refrescar el latido
+                            # cada segundo mientras mariadb.exe sigue con el archivo.
+                            $psi = New-Object System.Diagnostics.ProcessStartInfo
+                            $psi.FileName = $mariadbExe
+                            $psi.Arguments = ($mdArgParts + @('-e', (Quote-Win32Arg "source $fFwd"), (Quote-Win32Arg $dbname))) -join ' '
+                            $psi.RedirectStandardError = $true
+                            $psi.UseShellExecute = $false
+                            $mdProc = [System.Diagnostics.Process]::Start($psi)
+                            $mdErrTask = $mdProc.StandardError.ReadToEndAsync()
+                            while (-not $mdProc.WaitForExit(1000)) {
+                                Set-Content -Path (Join-Path $TmpDir "watch.beat") -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii
+                            }
+                            $mdErr = $mdErrTask.GetAwaiter().GetResult()
+                            if ($mdProc.ExitCode -ne 0) { $failCount++; "[$i/$total] FALLO: $($f.Name) -> $mdErr" | Add-Content $log }
                             else { "[$i/$total] OK: $($f.Name)" | Add-Content $log }
                         }
                         if ($failCount -gt 0) { $ok=$false; $err="$failCount de $total archivo(s) fallaron (ver log)" }

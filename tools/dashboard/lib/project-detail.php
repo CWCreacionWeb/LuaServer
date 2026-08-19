@@ -73,3 +73,33 @@ function git_info($dir){
     return ['branch'=>$branch, 'dirty'=>$dirty, 'commits'=>$commits, 'remote'=>$remote];
 }
 
+// Conexion de base de datos "vinculada" a un proyecto desde su ficha: sites.json[...]['dbLink'],
+// formato "mysql:nombre" / "pgsql:nombre". Null si no hay ninguna vinculada o si la BD anotada
+// ya no existe (motor apagado, borrada a mano...).
+// Deliberadamente un campo DISTINTO de 'db'/'dbuser' (los que anota el guiado de WordPress):
+// esos SI provocan un DROP DATABASE automatico al borrar el proyecto (ver action 'delete' en
+// actions/projects.php). Vincular aqui una BD ya existente es solo para poder ver/copiar sus
+// credenciales -- no debe arriesgarse a borrarla si el proyecto se elimina despues.
+function project_db_link($root, $info){
+    $raw = is_array($info) ? (string)($info['dbLink'] ?? '') : '';
+    if ($raw === '' || strpos($raw, ':') === false) return null;
+    [$eng, $dbn] = explode(':', $raw, 2);
+    if ($eng === 'mysql') {
+        if (!in_array($dbn, mysql_databases() ?: [], true)) return null;
+        $user = 'root'; $pass = mysql_root_pass($root);
+        // Si el proyecto tiene un usuario MySQL propio anotado por el guiado de WordPress y es
+        // justo para esta misma BD, se ofrecen esas credenciales reales en vez de root.
+        if (!empty($info['dbuser']) && ($info['db'] ?? '') === $dbn) {
+            $u = (string)$info['dbuser'];
+            $known = mysql_users_passwords($root);
+            if (isset($known[$u.'@127.0.0.1'])) { $user = $u; $pass = $known[$u.'@127.0.0.1']; }
+        }
+        return ['engine'=>'mysql','label'=>'MySQL / MariaDB','driver'=>'mysql','db'=>$dbn,'host'=>'127.0.0.1','port'=>3306,'user'=>$user,'pass'=>$pass];
+    }
+    if ($eng === 'pgsql') {
+        if (!in_array($dbn, pgsrv_databases() ?: [], true)) return null;
+        return ['engine'=>'pgsql','label'=>'PostgreSQL','driver'=>'pgsql','db'=>$dbn,'host'=>'127.0.0.1','port'=>5432,'user'=>'postgres','pass'=>pgsrv_pass($root)];
+    }
+    return null;
+}
+

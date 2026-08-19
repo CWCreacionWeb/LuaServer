@@ -156,6 +156,36 @@
             }
         }
     }
+    elseif ($action === 'set_db_link') {
+        // Campo DISTINTO de 'db'/'dbuser' (los que anota el guiado de WordPress y que SI
+        // provocan un DROP DATABASE automatico al borrar el proyecto, ver action 'delete'):
+        // vincular aqui una BD ya existente es solo para verla/copiar sus credenciales desde
+        // la ficha, nunca debe arriesgarse a borrarla si el proyecto se elimina despues.
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $raw = trim((string)($_POST['dblink'] ?? ''));
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            if (!is_array($cfg['sites'][$name])) { $cfg['sites'][$name] = ['php'=>$cfg['sites'][$name]]; }
+            if ($raw === '') {
+                unset($cfg['sites'][$name]['dbLink']);
+                write_json($CFG_FILE, $cfg);
+                $msg = 'applied:Base de datos desvinculada de "'.$name.'".';
+            } else {
+                [$eng, $dbn] = strpos($raw, ':') !== false ? explode(':', $raw, 2) : ['', ''];
+                $valid = ($eng === 'mysql' && valid_dbname($dbn) && in_array($dbn, mysql_databases() ?: [], true))
+                      || ($eng === 'pgsql' && valid_pg_ident($dbn) && in_array($dbn, pgsrv_databases() ?: [], true));
+                if (!$valid) { $msg = 'error:Base de datos no válida.'; }
+                else {
+                    $cfg['sites'][$name]['dbLink'] = $raw;
+                    write_json($CFG_FILE, $cfg);
+                    $msg = 'applied:"'.$name.'" vinculado a la base de datos "'.$dbn.'".';
+                }
+            }
+        }
+    }
     elseif ($action === 'clearjobs') {
         foreach (glob($ROOT.'/tmp/jobs/*.status') as $f) @unlink($f);
         $msg='info:Historial de tareas limpiado.';
@@ -269,6 +299,11 @@
             $cfg['sites'][$name]['php']=$php; write_json($CFG_FILE,$cfg); lua_apply();
             $msg='applied:"'.$name.'" ahora usa PHP '.$php.'.';
         } else { $msg='error:No se pudo cambiar la versión.'; }
+        // Este mismo action lo usan tanto la tarjeta de "Proyectos" (se queda ahi, comportamiento
+        // por defecto) como el selector de la ficha de proyecto: solo esta segunda manda 'back'
+        // para volver a su propia pagina en vez de acabar en la lista, igual que 'clearlog'.
+        $back = (string)($_POST['back'] ?? '');
+        if ($back !== '' && strpos($back, '?tab=proyecto&name=') === 0) { header('Location: '.$back.'&msg='.urlencode($msg)); exit; }
     }
     elseif ($action === 'delete') {
         $name=$_POST['name']??'';

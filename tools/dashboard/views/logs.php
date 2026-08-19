@@ -55,7 +55,119 @@
         <button type="button" class="btn danger sm" id="logDeleteBtn">Eliminar</button>
         <span id="logActionStatus" class="muted" style="font-size:12px"></span>
       </div>
+      <button type="button" class="btn ghost sm" id="logsTreeToggle">Ver todos agrupados</button>
     </div>
+
+    <!-- Vista de mantenimiento: TODOS los logs de TODOS los proyectos a la vez, agrupados, con
+         el mismo widget de arbol que "Archivos" en la ficha de proyecto (misma clase .tree/
+         .trow/.tdir/.tfile) -- aqui cada hoja es un checkbox en vez de un archivo para editar.
+         Oculta por defecto: no debe estorbar al uso habitual (leer un log concreto) de arriba. -->
+    <div id="logsTreeCard" class="card" hidden style="margin-bottom:14px">
+      <form method="post" id="bulkLogForm">
+        <input type="hidden" name="action" value="logs_delete_bulk">
+        <div class="row" style="margin-bottom:10px">
+          <div style="font-weight:600">Todos los logs</div>
+          <span class="muted" style="font-size:12px"><?= array_sum(array_map('count',$byProject)) ?> archivo(s) en <?= count($byProject) ?> proyecto(s)</span>
+          <div class="spacer"></div>
+          <a href="#" class="muted" style="font-size:12px" id="logsTreeSelAll">Seleccionar todo</a>
+          <a href="#" class="muted" style="font-size:12px" id="logsTreeSelNone">Ninguno</a>
+          <button type="button" class="btn danger sm" id="logsTreeDeleteBtn" disabled>Eliminar seleccionados (<span id="logsTreeCount">0</span>)</button>
+        </div>
+        <div class="tree" id="logsTree">
+          <?php foreach ($byProject as $proj => $files): ?>
+            <div class="tnode">
+              <label class="trow tdir open">
+                <input type="checkbox" class="lua-logtree-group" style="flex:0 0 auto">
+                <?= ticon_chev() ?><?= ticon_folder() ?><span><?= e(log_project_label($proj)) ?></span>
+                <span class="muted" style="margin-left:auto;font-size:11px"><?= count($files) ?></span>
+              </label>
+              <div class="tchildren">
+                <?php foreach ($files as $f): $fPath = $logDir.'/'.$f['file']; $fSize = is_file($fPath)?filesize($fPath):0; $fMtime = is_file($fPath)?filemtime($fPath):0; ?>
+                  <label class="trow tfile">
+                    <input type="checkbox" name="logs[]" value="<?= e($f['file']) ?>" class="lua-logtree-item" data-group="<?= e($proj) ?>" style="flex:0 0 auto">
+                    <?= ticon_file() ?><span><?= e(log_kind_label($f['kind'])) ?> &middot; <?= e($f['file']) ?></span>
+                    <span class="muted" style="margin-left:auto;font-size:11px;white-space:nowrap"><?= e(export_size_human($fSize)) ?> &middot; <?= $fMtime?e(date('d/m/Y H:i',$fMtime)):'' ?></span>
+                  </label>
+                <?php endforeach; ?>
+              </div>
+            </div>
+          <?php endforeach; ?>
+        </div>
+      </form>
+    </div>
+
+    <!-- Modal de confirmacion de borrado MULTIPLE de logs -->
+    <div id="delLogsBulkModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDeleteLogsBulk()">
+      <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="delLogsBulkTitle">
+        <div class="modal-ic">
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+            <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+          </svg>
+        </div>
+        <h3 id="delLogsBulkTitle">¿Eliminar los logs seleccionados?</h3>
+        <p class="modal-tx">Se borrarán <strong id="delLogsBulkCount"></strong> archivo(s) de log del disco de forma permanente. Si el servicio que los genera sigue activo, pueden volver a crearse solos.</p>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" onclick="luaCloseDeleteLogsBulk()">Cancelar</button>
+          <button type="button" class="btn danger" id="delLogsBulkConfirm">Sí, eliminar</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      (function(){
+        var card = document.getElementById('logsTreeCard');
+        var toggleBtn = document.getElementById('logsTreeToggle');
+        toggleBtn.addEventListener('click', function(){
+          card.hidden = !card.hidden;
+          toggleBtn.textContent = card.hidden ? 'Ver todos agrupados' : 'Ocultar todos agrupados';
+        });
+        var items = Array.prototype.slice.call(document.querySelectorAll('.lua-logtree-item'));
+        var groups = Array.prototype.slice.call(document.querySelectorAll('.lua-logtree-group'));
+        var delBtn = document.getElementById('logsTreeDeleteBtn');
+        var countEl = document.getElementById('logsTreeCount');
+        function refreshCount(){
+          var n = items.filter(function(i){ return i.checked; }).length;
+          countEl.textContent = n;
+          delBtn.disabled = n === 0;
+        }
+        items.forEach(function(i){ i.addEventListener('click', function(ev){ ev.stopPropagation(); refreshCount(); }); });
+        groups.forEach(function(g){
+          g.addEventListener('click', function(ev){
+            ev.stopPropagation();
+            var node = g.closest('.tnode');
+            node.querySelectorAll('.lua-logtree-item').forEach(function(i){ i.checked = g.checked; });
+            refreshCount();
+          });
+        });
+        document.getElementById('logsTreeSelAll').addEventListener('click', function(ev){
+          ev.preventDefault();
+          items.forEach(function(i){ i.checked = true; });
+          groups.forEach(function(g){ g.checked = true; });
+          refreshCount();
+        });
+        document.getElementById('logsTreeSelNone').addEventListener('click', function(ev){
+          ev.preventDefault();
+          items.forEach(function(i){ i.checked = false; });
+          groups.forEach(function(g){ g.checked = false; });
+          refreshCount();
+        });
+        delBtn.addEventListener('click', function(){
+          if (delBtn.disabled) return;
+          document.getElementById('delLogsBulkCount').textContent = countEl.textContent;
+          document.getElementById('delLogsBulkModal').hidden = false;
+          document.addEventListener('keydown', luaEscDeleteLogsBulk);
+        });
+        document.getElementById('delLogsBulkConfirm').addEventListener('click', function(){
+          document.getElementById('bulkLogForm').submit();
+        });
+      })();
+      function luaCloseDeleteLogsBulk(){
+        document.getElementById('delLogsBulkModal').hidden = true;
+        document.removeEventListener('keydown', luaEscDeleteLogsBulk);
+      }
+      function luaEscDeleteLogsBulk(e){ if(e.key==='Escape') luaCloseDeleteLogsBulk(); }
+    </script>
+
     <div id="logEmptyCard" class="card muted" style="<?= $sel!==''?'display:none':'' ?>">Elige un proyecto y luego un archivo de log para ver su contenido.</div>
     <pre class="logview" id="logViewPre" style="<?= $sel===''?'display:none':'' ?>"><?= $content!=='' ? highlight_error_log($content) : '(vac&iacute;o)' ?></pre>
 

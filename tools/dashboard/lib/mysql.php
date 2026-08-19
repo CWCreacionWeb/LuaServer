@@ -153,7 +153,10 @@ function mysql_user_scope($pdo, $user, $host){
         // contraseña): no cuenta como acceso real, por eso se excluye explicitamente.
         if (preg_match('/^GRANT\s+(.+?)\s+ON\s+\*\.\*/i', $line, $m)) {
             if (strcasecmp(trim($m[1]), 'USAGE') !== 0) $all = true;
-        } elseif (preg_match('/^GRANT\s+.+?\s+ON\s+`([^`]+)`\.\*/i', $line, $m)) {
+        // Cubre tanto "ON `db`.*" (BD entera) como "ON `db`.`tabla`" (grants a nivel de tabla
+        // o columna, que antes no casaban con ninguna rama y la UI decia "sin acceso" para un
+        // usuario que si tenia acceso, solo que mas restringido).
+        } elseif (preg_match('/^GRANT\s+.+?\s+ON\s+`([^`]+)`\.(?:`[^`]+`|\*)/i', $line, $m)) {
             $dbs[] = $m[1];
         }
     }

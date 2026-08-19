@@ -38,6 +38,78 @@
             }
         }
     }
+    elseif ($action === 'git_pull') {
+        // Mismo criterio conservador que la auto-actualizacion de la propia plataforma
+        // (Update-Apply en lua.ps1): fetch + merge --ff-only, nunca fusiona de verdad ni
+        // reescribe historia, y se niega de plano si hay cambios locales sin commitear.
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            $dir = project_dir($WWW, $cfg['sites'][$name], $name);
+            if (!is_dir($dir.'/.git')) { $msg = 'error:Este proyecto no es un repositorio Git.'; }
+            else {
+                $statusRaw = git_exec($dir, 'status --porcelain');
+                $remote = trim((string)git_exec($dir, 'remote get-url origin'));
+                if ($statusRaw !== null && trim($statusRaw) !== '') {
+                    $msg = 'error:Hay cambios sin commitear: commitéalos o descártalos antes de actualizar, para no perderlos ni generar conflictos.';
+                } elseif ($remote === '') {
+                    $msg = 'error:Este proyecto no tiene un remoto "origin" configurado.';
+                } else {
+                    [$sf,,$ef] = git_exec_verbose($dir, 'fetch --quiet origin');
+                    if (!$sf) { $msg = 'error:No se pudo consultar el remoto: '.($ef ?: 'fallo desconocido').' (¿SSH sin claves cargadas para esta cuenta, o sin red?)'; }
+                    else {
+                        $upstream = trim((string)git_exec($dir, 'rev-parse --abbrev-ref @{u}'));
+                        if ($upstream === '') { $msg = 'error:La rama actual no sigue a ninguna rama remota.'; }
+                        else {
+                            [$sm,,$em] = git_exec_verbose($dir, 'merge --ff-only '.escapeshellarg($upstream));
+                            $msg = $sm
+                                ? 'applied:"'.$name.'" actualizado desde '.$upstream.'.'
+                                : 'error:No se pudo actualizar en avance rápido (probablemente tienes commits propios sin subir, o hay conflictos): '.($em ?: 'fallo desconocido');
+                        }
+                    }
+                }
+            }
+        }
+    }
+    elseif ($action === 'git_commit_push') {
+        $name = $_POST['name'] ?? '';
+        $tab = 'proyecto'; $redirName = $name;
+        $message = trim((string)($_POST['message'] ?? ''));
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        if ($siteKey === null) { $msg = 'error:Proyecto no válido.'; }
+        elseif ($message === '') { $msg = 'error:Escribe un mensaje de commit.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            $dir = project_dir($WWW, $cfg['sites'][$name], $name);
+            if (!is_dir($dir.'/.git')) { $msg = 'error:Este proyecto no es un repositorio Git.'; }
+            else {
+                $statusRaw = git_exec($dir, 'status --porcelain');
+                if ($statusRaw === null || trim($statusRaw) === '') { $msg = 'error:No hay cambios sin commitear.'; }
+                else {
+                    [$sa,,$ea] = git_exec_verbose($dir, 'add -A');
+                    if (!$sa) { $msg = 'error:No se pudo preparar los cambios (git add): '.($ea ?: 'fallo desconocido'); }
+                    else {
+                        [$sc,,$ec] = git_exec_verbose($dir, 'commit -m '.escapeshellarg($message));
+                        if (!$sc) { $msg = 'error:No se pudo commitear (revisa que git tenga nombre/email configurados en esta máquina): '.($ec ?: 'fallo desconocido'); }
+                        else {
+                            $remote = trim((string)git_exec($dir, 'remote get-url origin'));
+                            $branch = trim((string)git_exec($dir, 'rev-parse --abbrev-ref HEAD'));
+                            if ($remote === '') { $msg = 'applied:Commit hecho en local. Conecta un repositorio remoto para poder subirlo.'; }
+                            else {
+                                [$sp,,$ep] = git_exec_verbose($dir, 'push origin '.escapeshellarg($branch));
+                                $msg = $sp
+                                    ? 'applied:Commit hecho y subido a origin/'.$branch.'.'
+                                    : 'error:Commit hecho, pero no se pudo hacer push: '.($ep ?: 'fallo desconocido').' (¿SSH sin claves cargadas para esta cuenta, o el remoto rechaza el push?)';
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     elseif ($action === 'ftp_save') {
         $name = $_POST['name'] ?? '';
         $tab = 'proyecto'; $redirName = $name;

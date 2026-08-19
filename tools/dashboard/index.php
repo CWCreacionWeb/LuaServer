@@ -74,6 +74,7 @@ include __DIR__.'/ajax/export-db.php';
 include __DIR__.'/ajax/pickfolder.php';
 include __DIR__.'/ajax/file-tree.php';
 include __DIR__.'/ajax/notes.php';
+include __DIR__.'/ajax/jobs.php';
 include __DIR__.'/ajax/logs.php';
 include __DIR__.'/ajax/procs.php';
 include __DIR__.'/ajax/redis.php';
@@ -105,6 +106,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     include __DIR__.'/actions/procs.php';
     include __DIR__.'/actions/update.php';
     include __DIR__.'/actions/terminal-docker.php';
+    include __DIR__.'/actions/logs.php';
 
     // Si "Crear proyecto"/"Registrar proyecto externo" fallo (mensaje de error), reabrir el
     // modal al recargar -- si no, el usuario pierde de vista el formulario que acaba de
@@ -167,7 +169,6 @@ $reopenNewProject = ($_GET['reopen'] ?? '') === 'newproject';
 $curPhp = PHP_VERSION;
 $jobs = read_jobs($ROOT.'/tmp/jobs');
 $anyJobRun = false; foreach($jobs as $jj){ if(in_array(($jj['state']??''),['running','queued'],true)){$anyJobRun=true;break;} }
-$anyDbImportRun = false; foreach($jobs as $jj){ if(in_array(($jj['type']??''),['db_import_dir','db_import_file'],true) && in_array(($jj['state']??''),['running','queued'],true)){$anyDbImportRun=true;break;} }
 $watcherAlive = watcher_alive($ROOT);
 // Para el icono de terminal global de la cabecera: se calcula aqui (una vez, antes de
 // cualquier pestana) porque la cabecera se pinta para las 14 pestanas por igual, no solo
@@ -193,7 +194,6 @@ setTimeout(ping,1500);})();
 </script><?php endif; ?>
 <?php if ($mtype==='info'): ?><script>setTimeout(function(){location.href=<?= json_encode($reloadTarget) ?>;},7000);</script><?php endif; ?>
 <?php if (($tab==='proyectos' || $tab==='config' || $tab==='proyecto') && ($anyJobRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
-<?php if ($tab==='bd' && ($anyDbImportRun || $mtype==='job')): ?><meta http-equiv="refresh" content="3"><?php endif; ?>
 <?php if ($tab==='logs' && (($_GET['refresh']??'')==='1')): ?><meta http-equiv="refresh" content="4"><?php endif; ?>
 <style>
   :root{
@@ -241,6 +241,17 @@ setTimeout(ping,1500);})();
   .content{flex:1;overflow-y:auto;padding:28px 40px 48px}
 
   .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:18px 20px;margin-bottom:14px}
+
+  /* Cards colapsables (ficha de proyecto): pc-toggle se anade DENTRO del primer hijo de
+     cada card (su "header", sea lo que sea -- un .row con badges/acciones, o solo un div
+     con el titulo) via JS, nunca como hermano suyo -- asi sigue visible sin reglas
+     especiales cuando se oculta el resto, y cae de forma natural al final de esa fila (o
+     justo tras el titulo si el header no es flex) sin poder solaparse con nada. */
+  .card.pc-collapsed{padding-bottom:18px}
+  .card.pc-collapsed > :not(:first-child){display:none}
+  .pc-toggle{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;flex:0 0 auto;margin-left:8px;padding:0;background:transparent;border:1px solid var(--line);border-radius:5px;color:var(--mut);cursor:pointer;transition:color .12s,border-color .12s,transform .15s;vertical-align:middle}
+  .pc-toggle:hover{color:var(--ac);border-color:var(--ac)}
+  .card.pc-collapsed .pc-toggle{transform:rotate(-90deg)}
   .row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
   .row .name{font-weight:700;font-size:16px;min-width:150px}
   .row .url{color:var(--mut);font-size:13px} .row .url:hover{color:var(--ac)}
@@ -262,6 +273,11 @@ setTimeout(ping,1500);})();
   .btn-git.sm{padding:4px 10px}
   .btn-git:disabled{opacity:.55;cursor:default}
 
+  /* Lista de BD/usuarios: con pocas filas no se nota, pero sin tope una instalacion con
+     decenas de usuarios (o de BD) alarga la tarjeta sin limite y descuadra el grid de al
+     lado (.pgrid2 usa align-items:start, asi que cada tarjeta ya crece independiente -- el
+     scroll interno es lo unico que faltaba para no arrastrar el resto de la pagina con ella). */
+  .dblist{max-height:52vh;overflow:auto}
   .dbrow{display:flex;align-items:center;flex-wrap:wrap;gap:16px;padding:14px 0;border-top:1px solid var(--line)}
   .dbrow:first-of-type{border-top:none}
   .dbrow .dbname{font-weight:600;font-family:ui-monospace,Consolas,monospace;font-size:13px}
@@ -303,7 +319,7 @@ setTimeout(ping,1500);})();
   .savemsg.err{color:var(--err)}
   @media (max-width:900px){ .pgrid2{grid-template-columns:1fr} }
 
-  .sitegrid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
+  .sitegrid{display:grid;grid-template-columns:repeat(8,1fr);gap:10px;margin-bottom:14px}
   .sitecard{position:relative;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;min-width:0}
   .sitecard.is-locked{border-color:var(--warn)}
   .sitecard .cardbody{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1}
@@ -535,6 +551,8 @@ setTimeout(ping,1500);})();
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:16px 12px}
   .grid label{min-height:2.6em}
   .tag{display:inline-block;font-size:12px;color:var(--ac);background:rgba(110,168,254,.12);padding:2px 9px;border-radius:999px}
+  button.tag{border:0;font:inherit;cursor:pointer;transition:filter .12s}
+  button.tag:hover{filter:brightness(1.2)}
 
   .banner{padding:11px 15px;border-radius:8px;margin-bottom:16px;font-size:14px;border:1px solid}
   .banner.applied{background:rgba(63,185,80,.12);border-color:var(--ok);color:var(--ok)}
@@ -550,9 +568,17 @@ setTimeout(ping,1500);})();
   .jstate.orange{background:rgba(247,127,0,.16);color:#f77f00}
   a.jstate{text-decoration:none;cursor:pointer;transition:filter .12s}
   a.jstate:hover{filter:brightness(1.2)}
-  button.jstate{border:0;font:inherit;letter-spacing:.3px;transition:filter .12s}
+  button.jstate{border:0;font:inherit;letter-spacing:.3px;transition:filter .12s;cursor:pointer}
   button.jstate:hover{filter:brightness(1.2)}
   button.jstate:disabled{cursor:default;opacity:.75}
+
+  /* Selector de version de PHP en la cabecera de la ficha de proyecto: mismo peso visual
+     (altura, tipografia, forma de pildora) que los jstate/typetag/exttag con los que
+     convive en la fila, para que no desentone como un <select> generico de formulario. */
+  .phpselform-hero{display:inline-flex;align-items:center}
+  .phpselform-hero select.phpsel{width:auto;height:22px;padding:0 20px 0 10px;font-size:11px;font-weight:700;letter-spacing:.3px;line-height:1;border:0;border-radius:999px;background-color:rgba(110,168,254,.15);color:var(--ac);cursor:pointer}
+  .phpselform-hero select.phpsel:hover{filter:brightness(1.15)}
+  .phpselform-hero select.phpsel:focus{outline:2px solid var(--ac);outline-offset:1px}
 
   .joblog{background:var(--in);border:1px solid var(--line);border-radius:3px;padding:10px;margin:10px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;max-height:72px;overflow:auto;color:var(--mut)}
   .progressbar{position:relative;height:8px;border-radius:999px;background:var(--in);border:1px solid var(--line);overflow:hidden;margin-top:8px}
@@ -745,6 +771,7 @@ setTimeout(ping,1500);})();
   .trow.tfile:hover{background:var(--in);color:var(--tx)}
   .tchildren{margin-left:9px;padding-left:11px;border-left:1px dashed var(--line)}
   .tnode-more{color:var(--mut);font-size:12px;padding:4px 0 4px 20px;font-style:italic}
+  .folderlist{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--in);padding:4px;margin-top:8px}
 
   details{border:1px solid var(--line);border-radius:6px;margin-bottom:12px;background:var(--card);overflow:hidden}
   summary{padding:14px 18px;cursor:pointer;font-weight:700;font-size:16px;list-style:none;display:flex;align-items:center;gap:10px}
@@ -1300,33 +1327,45 @@ setTimeout(ping,1500);})();
       nameEl.textContent = f ? f.name : 'Elegir .sql…';
       label.classList.toggle('has-file', !!f);
     }
-    // Dialogo nativo "Elegir carpeta": pide al watcher que lo abra (ver ajax=pickfolder_start/
-    // poll en el backend) y espera el resultado con polling. Puede tardar ~1s en aparecer
-    // (el watcher revisa la peticion cada segundo), y se espera hasta 5 minutos por si el
-    // usuario tarda en navegar hasta la carpeta correcta.
+    // Selector de carpeta propio (arbol de directorios servido por PHP, ver ajax=browsedir):
+    // antes esto pedia un dialogo nativo de Windows al watcher, que fallaba con "la aplicación
+    // no está en modo UserInteractive" en cuanto el watcher corria sin escritorio (p.ej. como
+    // tarea de SYSTEM con "Arrancar con Windows" activo -- ver CLAUDE.md, trampa nº1). Listar
+    // carpetas no necesita escritorio ni watcher, asi que esto funciona siempre.
+    var luaFolderPickerTarget = null;
     function luaPickFolder(btn, inputId){
-      var input = document.getElementById(inputId);
-      var orig = btn.textContent;
-      btn.disabled = true; btn.textContent = 'Abriendo…';
-      function fail(msg){ btn.disabled = false; btn.textContent = orig; if (msg) alert(msg); }
-      fetch('?ajax=pickfolder_start').then(function(r){ return r.json(); }).then(function(data){
-        if (!data || data.error) { fail(data && data.error ? data.error : 'No se pudo pedir el selector de carpetas.'); return; }
-        var tries = 0, maxTries = 430; // ~5 min a 700ms
-        var iv = setInterval(function(){
-          tries++;
-          fetch('?ajax=pickfolder_poll&id='+encodeURIComponent(data.id)).then(function(r){ return r.json(); }).then(function(d){
-            if (d.status === 'pending') {
-              if (tries >= maxTries) { clearInterval(iv); fail('El watcher no respondió a tiempo.'); }
-              return;
-            }
-            clearInterval(iv);
-            btn.disabled = false; btn.textContent = orig;
-            if (d.status === 'done' && d.path) { input.value = d.path; }
-            else if (d.status === 'error') { alert('Error al abrir el selector: ' + (d.msg || 'desconocido')); }
-          }).catch(function(){ clearInterval(iv); fail('Se perdió la conexión con el panel.'); });
-        }, 700);
-      }).catch(function(){ fail('No se pudo contactar con el panel.'); });
+      luaFolderPickerTarget = inputId;
+      document.getElementById('folderPickerModal').hidden = false;
+      luaFolderPickerLoad(document.getElementById(inputId).value || '');
     }
+    function luaFolderPickerLoad(path){
+      var list = document.getElementById('folderPickerList');
+      list.innerHTML = '<div class="muted" style="padding:8px">Cargando…</div>';
+      fetch('?ajax=browsedir&path='+encodeURIComponent(path)).then(function(r){ return r.json(); }).then(function(d){
+        if (d.error) { list.innerHTML = '<div class="muted" style="padding:8px">'+esc(d.error)+'</div>'; return; }
+        document.getElementById('folderPickerPath').value = d.path;
+        var up = document.getElementById('folderPickerUp');
+        up.disabled = !d.parent;
+        up.onclick = function(){ luaFolderPickerLoad(d.parent || ''); };
+        document.getElementById('folderPickerUse').onclick = function(){
+          if (!d.path) return; // en el listado de unidades no hay "esta carpeta" que usar
+          document.getElementById(luaFolderPickerTarget).value = d.path;
+          document.getElementById('folderPickerModal').hidden = true;
+        };
+        list.innerHTML = '';
+        if (!d.dirs.length) { list.innerHTML = '<div class="muted" style="padding:8px">(sin subcarpetas)</div>'; }
+        d.dirs.forEach(function(name){
+          var row = document.createElement('div');
+          row.className = 'trow tdir';
+          row.innerHTML = '<svg class="ticon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/></svg><span></span>';
+          row.querySelector('span').textContent = name;
+          row.onclick = function(){ luaFolderPickerLoad((d.path ? d.path.replace(/[\\\/]+$/,'') + '\\' : '') + name); };
+          list.appendChild(row);
+        });
+      }).catch(function(){ list.innerHTML = '<div class="muted" style="padding:8px">Se perdió la conexión con el panel.</div>'; });
+    }
+    function luaFolderPickerGo(){ luaFolderPickerLoad(document.getElementById('folderPickerPath').value); }
+    function luaFolderPickerClose(){ document.getElementById('folderPickerModal').hidden = true; }
   </script>
 
   <footer><?= e($brandName) ?> &middot; Apache + mod_fcgid &middot; panel solo accesible desde esta máquina</footer>

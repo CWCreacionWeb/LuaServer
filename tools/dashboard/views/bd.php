@@ -5,6 +5,14 @@
       $rootHasPass = mysql_root_pass($ROOT) !== '';
       $mysqlUsers = $mariaOn ? mysql_users() : null;
       $mysqlScopePdo = $mysqlUsers ? (function(){ try { return mysql_pdo(); } catch (Throwable $e) { return null; } })() : null;
+      // Se calcula una vez por usuario (SHOW GRANTS) y se reutiliza tanto en la fila de la
+      // tabla como en su modal de edicion -- evita repetir esa consulta por usuario.
+      $muRows = [];
+      foreach ($mysqlUsers ?: [] as $u) {
+          $isRoot = strcasecmp($u['user'],'root') === 0;
+          $scope = ($mysqlScopePdo && !$isRoot) ? mysql_user_scope($mysqlScopePdo, $u['user'], $u['host']) : null;
+          $muRows[] = ['u'=>$u, 'isRoot'=>$isRoot, 'scope'=>$scope, 'rowId'=>'mu_'.md5($u['user'].'@'.$u['host'])];
+      }
       // Motor mostrado: ?engine=pg|mysql. Por defecto MySQL, salvo que solo Postgres este activo.
       $reqEngine = $_GET['engine'] ?? '';
       $dbEngine = $reqEngine==='pg' ? 'pg' : ($reqEngine==='mysql' ? 'mysql' : (($pgOn && !$mariaOn) ? 'pg' : 'mysql')); ?>
@@ -231,13 +239,15 @@
             <label>Carpeta con los .sql</label>
             <div class="row" style="gap:6px">
               <input type="text" name="dir" id="dbImportDirInput" placeholder="C:\ruta\a\la\carpeta" required style="flex:1">
-              <button type="button" class="btn ghost sm" id="dbImportDirPick" onclick="luaPickFolder(this,'dbImportDirInput')" <?= $watcherAlive?'':'disabled title="El watcher no está activo"' ?>>Elegir…</button>
+              <button type="button" class="btn ghost sm" id="dbImportDirPick" onclick="luaPickFolder(this,'dbImportDirInput')">Elegir…</button>
             </div>
           </div>
           <button class="btn" type="submit">Importar carpeta</button>
         </form>
         <?php $dirJobs = array_values(array_filter($jobs, function($j){ return ($j['type']??'')==='db_import_dir'; })); ?>
-        <?php foreach (array_slice($dirJobs,0,5) as $j): echo render_import_job_card($ROOT, $j); endforeach; ?>
+        <div id="dirJobsList" data-import-job="dir">
+          <?php foreach (array_slice($dirJobs,0,5) as $j): echo render_import_job_card($ROOT, $j); endforeach; ?>
+        </div>
       </div>
 
       <div class="card">
@@ -270,6 +280,7 @@
           <a class="btn ghost sm" href="http://<?= e($phpmyadminDom) ?>/" target="_blank">phpMyAdmin &#8599;</a>
           <a class="btn ghost sm" href="/adminer.php?server=127.0.0.1&username=root" target="_blank">Adminer &#8599;</a>
         </div>
+        <div class="dblist">
         <?php if ($dbList === null): ?>
           <div class="muted">No se pudo conectar con MySQL (¿acaba de activarse? espera unos segundos y recarga).</div>
         <?php elseif (!$dbList): ?>
@@ -294,11 +305,12 @@
             </div>
           </div>
           <?php if (isset($fileJobsByDb[$db])): ?>
-            <div style="margin:0 0 4px">
+            <div style="margin:0 0 4px" id="fileJobCard-<?= e($db) ?>" data-import-job="file">
               <?= render_import_job_card($ROOT, $fileJobsByDb[$db]) ?>
             </div>
           <?php endif; ?>
         <?php endforeach; endif; ?>
+        </div>
       </div>
 
       <div class="card">
@@ -325,11 +337,11 @@
           <div>
             <label>Acceso a</label>
             <select name="scope" onchange="document.getElementById('userdbrow').style.display=(this.value==='db')?'block':'none'">
+              <option value="db" selected>Una base de datos…</option>
               <option value="all">Todas las bases de datos</option>
-              <option value="db">Una base de datos…</option>
             </select>
           </div>
-          <div id="userdbrow" style="display:none">
+          <div id="userdbrow">
             <label>Base de datos</label>
             <input name="dbname" placeholder="micliente" list="mysqlDbList">
             <datalist id="mysqlDbList">
@@ -339,31 +351,115 @@
           <button class="btn" type="submit">+ Crear usuario</button>
         </form>
 
+        <div class="dblist">
         <?php if ($mysqlUsers === null): ?>
           <div class="muted">No se pudo conectar con MySQL para listar usuarios (¿acaba de activarse? espera unos segundos y recarga).</div>
         <?php elseif (!$mysqlUsers): ?>
           <div class="muted">No hay usuarios de aplicación todavía. Crea el primero arriba.</div>
-        <?php else: foreach ($mysqlUsers as $u):
-          $scope = $mysqlScopePdo ? mysql_user_scope($mysqlScopePdo, $u['user'], $u['host']) : null; ?>
-          <div class="dbrow">
-            <div class="dbname"><?= e($u['user']) ?><span class="muted">@<?= e($u['host']) ?></span></div>
-            <?php if ($scope !== null): ?>
-              <span class="muted" style="font-size:12px">
-                <?php if ($scope['all']): ?>acceso a todas las BD
-                <?php elseif ($scope['dbs']): ?>acceso a: <?= e(implode(', ', $scope['dbs'])) ?>
-                <?php else: ?>sin acceso a ninguna BD todavía
-                <?php endif; ?>
-              </span>
-            <?php endif; ?>
-            <div class="spacer"></div>
-            <?php if (strcasecmp($u['user'],'root') !== 0): ?>
-              <button type="button" class="btn danger sm" onclick="luaAskDeleteMysqlUser('<?= e($u['user']) ?>','<?= e($u['host']) ?>')">Eliminar</button>
-            <?php endif; ?>
-          </div>
-        <?php endforeach; endif; ?>
+        <?php else: ?>
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead>
+              <tr>
+                <th style="text-align:left;padding:6px 10px 8px 4px;font-size:11.5px;font-weight:600;color:var(--mut);border-bottom:1px solid var(--line)">Usuario</th>
+                <th style="text-align:left;padding:6px 10px 8px;font-size:11.5px;font-weight:600;color:var(--mut);border-bottom:1px solid var(--line)">Bases de datos</th>
+                <th style="border-bottom:1px solid var(--line)"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php foreach ($muRows as $row): $u=$row['u']; $isRoot=$row['isRoot']; $scope=$row['scope']; $rowId=$row['rowId']; ?>
+                <tr>
+                  <td style="padding:9px 10px 9px 4px;font-family:ui-monospace,Consolas,monospace;font-weight:600;border-bottom:1px solid var(--line)"><?= e($u['user']) ?><span class="muted">@<?= e($u['host']) ?></span></td>
+                  <td class="muted" style="padding:9px 10px;border-bottom:1px solid var(--line)">
+                    <?php if ($isRoot): ?>todas las BD (superusuario)
+                    <?php elseif ($scope === null): ?>&mdash;
+                    <?php elseif ($scope['all']): ?>todas las BD
+                    <?php elseif ($scope['dbs']): ?><?= e(implode(', ', $scope['dbs'])) ?>
+                    <?php else: ?>sin acceso todavía
+                    <?php endif; ?>
+                  </td>
+                  <td style="padding:9px 4px 9px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)">
+                    <?php if (!$isRoot): ?>
+                      <?php if ($scope !== null): ?>
+                        <button type="button" class="btn ghost sm" onclick="document.getElementById('<?= $rowId ?>').hidden=false">Editar</button>
+                      <?php endif; ?>
+                      <button type="button" class="btn danger sm" onclick="luaAskDeleteMysqlUser('<?= e($u['user']) ?>','<?= e($u['host']) ?>')">Eliminar</button>
+                    <?php endif; ?>
+                  </td>
+                </tr>
+              <?php endforeach; ?>
+            </tbody>
+          </table>
+        <?php endif; ?>
+        </div>
         <div class="muted" style="margin-top:10px;font-size:12px">Estos credenciales hay que asignarlos a mano en el <code>.env</code>/config de cada proyecto.</div>
       </div>
       </div>
+
+      <?php foreach ($muRows as $row):
+        if ($row['isRoot'] || $row['scope'] === null) continue;
+        $u = $row['u']; $scope = $row['scope']; $rowId = $row['rowId']; ?>
+      <!-- Modal de edicion de acceso del usuario MySQL (una por usuario: los datos de cada uno
+           -- chips de BD, formularios -- ya vienen renderizados desde PHP, así no hace falta
+           JS para rellenar un modal compartido con el usuario que se acaba de pulsar). -->
+      <div id="<?= $rowId ?>" class="modal-overlay" hidden onclick="if(event.target===this)this.hidden=true">
+        <div class="modal-box" role="dialog" aria-modal="true" style="max-width:440px;text-align:left">
+          <h3 style="margin:0 0 4px;font-size:15px">Editar usuario</h3>
+          <div class="muted" style="font-size:12.5px;margin-bottom:16px;font-family:ui-monospace,Consolas,monospace"><?= e($u['user']) ?>@<?= e($u['host']) ?></div>
+
+          <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">Acceso a bases de datos</div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:14px">
+            <?php if ($scope['all']): ?>
+              <span class="tag">todas las BD</span>
+              <form method="post" style="display:inline-flex">
+                <input type="hidden" name="action" value="mysql_user_revoke_all">
+                <input type="hidden" name="username" value="<?= e($u['user']) ?>">
+                <input type="hidden" name="host" value="<?= e($u['host']) ?>">
+                <button type="submit" class="btn ghost sm" onclick="return confirm('¿Quitar el acceso de &quot;<?= e($u['user']) ?>&quot; a TODAS las bases de datos?')">Restringir a BD concretas</button>
+              </form>
+            <?php else: ?>
+              <?php if (!$scope['dbs']): ?><span class="muted">sin acceso a ninguna BD todavía</span><?php endif; ?>
+              <?php foreach ($scope['dbs'] as $sdb): ?>
+                <form method="post" style="display:inline-flex" onsubmit="return confirm('¿Quitar el acceso de &quot;<?= e($u['user']) ?>&quot; a &quot;<?= e($sdb) ?>&quot;?')">
+                  <input type="hidden" name="action" value="mysql_user_revoke_db">
+                  <input type="hidden" name="username" value="<?= e($u['user']) ?>">
+                  <input type="hidden" name="host" value="<?= e($u['host']) ?>">
+                  <input type="hidden" name="dbname" value="<?= e($sdb) ?>">
+                  <button type="submit" class="tag" title="Quitar acceso a &quot;<?= e($sdb) ?>&quot;"><?= e($sdb) ?> &times;</button>
+                </form>
+              <?php endforeach; ?>
+            <?php endif; ?>
+          </div>
+          <?php if (!$scope['all']): ?>
+            <form method="post" class="row" style="gap:6px;margin-bottom:10px">
+              <input type="hidden" name="action" value="mysql_user_grant_db">
+              <input type="hidden" name="username" value="<?= e($u['user']) ?>">
+              <input type="hidden" name="host" value="<?= e($u['host']) ?>">
+              <input name="dbname" placeholder="+ base de datos" list="mysqlDbList" style="flex:1;min-width:0">
+              <button type="submit" class="btn ghost sm">Añadir</button>
+            </form>
+            <form method="post" style="margin-bottom:20px">
+              <input type="hidden" name="action" value="mysql_user_grant_all">
+              <input type="hidden" name="username" value="<?= e($u['user']) ?>">
+              <input type="hidden" name="host" value="<?= e($u['host']) ?>">
+              <button type="submit" class="btn ghost sm" style="width:100%" onclick="return confirm('¿Dar acceso a &quot;<?= e($u['user']) ?>&quot; a TODAS las bases de datos?')">Dar acceso a todas las BD</button>
+            </form>
+          <?php endif; ?>
+
+          <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">Contraseña</div>
+          <form method="post" class="row" style="gap:6px;margin-bottom:20px">
+            <input type="hidden" name="action" value="mysql_user_password">
+            <input type="hidden" name="username" value="<?= e($u['user']) ?>">
+            <input type="hidden" name="host" value="<?= e($u['host']) ?>">
+            <input type="text" name="password" placeholder="nueva contraseña" autocomplete="off" required style="flex:1;min-width:0">
+            <button type="submit" class="btn ghost sm">Actualizar</button>
+          </form>
+
+          <div class="modal-actions">
+            <button type="button" class="btn ghost" onclick="document.getElementById('<?= $rowId ?>').hidden=true">Cerrar</button>
+          </div>
+        </div>
+      </div>
+      <?php endforeach; ?>
 
       <!-- Modal de confirmacion de borrado de usuario MySQL -->
       <div id="delMysqlUserModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseDeleteMysqlUser()">
@@ -433,6 +529,28 @@
         function luaEscDropDb(e){ if(e.key==='Escape') luaCloseDropDb(); }
       </script>
 
+      <!-- Modal: selector de carpeta propio (arbol de directorios servido por PHP, ver
+           ajax=browsedir) -- reemplaza al dialogo nativo de Windows, que fallaba cuando el
+           watcher no tiene sesion de escritorio (p.ej. corriendo como tarea de SYSTEM con
+           "Arrancar con Windows" activo). -->
+      <div id="folderPickerModal" class="modal-overlay" hidden onclick="if(event.target===this)luaFolderPickerClose()">
+        <div class="modal-box" role="dialog" aria-modal="true" style="max-width:460px;text-align:left">
+          <h3 style="margin:0 0 12px;font-size:15px">Elegir carpeta</h3>
+          <div class="row" style="gap:6px">
+            <input type="text" id="folderPickerPath" placeholder="C:\ruta\a\la\carpeta" style="flex:1" onkeydown="if(event.key==='Enter'){event.preventDefault();luaFolderPickerGo();}">
+            <button type="button" class="btn ghost sm" onclick="luaFolderPickerGo()">Ir</button>
+          </div>
+          <div class="folderlist" id="folderPickerList"></div>
+          <div class="modal-actions" style="margin-top:16px;justify-content:space-between">
+            <button type="button" class="btn ghost sm" id="folderPickerUp">&uarr; Subir</button>
+            <div style="display:flex;gap:8px">
+              <button type="button" class="btn ghost" onclick="luaFolderPickerClose()">Cancelar</button>
+              <button type="button" class="btn" id="folderPickerUse">Usar esta carpeta</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Modal de confirmacion de importar backup (puede sobrescribir tablas existentes) -->
       <div id="importDbModal" class="modal-overlay" hidden onclick="if(event.target===this)luaCloseImportDb()">
         <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="importDbTitle">
@@ -451,7 +569,15 @@
       </div>
       <script>
         var luaImportDbForm = null;
+        // Sin este flag, requestSubmit() de mas abajo dispara el 'submit' del formulario de
+        // verdad -- que vuelve a pasar por ESTE MISMO onsubmit (luaAskImportDb), que vuelve a
+        // hacer preventDefault() porque nada distingue "primera vez, hay que confirmar" de
+        // "ya confirmado, dejar pasar": el envio quedaba bloqueado para siempre y "Si,
+        // importar" no llegaba a mandar nada al servidor (el modal solo se cerraba solo a los
+        // 20s por la red de seguridad de abajo, dando la falsa impresion de que "ya iba").
+        var luaImportDbConfirmed = false;
         function luaAskImportDb(ev, form, dbname){
+          if (luaImportDbConfirmed) { luaImportDbConfirmed = false; return true; }
           ev.preventDefault();
           luaImportDbForm = form;
           document.getElementById('importDbName').textContent = dbname;
@@ -470,6 +596,7 @@
           // el loader global aparezca durante la importacion real (que puede tardar si el
           // .sql es grande) en vez de no mostrarse nunca. El modal se deja abierto (con el
           // boton en marcha) hasta que la navegacion real lo sustituya.
+          luaImportDbConfirmed = true;
           luaImportDbForm.requestSubmit();
           // Red de seguridad: si la pagina no llega a navegar, no dejar el boton colgado.
           setTimeout(function(){
@@ -503,7 +630,13 @@
       </div>
       <script>
         var luaImportDirForm = null;
+        // Mismo flag que luaImportDbConfirmed y por el mismo motivo: requestSubmit() de mas
+        // abajo vuelve a pasar por este onsubmit, que sin el flag haria preventDefault() otra
+        // vez y el envio no llegaria NUNCA al servidor -- "Si, importar" se quedaria en un
+        // callejon sin salida silencioso (el modal se cerraba solo a los 20s como si nada).
+        var luaImportDirConfirmed = false;
         function luaAskImportDir(ev, form){
+          if (luaImportDirConfirmed) { luaImportDirConfirmed = false; return true; }
           var db = form.dbname.value, dir = form.dir.value;
           if (!db || !dir) return true; // deja que el 'required' nativo se encargue
           ev.preventDefault();
@@ -521,6 +654,7 @@
           btn.disabled = true;
           btn.innerHTML = '<span class="btn-spin"></span>Importando&hellip;';
           document.removeEventListener('keydown', luaEscImportDir);
+          luaImportDirConfirmed = true;
           luaImportDirForm.requestSubmit();
           setTimeout(function(){
             btn.disabled = false; btn.innerHTML = 'Sí, importar';
@@ -533,6 +667,41 @@
           document.removeEventListener('keydown', luaEscImportDir);
         }
         function luaEscImportDir(e){ if(e.key==='Escape') luaCloseImportDir(); }
+      </script>
+
+      <!-- Progreso de los imports (carpeta o archivo unico) en vivo, sin recargar la pagina:
+           antes esto era un <meta refresh> de la pagina entera cada 3s mientras hubiera un
+           import en marcha (perdia el scroll y cualquier formulario a medio rellenar). Ahora
+           se pide solo el HTML ya renderizado de las tarjetas afectadas (ver ajax=import_jobs,
+           que reutiliza render_import_job_card) y se reemplaza en el sitio. Si la pagina se
+           recarga a mano mientras tanto, el progreso servido en esa recarga ya sale correcto
+           igual que siempre (vive en tmp/jobs/*.status, no en el estado de este script) y el
+           polling retoma solo desde ahi. -->
+      <script>
+        (function(){
+          var polling = null;
+          function applyImportUpdate(data){
+            Object.keys(data.fileCards).forEach(function(db){
+              var el = document.getElementById('fileJobCard-' + db);
+              // El contenedor solo existe si ya habia un import para esa BD al cargar la
+              // pagina; si arranca uno nuevo para otra BD, se vera en la proxima recarga real
+              // (el propio envio del formulario ya recarga la pagina).
+              if (el) el.innerHTML = data.fileCards[db];
+            });
+            var dirList = document.getElementById('dirJobsList');
+            if (dirList && data.dirHtml !== undefined) dirList.innerHTML = data.dirHtml;
+          }
+          function pollImportJobs(){
+            fetch('?ajax=import_jobs').then(function(r){ return r.json(); }).then(function(data){
+              applyImportUpdate(data);
+              if (!data.anyRunning && polling) { clearInterval(polling); polling = null; }
+            }).catch(function(){ /* se reintenta en el siguiente tick */ });
+          }
+          if (document.getElementById('dirJobsList')) {
+            pollImportJobs();
+            polling = setInterval(pollImportJobs, 1500);
+          }
+        })();
       </script>
 
     <?php endif; ?>

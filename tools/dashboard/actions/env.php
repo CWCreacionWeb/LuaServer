@@ -81,3 +81,53 @@
                 : 'error:No se pudo copiar .env.example.';
         }
     }
+    elseif ($action === 'env_apply_db') {
+        $tab = 'proyecto'; $name = $_POST['name'] ?? ''; $redirName = $name;
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        $dir  = $siteKey !== null ? project_dir($WWW, $cfg['sites'][$siteKey], $siteKey) : null;
+        $data = $dir !== null ? env_read_lines($dir) : null;
+        $conn = $siteKey !== null ? project_db_link($ROOT, $cfg['sites'][$siteKey]) : null;
+        if ($siteKey === null) { $msg='error:Proyecto no válido.'; }
+        elseif ($conn === null) { $msg='error:Este proyecto no tiene una base de datos vinculada (o ya no existe).'; }
+        elseif ($data === null) { $msg='error:No se encontró el archivo .env de este proyecto.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            $vals = [
+                'DB_CONNECTION' => $conn['driver'],
+                'DB_HOST'       => $conn['host'],
+                'DB_PORT'       => (string)$conn['port'],
+                'DB_DATABASE'   => $conn['db'],
+                'DB_USERNAME'   => $conn['user'],
+                'DB_PASSWORD'   => $conn['pass'],
+            ];
+            $lines = $data['lines'];
+            $seen = [];
+            foreach ($lines as $i => $line) {
+                $m = env_match_kv($line);
+                if ($m && array_key_exists($m['key'], $vals)) {
+                    $lines[$i] = $m['indent'].$m['key'].$m['eq'].$vals[$m['key']];
+                    $seen[$m['key']] = true;
+                }
+            }
+            foreach ($vals as $k => $v) { if (empty($seen[$k])) { $lines[] = $k.'='.$v; } }
+            $msg = env_write_lines($dir, $lines, $data['eol'], $data['trailing_nl'], $data['enc'])
+                ? 'applied:Variables DB_* del .env actualizadas con la conexión a "'.$conn['db'].'".'
+                : 'error:No se pudo guardar el archivo .env (¿permisos?).';
+        }
+    }
+    elseif ($action === 'env_copy_example') {
+        // A diferencia de env_from_example (solo crea si no hay .env), esta SI pisa un .env
+        // existente -- por eso pide confirmacion en el propio boton (ver proyecto.php) antes
+        // de enviar el formulario.
+        $tab = 'proyecto'; $name = $_POST['name'] ?? ''; $redirName = $name;
+        $siteKey = resolve_site_key($cfg['sites'], $name);
+        $dir = $siteKey !== null ? project_dir($WWW, $cfg['sites'][$siteKey], $siteKey) : null;
+        if ($siteKey === null) { $msg='error:Proyecto no válido.'; }
+        elseif ($dir === null || !is_file(env_example_path($dir))) { $msg='error:No se encontró .env.example.'; }
+        else {
+            $name = $siteKey; $redirName = $name;
+            $msg = @copy(env_example_path($dir), env_path($dir))
+                ? 'applied:.env sobrescrito con el contenido de .env.example.'
+                : 'error:No se pudo copiar .env.example.';
+        }
+    }

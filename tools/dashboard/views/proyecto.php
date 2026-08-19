@@ -8,7 +8,11 @@
       if ($pKey !== null) { $pName = $pKey; }
       $pInfo = $pKey !== null ? $sites[$pKey] : null; ?>
 
-    <a href="?tab=proyectos" class="muted" style="display:inline-block;margin-bottom:14px">&larr; Volver a proyectos</a>
+    <div class="row" style="margin-bottom:14px">
+      <a href="?tab=proyectos" class="muted">&larr; Volver a proyectos</a>
+      <div class="spacer"></div>
+      <a href="#" class="muted" style="font-size:12px" id="pcToggleAll">Colapsar todas</a>
+    </div>
 
     <?php if ($pInfo === null): ?>
       <div class="card muted">No se encontró el proyecto "<?= e($pName) ?>".</div>
@@ -53,7 +57,20 @@
             <?php if ($pTypeLabel): ?><span class="typetag typetag-<?= e($pType) ?>"><?= project_type_icon($pType) ?><?= e($pTypeLabel) ?></span><?php endif; ?>
             <?php if ($pExtPath): ?><span class="exttag" title="Proyecto externo: <?= e($pExtPath) ?>">ext</span><?php endif; ?>
             <span class="jstate <?= $pLocked?'warn':'ok' ?>"><?= $pLocked?'Bloqueado':'Desbloqueado' ?></span>
-            <span class="jstate run">PHP <?= e($pVer) ?></span>
+            <?php if ($vers): ?>
+              <form method="post" class="phpselform phpselform-hero" style="margin:0">
+                <input type="hidden" name="action" value="switch">
+                <input type="hidden" name="name" value="<?= e($pName) ?>">
+                <input type="hidden" name="back" value="?tab=proyecto&name=<?= e(rawurlencode($pName)) ?>">
+                <select name="php" class="phpsel" onchange="this.form.dataset.loadingText='Cambiando a PHP '+this.value+'…';this.form.requestSubmit()">
+                  <?php foreach ($vers as $v): ?>
+                    <option value="<?= e($v) ?>" <?= $v===$pVer?'selected':'' ?>>PHP <?= e($v) ?></option>
+                  <?php endforeach; ?>
+                </select>
+              </form>
+            <?php else: ?>
+              <span class="jstate run">PHP <?= e($pVer) ?></span>
+            <?php endif; ?>
             <?php if ($termOn && ($pHasComposer || $pHasNpm || $pHasArtisan)): ?>
               <button type="button" class="runbtn lua-runbtn" title="Ejecutar Composer/NPM/Artisan" aria-label="Ejecutar Composer/NPM/Artisan" data-name="<?= e($pName) ?>" data-path="<?= e(term_win($pDir)) ?>" data-composer="<?= $pHasComposer?'1':'0' ?>" data-npm="<?= $pHasNpm?'1':'0' ?>" data-artisan="<?= $pHasArtisan?'1':'0' ?>" data-php="<?= e($pVer) ?>">
                 <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -154,6 +171,110 @@
               </div>
             <?php endforeach; ?>
           </div>
+        <?php endif; ?>
+      </div>
+      </div>
+
+      <?php
+        $pDbLinkRaw = is_array($pInfo) ? (string)($pInfo['dbLink'] ?? '') : '';
+        $pDbLink = project_db_link($ROOT, $pInfo);
+      ?>
+      <div class="pgrid2">
+      <div class="card" style="grid-column:1/-1">
+        <div class="row" style="margin-bottom:10px">
+          <div style="font-weight:600">Base de datos</div>
+          <div class="spacer"></div>
+          <a class="muted" style="font-size:12px" href="?tab=bd">Gestionar bases de datos</a>
+        </div>
+        <?php if (!$pMyDbs && !$pPgDbs): ?>
+          <div class="muted">No hay bases de datos disponibles. Activa MariaDB o PostgreSQL en <a href="?tab=config">Configuración del servidor</a>.</div>
+        <?php else: ?>
+          <form method="post" class="inline">
+            <input type="hidden" name="action" value="set_db_link">
+            <input type="hidden" name="name" value="<?= e($pName) ?>">
+            <div style="flex:1;min-width:220px">
+              <label>Base de datos vinculada a este proyecto</label>
+              <select name="dblink" style="width:100%">
+                <option value="">Ninguna</option>
+                <?php if ($pMyDbs): ?>
+                  <optgroup label="MySQL / MariaDB">
+                    <?php foreach ($pMyDbs as $d): ?>
+                      <option value="mysql:<?= e($d) ?>" <?= $pDbLinkRaw==='mysql:'.$d?'selected':'' ?>><?= e($d) ?></option>
+                    <?php endforeach; ?>
+                  </optgroup>
+                <?php endif; ?>
+                <?php if ($pPgDbs): ?>
+                  <optgroup label="PostgreSQL">
+                    <?php foreach ($pPgDbs as $d): ?>
+                      <option value="pgsql:<?= e($d) ?>" <?= $pDbLinkRaw==='pgsql:'.$d?'selected':'' ?>><?= e($d) ?></option>
+                    <?php endforeach; ?>
+                  </optgroup>
+                <?php endif; ?>
+              </select>
+            </div>
+            <button class="btn ghost" type="submit">Guardar</button>
+          </form>
+        <?php endif; ?>
+        <?php if ($pDbLinkRaw !== '' && $pDbLink === null): ?>
+          <div class="muted" style="margin-top:10px;font-size:12px;color:var(--err)">La base de datos vinculada ya no existe o no se pudo consultar el motor.</div>
+        <?php elseif ($pDbLink): ?>
+          <?php
+            $pDbFields = [
+              'Motor'      => $pDbLink['label'],
+              'Host'       => $pDbLink['host'],
+              'Puerto'     => (string)$pDbLink['port'],
+              'Base'       => $pDbLink['db'],
+              'Usuario'    => $pDbLink['user'],
+              'Contraseña' => $pDbLink['pass']!==''?$pDbLink['pass']:'(sin contraseña)',
+            ];
+            $pDbCopyText = implode("\n", array_map(function($k,$v){ return $k.'='.$v; }, array_keys($pDbFields), $pDbFields));
+          ?>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px">
+            <?php foreach ($pDbFields as $lbl => $val): ?>
+              <div>
+                <label style="display:block;font-size:11px;color:var(--mut);margin-bottom:2px"><?= e($lbl) ?></label>
+                <code style="display:block;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<?= e($val) ?>"><?= e($val) ?></code>
+              </div>
+            <?php endforeach; ?>
+          </div>
+          <div class="row" style="margin-top:12px;gap:8px">
+            <button type="button" class="btn ghost sm lua-dbconn-copy" data-copy="<?= e($pDbCopyText) ?>">Copiar credenciales</button>
+            <?php if ($pHasArtisan): ?>
+              <form method="post" style="margin:0">
+                <input type="hidden" name="action" value="env_apply_db">
+                <input type="hidden" name="name" value="<?= e($pName) ?>">
+                <button class="btn ghost sm" type="submit" title="Escribe DB_CONNECTION/DB_HOST/DB_PORT/DB_DATABASE/DB_USERNAME/DB_PASSWORD en el .env de este proyecto">Aplicar al .env</button>
+              </form>
+            <?php endif; ?>
+          </div>
+          <script>
+            (function(){
+              // Mismo patron que el copiar de Notas: navigator.clipboard solo existe en
+              // contexto seguro, y http://<tld> (ver trampa nº2 de CLAUDE.md) no lo es.
+              var btn = document.querySelector('.lua-dbconn-copy');
+              if (!btn) return;
+              btn.addEventListener('click', function(){
+                var text = btn.getAttribute('data-copy');
+                var done = function(ok){
+                  var old = btn.textContent;
+                  btn.textContent = ok ? 'Copiado' : 'No se pudo copiar';
+                  setTimeout(function(){ btn.textContent = old; }, 1400);
+                };
+                if (navigator.clipboard && window.isSecureContext) {
+                  navigator.clipboard.writeText(text).then(function(){ done(true); }, function(){ done(false); });
+                  return;
+                }
+                var ta = document.createElement('textarea');
+                ta.value = text; ta.setAttribute('readonly','');
+                ta.style.position='fixed'; ta.style.top='-1000px';
+                document.body.appendChild(ta); ta.select();
+                var ok = false;
+                try { ok = document.execCommand('copy'); } catch(e){ ok = false; }
+                document.body.removeChild(ta);
+                done(ok);
+              });
+            })();
+          </script>
         <?php endif; ?>
       </div>
       </div>
@@ -471,6 +592,11 @@
               <?php if ($pGit['dirty']>0): ?><span class="jstate warn"><?= (int)$pGit['dirty'] ?> cambio(s) sin commitear</span><?php else: ?><span class="jstate ok">Limpio</span><?php endif; ?>
               <div class="spacer"></div>
               <?php if ($pGit['remote']!==''): ?><span class="muted" style="font-size:12px"><?= e($pGit['remote']) ?></span><?php endif; ?>
+              <form method="post" style="margin:0">
+                <input type="hidden" name="action" value="git_pull">
+                <input type="hidden" name="name" value="<?= e($pName) ?>">
+                <button type="submit" class="btn ghost sm" <?= ($pGit['remote']===''||$pGit['dirty']>0)?'disabled':'' ?> title="<?= $pGit['remote']===''?'Sin remoto "origin" configurado':($pGit['dirty']>0?'Commitea o descarta los cambios pendientes antes de actualizar':'git fetch + merge --ff-only: nunca reescribe ni fusiona, solo avanza si es posible sin conflicto') ?>">Actualizar (pull)</button>
+              </form>
             </div>
             <?php if (!$pGit['commits']): ?>
               <div class="muted">Sin commits todavía.</div>
@@ -485,6 +611,16 @@
                 <?php endforeach; ?>
               </div>
             <?php endif; ?>
+            <form method="post" class="row" style="gap:8px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)"
+                  onsubmit="return confirm('¿Commitear <?= (int)$pGit['dirty'] ?> cambio(s) y subirlos a origin/<?= e($pGit['branch']) ?>?')">
+              <input type="hidden" name="action" value="git_commit_push">
+              <input type="hidden" name="name" value="<?= e($pName) ?>">
+              <div style="flex:1;min-width:220px">
+                <label>Mensaje de commit</label>
+                <input name="message" placeholder="Describe el cambio" style="width:100%" <?= $pGit['dirty']>0?'required':'disabled' ?>>
+              </div>
+              <button class="btn" type="submit" style="margin-top:22px" <?= ($pGit['dirty']===0||$pGit['remote']==='')?'disabled':'' ?> title="<?= $pGit['remote']===''?'Sin remoto "origin" configurado':($pGit['dirty']===0?'No hay cambios sin commitear':'git add -A + commit + push') ?>">Commit y Push</button>
+            </form>
           </div>
         <?php else: ?>
           <div class="card">
@@ -638,6 +774,14 @@
         <div class="row" style="margin-bottom:10px">
           <div style="font-weight:600">Variables de entorno (.env)</div>
           <?php if ($pEnvData): ?><span class="muted" style="font-size:12px"><?= count(env_parse_rows($pEnvData['lines'])) ?> variables</span><?php endif; ?>
+          <div class="spacer"></div>
+          <?php if ($pEnvData && $pEnvExample): ?>
+            <form method="post" onsubmit="return confirm('¿Sobrescribir el .env actual con el contenido de .env.example? Se perderán los valores personalizados que no estén también en .env.example.')">
+              <input type="hidden" name="action" value="env_copy_example">
+              <input type="hidden" name="name" value="<?= e($pName) ?>">
+              <button type="submit" class="btn ghost sm">Copiar desde .env.example</button>
+            </form>
+          <?php endif; ?>
         </div>
         <?php if (!$pEnvData && !$pEnvExample): ?>
           <div class="muted">Este proyecto no tiene <code>.env</code> ni <code>.env.example</code>.</div>
@@ -862,6 +1006,60 @@
             document.removeEventListener('keydown', luaEscFileEditor);
           };
           function luaEscFileEditor(e){ if (e.key === 'Escape') luaCloseFileEditor(); }
+        })();
+      </script>
+
+      <!-- Cards colapsables: minimizar cualquier card de esta ficha a la altura de su
+           titulo. Preferencia por proyecto+card en localStorage (no hace falta servidor,
+           es una preferencia de UI, como el dock del runner o el modo de la terminal
+           global) -- clave derivada del TEXTO del titulo, no de la posicion, para que no
+           se desordene si una card aparece/desaparece segun el tipo de proyecto. -->
+      <script>
+        (function(){
+          var STORE = 'pcardCollapsed:'+<?= json_encode($pName) ?>+':';
+          var chevron = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+          var cards = Array.prototype.slice.call(document.querySelectorAll('.card'))
+            .filter(function(c){ return !c.classList.contains('row') && c.firstElementChild; });
+          function keyFor(card, i){
+            var head = card.firstElementChild;
+            var txt = (head.textContent || '').trim().replace(/\s+/g,' ').slice(0,60);
+            return STORE + (txt || ('#'+i));
+          }
+          function setState(card, btn, collapsed){
+            card.classList.toggle('pc-collapsed', collapsed);
+            btn.setAttribute('aria-label', collapsed ? 'Expandir' : 'Colapsar');
+            btn.title = collapsed ? 'Expandir' : 'Colapsar';
+          }
+          cards.forEach(function(card, i){
+            var key = keyFor(card, i);
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'pc-toggle';
+            btn.innerHTML = chevron;
+            card.firstElementChild.appendChild(btn);
+            setState(card, btn, localStorage.getItem(key) === '1');
+            btn.addEventListener('click', function(ev){
+              ev.preventDefault(); ev.stopPropagation();
+              var collapsed = !card.classList.contains('pc-collapsed');
+              setState(card, btn, collapsed);
+              try { if (collapsed) localStorage.setItem(key,'1'); else localStorage.removeItem(key); } catch(e){}
+            });
+          });
+          var allLink = document.getElementById('pcToggleAll');
+          if (allLink) {
+            allLink.addEventListener('click', function(ev){
+              ev.preventDefault();
+              var collapsing = allLink.textContent.trim() === 'Colapsar todas';
+              cards.forEach(function(card, i){
+                var btn = card.querySelector('.pc-toggle');
+                if (!btn) return;
+                setState(card, btn, collapsing);
+                var key = keyFor(card, i);
+                try { if (collapsing) localStorage.setItem(key,'1'); else localStorage.removeItem(key); } catch(e){}
+              });
+              allLink.textContent = collapsing ? 'Expandir todas' : 'Colapsar todas';
+            });
+          }
         })();
       </script>
 
